@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -37,6 +38,11 @@ DEFAULT_CHECKSUM_SUFFIXES = [
     ".sh",
     ".md",
 ]
+ANSI_GREEN = "\033[32m"
+ANSI_CYAN = "\033[36m"
+ANSI_YELLOW = "\033[33m"
+ANSI_DIM = "\033[2m"
+ANSI_RESET = "\033[0m"
 
 
 def default_config_path() -> Path:
@@ -124,6 +130,55 @@ def sorted_known_connections(config_data: dict[str, object]) -> list[dict[str, o
     )
 
 
+def use_ansi_color() -> bool:
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def color_text(text: str, color: str, use_color: bool) -> str:
+    if not use_color or not text:
+        return text
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def split_remote_for_display(remote: str) -> tuple[str, str, str]:
+    target, separator, path = remote.partition(":")
+    if not separator:
+        return "", target, ""
+    user, at, host = target.partition("@")
+    if not at:
+        return "", target, f":{path}"
+    return user, host, f":{path}"
+
+
+def format_remote_for_display(remote: str, use_color: bool) -> str:
+    user, host, path = split_remote_for_display(remote)
+    if user:
+        return (
+            f"{color_text(user, ANSI_GREEN, use_color)}@"
+            f"{color_text(host, ANSI_CYAN, use_color)}"
+            f"{color_text(path, ANSI_YELLOW, use_color)}"
+        )
+    return (
+        f"{color_text(host, ANSI_CYAN, use_color)}"
+        f"{color_text(path, ANSI_YELLOW, use_color)}"
+    )
+
+
+def format_known_connection_entry(
+    index: int,
+    entry: dict[str, object],
+    use_color: bool,
+) -> str:
+    trigger_count = int(entry.get("trigger_count", 0))
+    local_root = str(entry.get("local_root", ""))
+    remote = str(entry.get("remote", ""))
+    runs_text = color_text(f"({trigger_count} runs)", ANSI_DIM, use_color)
+    return (
+        f"  [{index}] {local_root}  <->  "
+        f"{format_remote_for_display(remote, use_color)}  {runs_text}"
+    )
+
+
 def choose_known_connection(config_data: dict[str, object]) -> dict[str, object]:
     entries = sorted_known_connections(config_data)
     if not entries:
@@ -133,12 +188,9 @@ def choose_known_connection(config_data: dict[str, object]) -> dict[str, object]
         raise SystemExit(1)
 
     print("Known rsync-tree-tui connections:")
+    color_enabled = use_ansi_color()
     for index, entry in enumerate(entries):
-        trigger_count = int(entry.get("trigger_count", 0))
-        print(
-            f"  [{index}] {entry.get('local_root', '')}  <->  "
-            f"{entry.get('remote', '')}  ({trigger_count} runs)"
-        )
+        print(format_known_connection_entry(index, entry, color_enabled))
     raw_index = input("Select connection index: ").strip()
     index = int(raw_index)
     if index < 0 or index >= len(entries):
@@ -292,6 +344,26 @@ class AppConfig:
     config_path: Path
     config_data: dict[str, object]
     checksum_policy: ChecksumPolicy
+
+
+@dataclass(slots=True)
+class ListLayout:
+    row_start: int
+    list_height: int
+    selection_width: int
+    panel_width: int
+    divider_width: int
+
+    def visible_index_at(self, y: int, scroll_offset: int, visible_count: int) -> int | None:
+        if y < self.row_start or y >= self.row_start + self.list_height:
+            return None
+        visible_index = scroll_offset + y - self.row_start
+        if visible_index < 0 or visible_index >= visible_count:
+            return None
+        return visible_index
+
+    def is_selection_column(self, x: int) -> bool:
+        return 0 <= x < self.selection_width
 
 
 # ------------------------------------------------------------------------ #
@@ -797,6 +869,20 @@ def node_is_expandable(node: TreeNode) -> bool:
     return node_is_directory(node) and (not node.children_loaded or bool(node.children))
 
 
+def mouse_has_button(bstate: int, *names: str) -> bool:
+    return any(bool(bstate & getattr(curses, name, 0)) for name in names)
+
+
+def mouse_is_primary_click(bstate: int) -> bool:
+    return mouse_has_button(
+        bstate,
+        "BUTTON1_CLICKED",
+        "BUTTON1_PRESSED",
+        "BUTTON1_RELEASED",
+        "BUTTON1_DOUBLE_CLICKED",
+    )
+
+
 # ------------------------------------------------------------------------ #
 #                                  tree node                                #
 # ------------------------------------------------------------------------ #
@@ -861,6 +947,7 @@ class SyncApp:
         self.pending_action: str | None = None
         self.last_cursor_rel_path = ""
         self.initial_connection_ok = False
+        self.list_layout: ListLayout | None = None
 
         self.refresh_manifests(initial_load=True)
         self.initial_connection_ok = not self.root_node.left_load_error and not self.root_node.right_load_error
@@ -1180,6 +1267,8 @@ class SyncApp:
         self.stdscr = stdscr
         curses.curs_set(0)
         stdscr.keypad(True)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0))
+        curses.mouseinterval(300)
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_RED, -1)  # both sides, different
         curses.init_pair(2, curses.COLOR_BLUE, -1)  # status line
@@ -1258,6 +1347,13 @@ class SyncApp:
         selection_width = 4
         divider_width = 3
         panel_width = max((width - selection_width - divider_width) // 2, 10)
+        self.list_layout = ListLayout(
+            row_start=row_start,
+            list_height=list_height,
+            selection_width=selection_width,
+            panel_width=panel_width,
+            divider_width=divider_width,
+        )
 
         # Column header labels (row 2)
         col_header = (
@@ -1345,6 +1441,13 @@ class SyncApp:
         elif self.cursor_index >= self.scroll_offset + list_height:
             self.scroll_offset = self.cursor_index - list_height + 1
 
+    def move_cursor_by(self, delta: int) -> None:
+        visible = visible_nodes(self.root_node)
+        if not visible:
+            return
+        self.cursor_index = max(0, min(self.cursor_index + delta, len(visible) - 1))
+        self.ensure_cursor_visible()
+
     def current_node(self) -> TreeNode | None:
         visible = visible_nodes(self.root_node)
         if not visible:
@@ -1392,6 +1495,54 @@ class SyncApp:
             return
         self.cursor_index = min(self.cursor_index + 1, len(visible_nodes(self.root_node)) - 1)
         self.ensure_cursor_visible()
+
+    def toggle_expand_current_directory(self) -> None:
+        node = self.current_node()
+        if node is None or not node_is_directory(node):
+            return
+        if node.is_expanded:
+            node.is_expanded = False
+            self.message = f"Collapsed {node.rel_path or '/'}."
+            return
+        if not node.children_loaded:
+            self.message = f"Loading {node.rel_path or '/'} ..."
+            self.render()
+            self.load_children(node)
+        node.is_expanded = True
+        self.message = f"Expanded {node.rel_path or '/'}."
+
+    def handle_mouse_event(self) -> None:
+        _mouse_id, x, y, _z, bstate = curses.getmouse()
+        visible = visible_nodes(self.root_node)
+        if not visible:
+            return
+
+        if mouse_has_button(bstate, "BUTTON4_PRESSED"):
+            self.move_cursor_by(-3)
+            return
+        if mouse_has_button(bstate, "BUTTON5_PRESSED"):
+            self.move_cursor_by(3)
+            return
+
+        if not mouse_is_primary_click(bstate):
+            return
+        if self.list_layout is None:
+            return
+        visible_index = self.list_layout.visible_index_at(
+            y,
+            self.scroll_offset,
+            len(visible),
+        )
+        if visible_index is None:
+            return
+
+        self.cursor_index = visible_index
+        self.ensure_cursor_visible()
+        if self.list_layout.is_selection_column(x):
+            self.toggle_current_node()
+            return
+        if mouse_has_button(bstate, "BUTTON1_DOUBLE_CLICKED"):
+            self.toggle_expand_current_directory()
 
     # ------------------------------- sync logic ----------------------------- #
 
@@ -1718,6 +1869,10 @@ class SyncApp:
             "Left               Collapse directory / go to parent",
             "Right / Enter      Expand directory / enter first child",
             "Space              Toggle selection (file or whole subtree)",
+            "Mouse wheel        Move cursor up/down",
+            "Mouse click        Move cursor to row",
+            "Checkbox click     Toggle row selection",
+            "Double click       Expand/collapse directory",
             "d                  Download selected  (remote → local)",
             "u                  Upload selected    (local → remote)",
             "p                  Preview diff for current file (red entries only)",
@@ -1819,6 +1974,9 @@ class SyncApp:
             return  # block all other keys while confirmation is pending
 
         visible = visible_nodes(self.root_node)
+        if key == curses.KEY_MOUSE:
+            self.handle_mouse_event()
+            return
         if key == curses.KEY_UP:
             self.cursor_index = max(self.cursor_index - 1, 0)
             self.ensure_cursor_visible()

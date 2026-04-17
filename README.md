@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.1.1`
+当前版本：`v0.1.2`
 
 ## 运行
 
@@ -53,7 +53,7 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 ~/.config/rsync-tree-tui/config.json
 ```
 
-该文件维护 checksum 策略和成功连接过的 local/remote。没有传入 remote 时，工具会按访问次数列出历史连接，让用户输入 index 选择。
+该文件维护 checksum 策略和成功连接过的 local/remote。没有传入 remote 时，工具会按访问次数列出历史连接，让用户输入 index 选择。TTY 环境中，remote 的 user、host、path 会用不同颜色提示；非 TTY 或设置 `NO_COLOR` 时输出纯文本。
 
 配置样例见 `config.example.json`。
 
@@ -83,6 +83,15 @@ r                  刷新 manifest
 q / Esc            退出
 ```
 
+## 鼠标操作
+
+```text
+滚轮上 / 下         移动光标
+单击行             移动光标到该行
+单击复选框列       切换该行选择
+双击目录           展开或折叠目录
+```
+
 ## 版本
 
 版本变更记录见 `CHANGELOG.md`。
@@ -92,4 +101,5 @@ q / Esc            退出
 ```text
 v0.1.0
 v0.1.1
+v0.1.2
 ```

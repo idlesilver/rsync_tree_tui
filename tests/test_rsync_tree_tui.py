@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import rsync_tree_tui as tui
@@ -72,6 +73,46 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.local_root, (Path(self.tmp.name) / "cli_local").resolve())
         self.assertEqual(config.remote_spec, "cli@example:/data")
+
+
+class KnownConnectionDisplayTests(unittest.TestCase):
+    def test_remote_display_splits_user_host_and_path(self) -> None:
+        self.assertEqual(
+            tui.split_remote_for_display("alice@example.com:/data/assets"),
+            ("alice", "example.com", ":/data/assets"),
+        )
+
+    def test_remote_display_handles_host_without_user(self) -> None:
+        self.assertEqual(
+            tui.split_remote_for_display("example.com:/data/assets"),
+            ("", "example.com", ":/data/assets"),
+        )
+
+    def test_colored_remote_display_uses_ansi_segments(self) -> None:
+        text = tui.format_remote_for_display("alice@example.com:/data", use_color=True)
+
+        self.assertIn(tui.ANSI_GREEN, text)
+        self.assertIn(tui.ANSI_CYAN, text)
+        self.assertIn(tui.ANSI_YELLOW, text)
+
+    def test_plain_remote_display_has_no_ansi_segments(self) -> None:
+        text = tui.format_remote_for_display("alice@example.com:/data", use_color=False)
+
+        self.assertEqual(text, "alice@example.com:/data")
+        self.assertNotIn("\033[", text)
+
+    def test_known_connection_entry_keeps_copyable_text_without_color(self) -> None:
+        text = tui.format_known_connection_entry(
+            2,
+            {
+                "local_root": "/local",
+                "remote": "alice@example.com:/data",
+                "trigger_count": 4,
+            },
+            use_color=False,
+        )
+
+        self.assertEqual(text, "  [2] /local  <->  alice@example.com:/data  (4 runs)")
 
 
 class ManifestTests(unittest.TestCase):
@@ -144,6 +185,131 @@ class RenderTests(unittest.TestCase):
         cell = tui.render_side_cell(node, "left", 40)
 
         self.assertIn("<error>", cell)
+
+
+class MouseTests(unittest.TestCase):
+    def make_app_with_nodes(self) -> tui.SyncApp:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        first = tui.TreeNode(
+            name="first",
+            rel_path="first",
+            parent=root,
+            left_entry=tui.EntryMeta(
+                rel_path="first",
+                entry_type=tui.EntryType.FILE,
+                size=1,
+                mtime_s=1,
+                perms=0o644,
+            ),
+        )
+        second = tui.TreeNode(
+            name="second",
+            rel_path="second",
+            parent=root,
+            left_entry=tui.EntryMeta(
+                rel_path="second",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+            children_loaded=True,
+        )
+        root.children = {"first": first, "second": second}
+        app.root_node = root
+        app.cursor_index = 0
+        app.scroll_offset = 0
+        app.last_cursor_rel_path = ""
+        app.list_layout = tui.ListLayout(
+            row_start=3,
+            list_height=10,
+            selection_width=4,
+            panel_width=40,
+            divider_width=3,
+        )
+        app.message = ""
+        return app
+
+    def test_list_layout_hit_test(self) -> None:
+        layout = tui.ListLayout(
+            row_start=3,
+            list_height=5,
+            selection_width=4,
+            panel_width=20,
+            divider_width=3,
+        )
+
+        self.assertEqual(layout.visible_index_at(4, 10, 20), 11)
+        self.assertIsNone(layout.visible_index_at(2, 10, 20))
+        self.assertTrue(layout.is_selection_column(3))
+        self.assertFalse(layout.is_selection_column(4))
+
+    def test_mouse_click_row_moves_cursor_without_selecting(self) -> None:
+        app = self.make_app_with_nodes()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 4, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertEqual(app.cursor_index, 1)
+        self.assertFalse(tui.visible_nodes(app.root_node)[1].is_selected)
+
+    def test_mouse_click_selection_column_toggles_selection(self) -> None:
+        app = self.make_app_with_nodes()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 1, 4, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertEqual(app.cursor_index, 1)
+        self.assertTrue(tui.visible_nodes(app.root_node)[1].is_selected)
+
+    def test_mouse_wheel_moves_cursor(self) -> None:
+        app = self.make_app_with_nodes()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 4, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON5_PRESSED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertEqual(app.cursor_index, 1)
+
+    def test_mouse_motion_without_click_is_ignored(self) -> None:
+        app = self.make_app_with_nodes()
+
+        with mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 4, 0, 0)):
+            app.handle_mouse_event()
+
+        self.assertEqual(app.cursor_index, 0)
+
+    def test_mouse_double_click_toggles_directory(self) -> None:
+        app = self.make_app_with_nodes()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 3, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_DOUBLE_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertTrue(tui.visible_nodes(app.root_node)[0].is_expanded)
 
 
 if __name__ == "__main__":
