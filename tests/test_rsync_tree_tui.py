@@ -1,10 +1,24 @@
 import argparse
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import rsync_tree_tui as tui
+
+
+class CliTests(unittest.TestCase):
+    def test_version_output(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "rsync_tree_tui.py", "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertIn(tui.__version__, result.stdout)
 
 
 class ConfigTests(unittest.TestCase):

@@ -23,6 +23,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
+__version__ = "0.1.0"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -331,6 +332,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=f"Global JSON config path (default: {default_config_path()}).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{APP_NAME} {__version__}",
     )
     return parser.parse_args()
 
