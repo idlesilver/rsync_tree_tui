@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.1.2`
+当前版本：`v0.1.3`
 
 ## 运行
 
@@ -57,6 +57,28 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 
 配置样例见 `config.example.json`。
 
+## 快速上手
+
+下面的脚本会创建两个相似但不完全相同的目录，然后用 `localhost` 作为远端目标启动工具。需要本机 SSH 可以连到 localhost。
+
+```bash
+tmp_root="$(mktemp -d)"
+local_dir="$tmp_root/local"
+remote_dir="$tmp_root/remote"
+
+mkdir -p "$local_dir/sub" "$remote_dir/sub"
+printf "same\n" > "$local_dir/sub/same.txt"
+printf "same\n" > "$remote_dir/sub/same.txt"
+printf "local only\n" > "$local_dir/local_only.txt"
+printf "remote only\n" > "$remote_dir/remote_only.txt"
+printf "local value\n" > "$local_dir/sub/different.txt"
+printf "remote value\n" > "$remote_dir/sub/different.txt"
+
+python rsync_tree_tui.py \
+  --local-root "$local_dir" \
+  --remote "localhost:$remote_dir"
+```
+
 ## Checksum Policy
 
 默认 `balanced` 策略：
@@ -102,4 +124,5 @@ q / Esc            退出
 v0.1.0
 v0.1.1
 v0.1.2
+v0.1.3
 ```

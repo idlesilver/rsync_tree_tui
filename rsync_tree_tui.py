@@ -24,7 +24,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -878,9 +878,21 @@ def mouse_is_primary_click(bstate: int) -> bool:
         bstate,
         "BUTTON1_CLICKED",
         "BUTTON1_PRESSED",
-        "BUTTON1_RELEASED",
         "BUTTON1_DOUBLE_CLICKED",
     )
+
+
+def mouse_event_mask() -> int:
+    mask = 0
+    for name in (
+        "BUTTON1_CLICKED",
+        "BUTTON1_PRESSED",
+        "BUTTON1_DOUBLE_CLICKED",
+        "BUTTON4_PRESSED",
+        "BUTTON5_PRESSED",
+    ):
+        mask |= getattr(curses, name, 0)
+    return mask or curses.ALL_MOUSE_EVENTS
 
 
 # ------------------------------------------------------------------------ #
@@ -1267,8 +1279,8 @@ class SyncApp:
         self.stdscr = stdscr
         curses.curs_set(0)
         stdscr.keypad(True)
-        curses.mousemask(curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0))
-        curses.mouseinterval(300)
+        curses.mousemask(mouse_event_mask())
+        curses.mouseinterval(180)
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_RED, -1)  # both sides, different
         curses.init_pair(2, curses.COLOR_BLUE, -1)  # status line

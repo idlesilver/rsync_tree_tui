@@ -297,6 +297,19 @@ class MouseTests(unittest.TestCase):
 
         self.assertEqual(app.cursor_index, 0)
 
+    def test_mouse_event_mask_does_not_request_motion_events(self) -> None:
+        with (
+            mock.patch("rsync_tree_tui.curses.BUTTON1_CLICKED", 1, create=True),
+            mock.patch("rsync_tree_tui.curses.BUTTON1_PRESSED", 2, create=True),
+            mock.patch("rsync_tree_tui.curses.BUTTON1_DOUBLE_CLICKED", 4, create=True),
+            mock.patch("rsync_tree_tui.curses.BUTTON4_PRESSED", 8, create=True),
+            mock.patch("rsync_tree_tui.curses.BUTTON5_PRESSED", 16, create=True),
+            mock.patch("rsync_tree_tui.curses.REPORT_MOUSE_POSITION", 32, create=True),
+        ):
+            mask = tui.mouse_event_mask()
+
+        self.assertEqual(mask, 31)
+
     def test_mouse_double_click_toggles_directory(self) -> None:
         app = self.make_app_with_nodes()
 
