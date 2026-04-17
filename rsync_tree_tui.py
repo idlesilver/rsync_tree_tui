@@ -1,0 +1,1520 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import concurrent.futures
+import curses
+import os
+import shlex
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+
+# ------------------------------------------------------------------------ #
+#                               default paths                               #
+# ------------------------------------------------------------------------ #
+
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_REPO_ROOT = _SCRIPT_DIR.parent
+
+
+def _get_env_or_dotenv(key: str) -> str | None:
+    """Read key from environment variables, then from .env at repo root."""
+    val = os.environ.get(key)
+    if val:
+        return val
+    env_file = _REPO_ROOT / ".env"
+    if env_file.exists():
+        for raw in env_file.read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == key:
+                return v.strip().strip("\"'")
+    return None
+
+
+def _default_local_root() -> Path:
+    """Mirrors LHVLA_STORAGE_ROOT logic in long_horizon_vla.common.path."""
+    env_val = _get_env_or_dotenv("LHVLA_STORAGE_ROOT")
+    if env_val:
+        p = Path(env_val).expanduser()
+        return (p if p.is_absolute() else _REPO_ROOT / p).resolve()
+    return (_REPO_ROOT / "storage").resolve()
+
+
+def _default_remote() -> str | None:
+    return _get_env_or_dotenv("RSYNC_REMOTE")
+
+# ------------------------------------------------------------------------ #
+#                                  models                                  #
+# ------------------------------------------------------------------------ #
+
+
+class EntryType(str, Enum):
+    FILE = "file"
+    DIRECTORY = "directory"
+
+
+class SelectionState(str, Enum):
+    UNSELECTED = " "
+    SELECTED = "x"
+    PARTIAL = "-"
+
+
+@dataclass(slots=True)
+class EntryMeta:
+    rel_path: str
+    entry_type: EntryType
+    size: int
+    mtime_s: int
+    perms: int  # octal mode bits, e.g. 0o755
+    owner: str = ""
+    group: str = ""
+
+
+# ------------------------------------------------------------------------ #
+#                              manifest helpers                             #
+# ------------------------------------------------------------------------ #
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Interactive local/remote asset comparison and sync tool.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Defaults (in priority order):\n"
+            "  --local-root : $LHVLA_STORAGE_ROOT  →  .env LHVLA_STORAGE_ROOT"
+            "  →  <repo>/storage\n"
+            "  --remote     : $RSYNC_REMOTE\n"
+        ),
+    )
+    parser.add_argument(
+        "--local-root",
+        type=Path,
+        default=None,
+        help="Local storage root (default: LHVLA_STORAGE_ROOT / repo/storage).",
+    )
+    parser.add_argument(
+        "--remote",
+        default=None,
+        help="Remote target user@host:/path (default: RSYNC_REMOTE env var).",
+    )
+    return parser.parse_args()
+
+
+def split_remote_spec(remote_spec: str) -> tuple[str, str]:
+    if ":" not in remote_spec:
+        raise ValueError(f"Invalid remote spec: {remote_spec}")
+    remote_target, remote_root = remote_spec.split(":", 1)
+    if not remote_target or not remote_root:
+        raise ValueError(f"Invalid remote spec: {remote_spec}")
+    return remote_target, remote_root
+
+
+def parse_manifest_output(output: bytes) -> dict[str, EntryMeta]:
+    entry_by_rel_path: dict[str, EntryMeta] = {}
+    if not output:
+        return entry_by_rel_path
+
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        parts = record.decode("utf-8").split("\t")
+        rel_path_text, entry_type_text, size_text, mtime_text, perms_text, owner_text, group_text = parts
+        entry_type = EntryType.DIRECTORY if entry_type_text == "d" else EntryType.FILE
+        entry_by_rel_path[rel_path_text] = EntryMeta(
+            rel_path=rel_path_text,
+            entry_type=entry_type,
+            size=int(size_text),
+            mtime_s=int(float(mtime_text)),
+            perms=int(perms_text, 8),
+            owner=owner_text,
+            group=group_text,
+        )
+    return entry_by_rel_path
+
+
+def list_local_entries(local_root: Path, rel_path: str) -> dict[str, EntryMeta]:
+    start_path = rel_path if rel_path else "."
+    output = subprocess.run(
+        [
+            "find",
+            "-L",
+            start_path,
+            "-mindepth",
+            "1",
+            "-maxdepth",
+            "1",
+            "-printf",
+            r"%P\t%y\t%s\t%T@\t%m\t%u\t%g\0",
+        ],
+        cwd=local_root,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    return parse_manifest_output(output)
+
+
+def list_remote_entries(
+    remote_target: str,
+    remote_root: str,
+    rel_path: str,
+    ssh_opts: list[str],
+) -> dict[str, EntryMeta]:
+    start_path = rel_path if rel_path else "."
+    remote_command = (
+        f"cd {shlex.quote(remote_root)} && "
+        f"find -L {shlex.quote(start_path)} -mindepth 1 -maxdepth 1 "
+        r"-printf '%P\t%y\t%s\t%T@\t%m\t%u\t%g\0'"
+    )
+    output = subprocess.run(
+        ["ssh", *ssh_opts, remote_target, remote_command],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    return parse_manifest_output(output)
+
+
+def join_rel_path(parent_rel_path: str, child_name: str) -> str:
+    if not parent_rel_path:
+        return child_name
+    return f"{parent_rel_path}/{child_name}"
+
+
+def sorted_children(node: TreeNode) -> list[TreeNode]:
+    def sort_key(child_node: TreeNode) -> tuple[int, str]:
+        return (0 if node_is_directory(child_node) else 1, child_node.name)
+
+    return sorted(node.children.values(), key=sort_key)
+
+
+def node_has_children(node: TreeNode) -> bool:
+    return bool(node.children)
+
+
+def node_is_directory(node: TreeNode) -> bool:
+    if node_has_children(node):
+        return True
+    if node.left_entry and node.left_entry.entry_type == EntryType.DIRECTORY:
+        return True
+    if node.right_entry and node.right_entry.entry_type == EntryType.DIRECTORY:
+        return True
+    return False
+
+
+def node_exists_on_left(node: TreeNode) -> bool:
+    return node.left_entry is not None
+
+
+def node_exists_on_right(node: TreeNode) -> bool:
+    return node.right_entry is not None
+
+
+def node_has_self_difference(node: TreeNode) -> bool:
+    if node.left_entry is None or node.right_entry is None:
+        return node.left_entry is not None or node.right_entry is not None
+
+    if node.left_entry.entry_type != node.right_entry.entry_type:
+        return True
+
+    if node.left_entry.entry_type == EntryType.FILE:
+        if node.left_entry.size != node.right_entry.size:
+            return True  # different size → definitely different content
+        if node.content_verified_same:
+            return False  # hash-confirmed identical; metadata diff is irrelevant
+        return node.left_entry.mtime_s != node.right_entry.mtime_s
+
+    return False
+
+
+def node_has_difference(node: TreeNode) -> bool:
+    if node_has_self_difference(node):
+        return True
+    if not node.children_loaded:
+        return False
+    return any(node_has_difference(child_node) for child_node in node.children.values())
+
+
+def node_is_confirmed_same(node: TreeNode) -> bool:
+    """True only when both sides exist and every descendant has been loaded with no diff.
+
+    A directory with unexplored subdirectories returns False (shown as white),
+    even if no difference has been detected yet.
+    """
+    if node.left_entry is None or node.right_entry is None:
+        return False
+    if node_has_self_difference(node):
+        return False
+    if node_is_directory(node):
+        if not node.children_loaded:
+            return False
+        return all(
+            node_is_confirmed_same(child) for child in node.children.values()
+        )
+    return True
+
+
+def selection_state(node: TreeNode) -> SelectionState:
+    if not node_is_directory(node):
+        return (
+            SelectionState.SELECTED if node.is_selected else SelectionState.UNSELECTED
+        )
+
+    if node.is_selected and not node.children_loaded:
+        return SelectionState.SELECTED
+
+    if not node.children:
+        return (
+            SelectionState.SELECTED if node.is_selected else SelectionState.UNSELECTED
+        )
+
+    child_states = [selection_state(child_node) for child_node in node.children.values()]
+    if all(child_state == SelectionState.SELECTED for child_state in child_states):
+        return SelectionState.SELECTED
+    if all(child_state == SelectionState.UNSELECTED for child_state in child_states):
+        if node.is_selected:
+            return SelectionState.PARTIAL
+        return SelectionState.UNSELECTED
+    return SelectionState.PARTIAL
+
+
+def set_subtree_selection(node: TreeNode, is_selected: bool) -> None:
+    node.is_selected = is_selected
+    for child_node in node.children.values():
+        set_subtree_selection(child_node, is_selected)
+
+
+def collect_selected_paths(node: TreeNode, source_side: str) -> list[str]:
+    selected_rel_paths: list[str] = []
+    source_entry = node.left_entry if source_side == "left" else node.right_entry
+    if node.rel_path and node.is_selected and source_entry is not None:
+        if not node_is_directory(node) or selection_state(node) == SelectionState.SELECTED:
+            selected_rel_paths.append(node.rel_path)
+            return selected_rel_paths
+    for child_node in sorted_children(node):
+        selected_rel_paths.extend(collect_selected_paths(child_node, source_side))
+    return selected_rel_paths
+
+
+def collect_selected_node_paths(node: TreeNode) -> set[str]:
+    selected_node_paths: set[str] = set()
+    if node.is_selected:
+        selected_node_paths.add(node.rel_path)
+    for child_node in node.children.values():
+        selected_node_paths.update(collect_selected_node_paths(child_node))
+    return selected_node_paths
+
+
+def deselect_all_nodes(node: TreeNode) -> int:
+    """Recursively clear is_selected on every node. Returns the count of nodes cleared."""
+    cleared = 0
+    if node.is_selected:
+        node.is_selected = False
+        cleared += 1
+    for child in node.children.values():
+        cleared += deselect_all_nodes(child)
+    return cleared
+
+
+def collect_selected_nodes(node: TreeNode) -> list[TreeNode]:
+    """Collect all selected TreeNode objects (not just paths)."""
+    result: list[TreeNode] = []
+    if node.rel_path and node.is_selected:
+        result.append(node)
+        return result  # don't descend into selected node — subtree will be handled
+    for child_node in sorted_children(node):
+        result.extend(collect_selected_nodes(child_node))
+    return result
+
+
+def collect_expanded_node_paths(node: TreeNode) -> set[str]:
+    expanded_node_paths: set[str] = set()
+    if node.is_expanded:
+        expanded_node_paths.add(node.rel_path)
+    for child_node in node.children.values():
+        expanded_node_paths.update(collect_expanded_node_paths(child_node))
+    return expanded_node_paths
+
+
+def visible_nodes(root_node: TreeNode) -> list[TreeNode]:
+    nodes: list[TreeNode] = []
+
+    def append_visible_nodes(node: TreeNode) -> None:
+        if node.rel_path:
+            nodes.append(node)
+        if node.is_expanded:
+            for child_node in sorted_children(node):
+                append_visible_nodes(child_node)
+
+    append_visible_nodes(root_node)
+    return nodes
+
+
+# ------------------------------------------------------------------------ #
+#                                tui helpers                                #
+# ------------------------------------------------------------------------ #
+
+
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def truncate_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.ljust(width)
+    if width <= 3:
+        return text[:width]
+    return f"{text[: width - 3]}..."
+
+
+def path_suffix_for_side(node: TreeNode, side: str) -> str:
+    entry = node.left_entry if side == "left" else node.right_entry
+    if entry is None:
+        return ""
+    if entry.entry_type == EntryType.DIRECTORY or node_has_children(node):
+        return "/"
+    return ""
+
+
+def remote_dir_badge(entry: EntryMeta) -> str:
+    """Return a short access badge based on group permission bits."""
+    g_r = bool(entry.perms & 0o040)
+    g_w = bool(entry.perms & 0o020)
+    if g_r and g_w:
+        return " [pub]"
+    if g_r:
+        return " [ro]"
+    return " [pvt]"
+
+
+_TREE_MID   = "├─ "
+_TREE_LAST  = "└─ "
+_TREE_CONT  = "│  "
+_TREE_BLANK = "   "
+
+
+def compute_tree_prefixes(visible: list[TreeNode]) -> list[str]:
+    """Return the box-drawing prefix string for each visible node."""
+    prefixes: list[str] = []
+    for i, node in enumerate(visible):
+        if node.depth <= 0:
+            prefixes.append("")
+            continue
+        parts: list[str] = []
+        for d in range(1, node.depth + 1):
+            has_more = False
+            for j in range(i + 1, len(visible)):
+                vj = visible[j].depth
+                if vj < d:
+                    break
+                if vj == d:
+                    has_more = True
+                    break
+            if d < node.depth:
+                parts.append(_TREE_CONT if has_more else _TREE_BLANK)
+            else:
+                parts.append(_TREE_MID if has_more else _TREE_LAST)
+        prefixes.append("".join(parts))
+    return prefixes
+
+
+def render_side_cell(
+    node: TreeNode,
+    side: str,
+    width: int,
+    tree_prefix: str = "",
+    show_badge: bool = False,
+) -> str:
+    entry = node.left_entry if side == "left" else node.right_entry
+    expand_icon = (
+        "▼" if (node_is_expandable(node) and node.is_expanded)
+        else "▶" if node_is_expandable(node)
+        else " "
+    )
+    node_name = node.name if entry is not None else "<missing>"
+    suffix = path_suffix_for_side(node, side)
+    badge = ""
+    if show_badge and entry is not None and node_is_directory(node):
+        badge = remote_dir_badge(entry)
+    cell_text = f"{tree_prefix}{expand_icon} {node_name}{suffix}{badge}"
+    return truncate_text(cell_text, width)
+
+
+def selection_marker(node: TreeNode) -> str:
+    return f"[{selection_state(node).value}]"
+
+
+def format_local_root(local_root: Path) -> str:
+    return f"{local_root.as_posix().rstrip('/')}/"
+
+
+def format_remote_root(remote_target: str, remote_root: str) -> str:
+    return f"{remote_target}:{remote_root.rstrip('/')}/"
+
+
+def node_is_expandable(node: TreeNode) -> bool:
+    return node_is_directory(node) and (not node.children_loaded or bool(node.children))
+
+
+# ------------------------------------------------------------------------ #
+#                                  tree node                                #
+# ------------------------------------------------------------------------ #
+
+
+@dataclass(slots=True)
+class TreeNode:
+    name: str
+    rel_path: str
+    parent: TreeNode | None = None
+    left_entry: EntryMeta | None = None
+    right_entry: EntryMeta | None = None
+    children: dict[str, TreeNode] = field(default_factory=dict)
+    children_loaded: bool = False
+    is_expanded: bool = False
+    is_selected: bool = False
+    content_verified_same: bool = (
+        False  # True = hash-confirmed identical despite metadata diff
+    )
+
+    @property
+    def depth(self) -> int:
+        if self.parent is None:
+            return -1
+        return self.parent.depth + 1
+
+
+# ------------------------------------------------------------------------ #
+#                                  sync app                                 #
+# ------------------------------------------------------------------------ #
+
+
+class SyncApp:
+    def __init__(self, local_root: Path, remote_spec: str) -> None:
+        self.local_root = local_root.resolve()
+        self.remote_spec = remote_spec
+        self.remote_target, self.remote_root = split_remote_spec(remote_spec)
+
+        # SSH ControlMaster: PID-scoped socket so concurrent instances do not
+        # share a socket — if they did, the first instance to exit would send
+        # "ssh -O exit" and break the remaining instances.
+        host_slug = (
+            self.remote_target.replace("@", "_at_")
+            .replace(".", "_")
+            .replace(":", "_")
+        )
+        self._ssh_socket_path: str = str(
+            Path.home() / ".ssh" / f"rsync_tui_{host_slug}_{os.getpid()}.sock"
+        )
+        self._control_master_closed: bool = False
+        atexit.register(self._close_control_master)
+
+        # Remote identity (queried once; first SSH call establishes the master)
+        self.remote_user: str = ""
+        self.remote_groups: set[str] = set()
+        self._query_remote_identity()
+
+        self.root_node = TreeNode(name="", rel_path="")
+        self.node_by_rel_path: dict[str, TreeNode] = {"": self.root_node}
+        self.cursor_index = 0
+        self.scroll_offset = 0
+        self.message = "Loading manifests..."
+        self.pending_action: str | None = None
+        self.last_cursor_rel_path = ""
+
+        self.refresh_manifests(initial_load=True)
+
+    # ------------------------------- SSH helpers ---------------------------- #
+
+    def _ssh_opts(self) -> list[str]:
+        """SSH options injected into every ssh/rsync call for ControlMaster reuse.
+
+        Only ControlMaster options are overridden; all other settings (identity
+        file, host key checking, port, user, etc.) are left to the user's
+        ~/.ssh/config so colleagues can use their own SSH configuration.
+        """
+        return [
+            "-o", f"ControlPath={self._ssh_socket_path}",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60",
+        ]
+
+    def _close_control_master(self) -> None:
+        if self._control_master_closed:
+            return
+        self._control_master_closed = True
+        subprocess.run(
+            ["ssh", *self._ssh_opts(), "-O", "exit", self.remote_target],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        Path(self._ssh_socket_path).unlink(missing_ok=True)
+
+    def _query_remote_identity(self) -> None:
+        """Query remote user name and groups once.
+
+        Owner/group of each entry is now embedded in EntryMeta (via find %u/%g),
+        so only the SSH user's own identity is needed here for comparison.
+        """
+        try:
+            id_out = subprocess.run(
+                ["ssh", *self._ssh_opts(), self.remote_target, "id -un && id -Gn"],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            ).stdout.strip().splitlines()
+            self.remote_user = id_out[0].strip()
+            self.remote_groups = set(id_out[1].strip().split())
+        except Exception:
+            # If identity query fails, fall back to no-permission-inference mode
+            pass
+
+    # ------------------------------- permission helpers --------------------- #
+
+    def _remote_effective_write(self, entry: EntryMeta) -> bool:
+        """Return True if the SSH user has write permission on this remote entry."""
+        p = entry.perms
+        # If identity query failed, we don't know the user's role — allow upload
+        # and let the remote filesystem reject unauthorized writes.
+        if not self.remote_user:
+            return bool(p & 0o222)  # any write bit set → probably writable by someone
+        is_owner = self.remote_user == entry.owner
+        in_group = bool(entry.group and entry.group in self.remote_groups)
+        if is_owner and bool(p & 0o200):
+            return True
+        if in_group and bool(p & 0o020):
+            return True
+        return bool(p & 0o002)
+
+    def _remote_path_writable(self, rel_path: str) -> bool:
+        """Walk up the tree to find the nearest ancestor with a right_entry and check write."""
+        node = self.node_by_rel_path.get(rel_path)
+        while node is not None:
+            if node.right_entry is not None:
+                return self._remote_effective_write(node.right_entry)
+            node = node.parent
+        # No remote entry found — assume writable (owner case or new upload)
+        return True
+
+    # ------------------------------- content verification ------------------- #
+
+    def _collect_content_check_candidates(self, node: TreeNode) -> list[TreeNode]:
+        """Walk subtree and return file nodes with same size but different mtime, not yet verified."""
+        result: list[TreeNode] = []
+        if (
+            not node_is_directory(node)
+            and node.left_entry is not None
+            and node.right_entry is not None
+            and node.left_entry.size == node.right_entry.size
+            and node.left_entry.mtime_s != node.right_entry.mtime_s
+            and not node.content_verified_same
+        ):
+            result.append(node)
+        for child in node.children.values():
+            result.extend(self._collect_content_check_candidates(child))
+        return result
+
+    def _rsync_content_check(self, candidates: list[TreeNode]) -> int:
+        """Run rsync --checksum (dry-run) on candidates; mark byte-identical files as verified.
+
+        Uses --no-perms/--no-owner/--no-group/--omit-dir-times so that only content
+        differences count.  rsync itemize output format: 'YXcstpogaz path'
+          Y = '.' → no content update needed (same)
+          Y = '>' or '<' → content differs
+        Returns the number of nodes confirmed identical.
+        """
+        if not candidates:
+            return 0
+
+        with tempfile.NamedTemporaryFile("wb", delete=False) as f:
+            for node in candidates:
+                f.write(node.rel_path.encode("utf-8"))
+                f.write(b"\0")
+            tmp_path = Path(f.name)
+
+        self.message = f"rsync --checksum: comparing {len(candidates)} same-size files..."
+        self.render()
+        try:
+            ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
+            result = subprocess.run(
+                [
+                    "rsync",
+                    "-niv",               # dry-run, itemize-changes, verbose (shows all files)
+                    "--checksum",         # compare by content checksum, not mtime
+                    "--no-perms",
+                    "--no-owner",
+                    "--no-group",
+                    "--omit-dir-times",
+                    "--from0",
+                    f"--files-from={tmp_path}",
+                    "-e", ssh_cmd,
+                    format_local_root(self.local_root),
+                    format_remote_root(self.remote_target, self.remote_root),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        # Parse itemize lines: 11-char code + space + path
+        # Y (first char) = '.' → same content; '>' / '<' / 'c' → needs update
+        same_paths: set[str] = set()
+        diff_paths: set[str] = set()
+        for line in result.stdout.splitlines():
+            if len(line) < 13 or line[11] != " " or line[1] != "f":
+                continue  # skip non-file itemize lines (dirs, headers, stats)
+            update_type = line[0]
+            rel_path = line[12:]
+            if update_type == ".":
+                same_paths.add(rel_path)
+            elif update_type in (">", "<", "c"):
+                diff_paths.add(rel_path)
+
+        matched = 0
+        for node in candidates:
+            if node.rel_path in same_paths:
+                node.content_verified_same = True
+                matched += 1
+            elif node.rel_path in diff_paths:
+                node.content_verified_same = False
+        return matched
+
+    # ------------------------------- lifecycle ------------------------------ #
+
+    def refresh_manifests(self, initial_load: bool = False) -> None:
+        selected_node_paths = collect_selected_node_paths(self.root_node)
+        expanded_node_paths = collect_expanded_node_paths(self.root_node)
+        if initial_load:
+            selected_node_paths = set()
+            expanded_node_paths = {""}
+
+        self.initialize_tree()
+
+        materialized_paths = sorted(
+            (selected_node_paths | expanded_node_paths) - {""},
+            key=lambda rel_path: (rel_path.count("/"), rel_path),
+        )
+        for rel_path in materialized_paths:
+            node = self.ensure_path_loaded(rel_path)
+            if node is not None and rel_path in selected_node_paths:
+                node.is_selected = True
+            if node is not None and rel_path in expanded_node_paths and node_is_directory(node):
+                self.load_children(node)
+                node.is_expanded = True
+
+        visible = visible_nodes(self.root_node)
+        if not visible:
+            self.cursor_index = 0
+            self.scroll_offset = 0
+            self.message = "No entries found on either side."
+            return
+
+        if self.last_cursor_rel_path in self.node_by_rel_path:
+            self.cursor_index = max(
+                0,
+                next(
+                    (
+                        index
+                        for index, node in enumerate(visible)
+                        if node.rel_path == self.last_cursor_rel_path
+                    ),
+                    0,
+                ),
+            )
+        else:
+            self.cursor_index = min(self.cursor_index, len(visible) - 1)
+        self.ensure_cursor_visible()
+        self.message = f"Loaded {len(self.root_node.children)} root entries."
+
+    def initialize_tree(self) -> None:
+        self.root_node = TreeNode(name="", rel_path="", is_expanded=True)
+        self.node_by_rel_path = {"": self.root_node}
+        self.load_children(self.root_node)
+
+    def ensure_path_loaded(self, rel_path: str) -> TreeNode | None:
+        current_node = self.root_node
+        if not rel_path:
+            return current_node
+
+        for part in rel_path.split("/"):
+            if not current_node.children_loaded:
+                self.load_children(current_node)
+            next_node = current_node.children.get(part)
+            if next_node is None:
+                return None
+            current_node = next_node
+        return current_node
+
+    def load_children(self, node: TreeNode) -> None:
+        if node.children_loaded or not node_is_directory(node) and node.rel_path:
+            return
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_local = pool.submit(self.list_local_child_entries, node)
+            f_remote = pool.submit(self.list_remote_child_entries, node)
+
+            spin_i = 0
+            pending = {f_local, f_remote}
+            while pending:
+                done, pending = concurrent.futures.wait(pending, timeout=0.1)
+                if pending and hasattr(self, "stdscr"):
+                    self.message = (
+                        f"Loading {node.rel_path or '/'} "
+                        f"{_SPINNER[spin_i % len(_SPINNER)]}"
+                    )
+                    self.render()
+                    spin_i += 1
+
+            try:
+                left_entry_by_name = f_local.result()
+            except Exception as exc:
+                left_entry_by_name = {}
+                self.message = f"Error listing local {node.rel_path or '/'}: {exc}"
+            try:
+                right_entry_by_name = f_remote.result()
+            except Exception as exc:
+                right_entry_by_name = {}
+                self.message = f"Error listing remote {node.rel_path or '/'}: {exc}"
+
+        existing_children = node.children
+        node.children = {}
+        child_names = sorted(set(left_entry_by_name.keys()) | set(right_entry_by_name.keys()))
+        inherit_selection = node.is_selected
+
+        for child_name in child_names:
+            child_rel_path = join_rel_path(node.rel_path, child_name)
+            child_node = existing_children.get(child_name)
+            if child_node is None:
+                child_node = self.node_by_rel_path.get(child_rel_path)
+            if child_node is None:
+                child_node = TreeNode(
+                    name=child_name,
+                    rel_path=child_rel_path,
+                    parent=node,
+                    is_selected=inherit_selection,
+                )
+                self.node_by_rel_path[child_rel_path] = child_node
+            child_node.parent = node
+            new_left = left_entry_by_name.get(child_name)
+            new_right = right_entry_by_name.get(child_name)
+            if new_left != child_node.left_entry or new_right != child_node.right_entry:
+                child_node.content_verified_same = False
+            child_node.left_entry = new_left
+            child_node.right_entry = new_right
+            if not node_is_directory(child_node):
+                child_node.children_loaded = True
+                child_node.children = {}
+            node.children[child_name] = child_node
+
+        node.children_loaded = True
+
+    def list_local_child_entries(self, node: TreeNode) -> dict[str, EntryMeta]:
+        if node.rel_path and node.left_entry is None:
+            return {}
+        return list_local_entries(self.local_root, node.rel_path)
+
+    def list_remote_child_entries(self, node: TreeNode) -> dict[str, EntryMeta]:
+        if node.rel_path and node.right_entry is None:
+            return {}
+        return list_remote_entries(
+            self.remote_target,
+            self.remote_root,
+            node.rel_path,
+            self._ssh_opts(),
+        )
+
+    def run(self) -> None:
+        curses.wrapper(self._run)
+
+    def _run(self, stdscr: curses.window) -> None:
+        self.stdscr = stdscr
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)  # both sides, different
+        curses.init_pair(2, curses.COLOR_BLUE, -1)  # status line
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)  # help text / local-only
+        curses.init_pair(4, curses.COLOR_CYAN, -1)  # remote-only
+        curses.init_pair(5, curses.COLOR_GREEN,  -1)   # both exist, confirmed same
+
+        try:
+            while True:
+                self.render()
+                key = stdscr.getch()
+                if key in (ord("q"), 27):
+                    return
+                self.handle_key(key)
+        finally:
+            self._close_control_master()
+
+    # ------------------------------- rendering ------------------------------ #
+
+    def render(self) -> None:
+        stdscr = self.stdscr
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        header_left = f"Local:  {self.local_root}"
+        header_right = f"Remote: {self.remote_spec}"
+        stdscr.addnstr(0, 0, header_left, width - 1, curses.A_BOLD)
+        stdscr.addnstr(1, 0, header_right, width - 1, curses.A_BOLD)
+
+        nav_help = (
+            "Up/Down Move  Left/Right Fold  Space Toggle  "
+            "d Download  u Upload  p Diff  c Check  x Clear  r Refresh  ? Help  q Quit"
+        )
+        stdscr.addnstr(height - 3, 0, nav_help, width - 1, curses.color_pair(3))
+
+        # Color legend — each segment rendered in its actual color
+        _legend = [
+            ("unexplored", curses.A_NORMAL),
+            (" local-only", curses.color_pair(3)),
+            (" remote-only", curses.color_pair(4)),
+            (" same", curses.color_pair(5)),
+            (" diff", curses.color_pair(1)),
+        ]
+        _lx = 0  # min(len(nav_help), width - 1)
+        for _label, _attr in _legend:
+            if _lx + len(_label) >= width - 1:
+                break
+            stdscr.addnstr(height - 2, _lx, _label, width - 1 - _lx, _attr)
+            _lx += len(_label)
+
+        status_text = self.message
+        if self.pending_action is not None:
+            if self.pending_action == "check":
+                status_text = (
+                    "Recursively check selected entries (may take a long time). "
+                    "Press y to confirm, n to cancel."
+                )
+            elif self.pending_action == "clear":
+                status_text = "Clear ALL selections? Press y to confirm, n to cancel."
+            else:
+                status_text = (
+                    f"{self.pending_action} selected entries. Press y to confirm, n to cancel."
+                )
+        stdscr.addnstr(height - 1, 0, status_text, width - 1, curses.color_pair(2))
+
+        visible = visible_nodes(self.root_node)
+        if not visible:
+            stdscr.refresh()
+            return
+
+        row_start = 3
+        row_end = height - 3
+        list_height = max(row_end - row_start, 1)
+        self.ensure_cursor_visible(list_height=list_height)
+
+        selection_width = 4
+        divider_width = 3
+        panel_width = max((width - selection_width - divider_width) // 2, 10)
+
+        # Column header labels (row 2)
+        col_header = (
+            " " * selection_width
+            + "LOCAL".ljust(panel_width)
+            + " │ "
+            + "REMOTE"
+        )
+        stdscr.addnstr(2, 0, col_header, width - 1, curses.A_BOLD | curses.A_UNDERLINE)
+
+        tree_prefixes = compute_tree_prefixes(visible)
+
+        for list_row in range(list_height):
+            visible_index = self.scroll_offset + list_row
+            if visible_index >= len(visible):
+                break
+
+            screen_row = row_start + list_row
+            node = visible[visible_index]
+            is_cursor_row = visible_index == self.cursor_index
+
+            left_exists = node_exists_on_left(node)
+            right_exists = node_exists_on_right(node)
+            if left_exists and right_exists:
+                if node_has_difference(node):
+                    row_color = curses.color_pair(1)   # red — different
+                elif node_is_confirmed_same(node):
+                    row_color = curses.color_pair(5)   # green — all descendants confirmed same
+                else:
+                    row_color = 0                       # white — both exist, not fully explored
+            elif left_exists:
+                row_color = curses.color_pair(3)   # yellow — local only
+            else:
+                row_color = curses.color_pair(4)  # cyan   — remote only
+            row_attr = (curses.A_REVERSE if is_cursor_row else curses.A_NORMAL) | row_color
+
+            marker_text = selection_marker(node)
+            marker_attr = row_attr
+            if selection_state(node) != SelectionState.UNSELECTED:
+                marker_attr |= curses.A_BOLD
+            stdscr.addnstr(screen_row, 0, marker_text, selection_width, marker_attr)
+
+            left_attr = row_attr | (curses.A_BOLD if left_exists else 0)
+            stdscr.addnstr(
+                screen_row,
+                selection_width,
+                render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=False),
+                panel_width,
+                left_attr,
+            )
+
+            stdscr.addnstr(screen_row, selection_width + panel_width, " │ ", divider_width, curses.A_BOLD)
+
+            right_attr = row_attr | (curses.A_BOLD if right_exists else 0)
+            stdscr.addnstr(
+                screen_row,
+                selection_width + panel_width + divider_width,
+                render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=True),
+                panel_width,
+                right_attr,
+            )
+
+        stdscr.refresh()
+
+    # ------------------------------- navigation ----------------------------- #
+
+    def ensure_cursor_visible(self, list_height: int | None = None) -> None:
+        visible = visible_nodes(self.root_node)
+        if not visible:
+            self.cursor_index = 0
+            self.scroll_offset = 0
+            return
+
+        self.cursor_index = max(0, min(self.cursor_index, len(visible) - 1))
+        self.last_cursor_rel_path = visible[self.cursor_index].rel_path
+
+        if list_height is None:
+            height, _ = self.stdscr.getmaxyx() if hasattr(self, "stdscr") else (24, 120)
+            list_height = max(height - 6, 1)
+
+        max_scroll = max(len(visible) - list_height, 0)
+        self.scroll_offset = max(0, min(self.scroll_offset, max_scroll))
+        if self.cursor_index < self.scroll_offset:
+            self.scroll_offset = self.cursor_index
+        elif self.cursor_index >= self.scroll_offset + list_height:
+            self.scroll_offset = self.cursor_index - list_height + 1
+
+    def current_node(self) -> TreeNode | None:
+        visible = visible_nodes(self.root_node)
+        if not visible:
+            return None
+        return visible[self.cursor_index]
+
+    def toggle_current_node(self) -> None:
+        node = self.current_node()
+        if node is None:
+            return
+        next_selected = selection_state(node) == SelectionState.UNSELECTED
+        set_subtree_selection(node, next_selected)
+        selected_count = len(collect_selected_node_paths(self.root_node))
+        self.message = f"Updated selection. Marked nodes: {selected_count}."
+
+    def collapse_or_move_to_parent(self) -> None:
+        node = self.current_node()
+        if node is None:
+            return
+        if node_is_directory(node) and node.is_expanded:
+            node.is_expanded = False
+            self.message = f"Collapsed {node.rel_path or '/'}."
+            return
+        if node.parent is None or node.parent.rel_path == "":
+            return
+
+        parent_rel_path = node.parent.rel_path
+        visible = visible_nodes(self.root_node)
+        self.cursor_index = next(
+            index for index, visible_node in enumerate(visible) if visible_node.rel_path == parent_rel_path
+        )
+        self.ensure_cursor_visible()
+
+    def expand_or_move_to_child(self) -> None:
+        node = self.current_node()
+        if node is None or not node_is_directory(node):
+            return
+        if not node.children_loaded:
+            self.message = f"Loading {node.rel_path or '/'} ..."
+            self.render()
+            self.load_children(node)
+        if not node.is_expanded:
+            node.is_expanded = True
+            self.message = f"Expanded {node.rel_path or '/'}."
+            return
+        self.cursor_index = min(self.cursor_index + 1, len(visible_nodes(self.root_node)) - 1)
+        self.ensure_cursor_visible()
+
+    # ------------------------------- sync logic ----------------------------- #
+
+    def _load_subtree(self, node: TreeNode) -> None:
+        """Recursively load all unloaded children of a node, updating the spinner."""
+        if not node_is_directory(node):
+            return
+        if not node.children_loaded:
+            self.message = f"Checking {node.rel_path or '/'} ..."
+            self.render()
+            self.load_children(node)
+        for child in node.children.values():
+            _load_subtree_node = child
+            self._load_subtree(_load_subtree_node)
+
+    def execute_check(self) -> None:
+        """Recursively load all selected nodes to resolve white (unexplored) state."""
+        selected_nodes = collect_selected_nodes(self.root_node)
+        if not selected_nodes:
+            self.pending_action = None
+            self.message = "No entries selected for check."
+            return
+        self.pending_action = None  # clear first so render() shows message, not confirm prompt
+        self.message = f"Checking {len(selected_nodes)} selected entries..."
+        self.render()
+        count = 0
+        for node in selected_nodes:
+            self._load_subtree(node)
+            count += 1
+
+        # rsync --checksum for files that share size but differ in mtime
+        candidates: list[TreeNode] = []
+        for node in selected_nodes:
+            candidates.extend(self._collect_content_check_candidates(node))
+        matched = 0
+        if candidates:
+            matched = self._rsync_content_check(candidates)
+
+        summary = f"Check complete for {count} selected entries."
+        if candidates:
+            summary += f" Content: {matched}/{len(candidates)} same-size files byte-identical."
+        self.message = summary
+
+    def start_action(self, action: str) -> None:
+        if action == "check":
+            selected_nodes = collect_selected_nodes(self.root_node)
+            if not selected_nodes:
+                self.message = "No entries selected to check."
+                return
+            self.pending_action = "check"
+            return
+
+        if action == "clear":
+            selected_nodes = collect_selected_nodes(self.root_node)
+            if not selected_nodes:
+                self.message = "No selections to clear."
+                return
+            self.pending_action = "clear"
+            return
+
+        source_side = "right" if action == "download" else "left"
+        selected_paths = collect_selected_paths(self.root_node, source_side)
+
+        if action == "upload":
+            selected_paths = [
+                p for p in selected_paths if self._remote_path_writable(p)
+            ]
+            if not selected_paths:
+                self.message = "No writable remote paths in selection. Check [pub] dirs."
+                self.pending_action = None
+                return
+
+        if not selected_paths:
+            self.message = f"No selectable {source_side} entries are currently selected."
+            self.pending_action = None
+            return
+
+        self.pending_action = action
+        self.message = f"Prepared {action} for {len(selected_paths)} entries."
+
+    def _expand_selected_paths(
+        self, rel_paths: list[str], source_side: str
+    ) -> list[str]:
+        """Expand directory paths into all contained paths so rsync transfers recursively.
+
+        rsync --files-from does NOT recurse into directories even with -a/-r,
+        so we must explicitly list all descendants.
+        """
+        expanded: list[str] = []
+        for rel_path in rel_paths:
+            if source_side == "left":
+                result = subprocess.run(
+                    ["find", "-L", rel_path, "-mindepth", "1", "-printf", r"%p\0"],
+                    cwd=self.local_root,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                find_cmd = (
+                    f"cd {shlex.quote(self.remote_root)} && "
+                    f"find -L {shlex.quote(rel_path)} -mindepth 1 -printf '%p\\0'"
+                    f" 2>/dev/null || true"
+                )
+                result = subprocess.run(
+                    ["ssh", *self._ssh_opts(), self.remote_target, find_cmd],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+            sub_items = [x.decode() for x in result.stdout.split(b"\0") if x]
+            expanded.append(rel_path)
+            expanded.extend(sub_items)
+        return expanded
+
+    def execute_pending_action(self) -> None:
+        if self.pending_action is None:
+            return
+
+        if self.pending_action == "check":
+            self.execute_check()
+            return
+
+        if self.pending_action == "clear":
+            self.pending_action = None
+            count = deselect_all_nodes(self.root_node)
+            self.message = f"Cleared {count} selection(s)."
+            return
+
+        action = self.pending_action
+        source_side = "right" if action == "download" else "left"
+        selected_paths = sorted(collect_selected_paths(self.root_node, source_side))
+
+        if action == "upload":
+            selected_paths = [
+                p for p in selected_paths if self._remote_path_writable(p)
+            ]
+
+        if not selected_paths:
+            self.pending_action = None
+            self.message = "Selection disappeared after refresh."
+            return
+
+        self.pending_action = None  # clear first so render() shows message, not confirm prompt
+        self.message = f"Starting {action} for {len(selected_paths)} entries..."
+        self.render()
+        selected_paths = self._expand_selected_paths(selected_paths, source_side)
+
+        with tempfile.NamedTemporaryFile("wb", delete=False) as file_list_file:
+            for rel_path in selected_paths:
+                file_list_file.write(rel_path.encode("utf-8"))
+                file_list_file.write(b"\0")
+            file_list_path = Path(file_list_file.name)
+
+        source_root = (
+            format_remote_root(self.remote_target, self.remote_root)
+            if action == "download"
+            else format_local_root(self.local_root)
+        )
+        dest_root = (
+            format_local_root(self.local_root)
+            if action == "download"
+            else format_remote_root(self.remote_target, self.remote_root)
+        )
+
+        ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
+        command = [
+            "rsync",
+            "-av",
+            "--checksum",           # compare by content, not mtime; skips byte-identical files
+            "--no-perms",
+            "--no-owner",
+            "--no-group",
+            "--omit-dir-times",
+            "--keep-dirlinks",      # -K: treat symlinked dirs on dest as real dirs
+            "--itemize-changes",
+            "--progress",
+            "--partial",
+            "--partial-dir=.rsync-partial",
+            "-e", ssh_cmd,
+            "--from0",
+            f"--files-from={file_list_path}",
+            source_root,
+            dest_root,
+        ]
+
+        self.suspend_tui()
+        sync_ok = False
+        try:
+            print(f"Running {' '.join(command)}")
+            subprocess.run(command, check=True)
+            input("Sync completed. Press Enter to return to the TUI...")
+            sync_ok = True
+        except subprocess.CalledProcessError as exc:
+            input(
+                f"Sync failed (rsync exit code {exc.returncode}). "
+                "Press Enter to return to the TUI..."
+            )
+        finally:
+            file_list_path.unlink(missing_ok=True)
+            self.resume_tui()
+
+        self.refresh_manifests(initial_load=False)
+        if sync_ok:
+            self.message = (
+                f"Completed {source_side} -> "
+                f"{'local' if action == 'download' else 'remote'} sync."
+            )
+        else:
+            self.message = "Sync failed — check terminal output above for details."
+
+    def suspend_tui(self) -> None:
+        curses.def_prog_mode()
+        curses.endwin()
+
+    def resume_tui(self) -> None:
+        curses.reset_prog_mode()
+        self.stdscr.keypad(True)
+        curses.curs_set(0)
+        self.stdscr.clear()
+        self.stdscr.refresh()
+
+    # ------------------------------- popup overlay -------------------------- #
+
+    def _show_popup(self, title: str, lines: list[str]) -> None:
+        """Scrollable centered overlay. ↑↓/PgUp/PgDn to scroll, q/Esc/Enter to close.
+
+        Lines starting with +/-/@ are colored as unified-diff output.
+        """
+        scroll = 0
+        while True:
+            self.render()
+            height, width = self.stdscr.getmaxyx()
+
+            max_line_len = max((len(l) for l in lines), default=0)
+            inner_w = min(max(max_line_len, len(title) + 4, 24), width - 6)
+            box_w = inner_w + 2
+            inner_h = min(max(len(lines), 1), height - 8)
+            # rows: top-border(1) + separator(1) + content(inner_h) + bottom-border(1)
+            box_h = inner_h + 3
+
+            start_y = max((height - box_h) // 2, 0)
+            start_x = max((width - box_w) // 2, 0)
+            box_h = min(box_h, height - start_y)
+            box_w = min(box_w, width - start_x)
+            inner_h = box_h - 3
+            inner_w = box_w - 2
+
+            win = curses.newwin(box_h, box_w, start_y, start_x)
+            win.erase()
+            win.box()
+
+            # Title in top border
+            title_str = f" {title} "
+            win.addnstr(0, max((box_w - len(title_str)) // 2, 1), title_str, box_w - 2, curses.A_BOLD)
+
+            # Separator under title
+            win.addnstr(1, 1, "─" * inner_w, inner_w)
+
+            # Content lines with diff coloring
+            for row, line in enumerate(lines[scroll : scroll + inner_h]):
+                if line.startswith("+") and not line.startswith("+++"):
+                    attr = curses.color_pair(5)  # green
+                elif line.startswith("-") and not line.startswith("---"):
+                    attr = curses.color_pair(1)  # red
+                elif line.startswith("@"):
+                    attr = curses.color_pair(2)  # cyan
+                else:
+                    attr = 0
+                win.addnstr(2 + row, 1, line[:inner_w].ljust(inner_w), inner_w, attr)
+
+            # Footer in bottom border: hint left, scroll position right
+            hint = " q/Esc:close  ↑↓:scroll "
+            win.addnstr(box_h - 1, 1, hint, min(len(hint), box_w - 2), curses.color_pair(3))
+            if len(lines) > inner_h:
+                pos = f" {scroll + 1}-{min(scroll + inner_h, len(lines))}/{len(lines)} "
+                pos_x = max(box_w - len(pos) - 1, 1)
+                if pos_x > len(hint) + 1:
+                    win.addnstr(box_h - 1, pos_x, pos, box_w - pos_x - 1, curses.color_pair(2))
+
+            win.refresh()
+
+            key = self.stdscr.getch()
+            if key in (ord("q"), 27, ord("\n"), ord(" "), ord("?"), ord("p")):
+                return
+            elif key == curses.KEY_UP:
+                scroll = max(0, scroll - 1)
+            elif key == curses.KEY_DOWN:
+                scroll = min(max(0, len(lines) - inner_h), scroll + 1)
+            elif key == curses.KEY_PPAGE:
+                scroll = max(0, scroll - inner_h)
+            elif key == curses.KEY_NPAGE:
+                scroll = min(max(0, len(lines) - inner_h), scroll + inner_h)
+
+    def _show_help_popup(self) -> None:
+        lines = [
+            "Up / Down          Move cursor",
+            "Left               Collapse directory / go to parent",
+            "Right / Enter      Expand directory / enter first child",
+            "Space              Toggle selection (file or whole subtree)",
+            "d                  Download selected  (remote → local)",
+            "u                  Upload selected    (local → remote)",
+            "p                  Preview diff for current file (red entries only)",
+            "c                  Recursively check selected entries",
+            "x                  Clear all selections (with confirmation)",
+            "r                  Refresh manifests",
+            "?                  Show this help",
+            "q / Esc            Quit",
+            "",
+            "Colors",
+            "  white            Both sides exist, not fully explored",
+            "  yellow           Local only",
+            "  blue             Remote only",
+            "  green            Confirmed identical (size + mtime match)",
+            "  red              Different (size or mtime differ)",
+            "",
+            "Remote badge (shown beside remote directory name)",
+            "  [pub]            Group read + write",
+            "  [ro]             Group read only",
+            "  [pvt]            No group access",
+        ]
+        self._show_popup("Help", lines)
+
+    def _try_preview_diff(self) -> None:
+        """Gate-check then launch diff preview for the node under the cursor."""
+        node = self.current_node()
+        if node is None:
+            return
+        if node_is_directory(node):
+            self.message = "Diff preview is only available for files, not directories."
+            return
+        if not node_exists_on_left(node) or not node_exists_on_right(node):
+            self.message = "Diff preview requires the file to exist on both sides."
+            return
+        if not node_has_self_difference(node):
+            self.message = "File appears identical on both sides (same size and mtime)."
+            return
+        self._preview_diff(node)
+
+    def _preview_diff(self, node: TreeNode) -> None:
+        """Fetch the remote copy to a temp file and show unified diff in a popup."""
+        local_path = self.local_root / node.rel_path
+        remote_path = f"{self.remote_root.rstrip('/')}/{node.rel_path}"
+
+        self.message = f"Fetching remote {node.rel_path} for diff..."
+        self.render()
+
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=Path(node.name).suffix or ".tmp"
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+
+        try:
+            fetch = subprocess.run(
+                ["ssh", *self._ssh_opts(), self.remote_target, f"cat {shlex.quote(remote_path)}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            tmp_path.write_bytes(fetch.stdout)
+
+            diff_result = subprocess.run(
+                [
+                    "diff", "-u",
+                    "--label", f"local/{node.rel_path}",
+                    "--label", f"remote/{node.rel_path}",
+                    str(local_path),
+                    str(tmp_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            lines = diff_result.stdout.splitlines()
+            if not lines:
+                # diff exit 0 → identical content (mtime differs but bytes same)
+                node.content_verified_same = True
+                lines = ["(files are byte-identical; only metadata differs)"]
+            self._show_popup(f"diff  {node.rel_path}", lines)
+            self.message = f"Diff preview closed for {node.rel_path}."
+        except subprocess.CalledProcessError as exc:
+            err = exc.stderr.decode(errors="replace").strip() if exc.stderr else str(exc)
+            self._show_popup(
+                "Diff Error", ["Failed to fetch remote file:", err or "(no output)"]
+            )
+            self.message = f"Diff failed for {node.rel_path}."
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    # ------------------------------- key events ----------------------------- #
+
+    def handle_key(self, key: int) -> None:
+        if self.pending_action is not None:
+            if key == ord("y"):
+                self.execute_pending_action()
+            elif key == ord("n"):
+                self.pending_action = None
+                self.message = "Cancelled pending sync action."
+            return  # block all other keys while confirmation is pending
+
+        visible = visible_nodes(self.root_node)
+        if key == curses.KEY_UP:
+            self.cursor_index = max(self.cursor_index - 1, 0)
+            self.ensure_cursor_visible()
+            return
+        if key == curses.KEY_DOWN:
+            self.cursor_index = min(self.cursor_index + 1, max(len(visible) - 1, 0))
+            self.ensure_cursor_visible()
+            return
+        if key == curses.KEY_LEFT:
+            self.collapse_or_move_to_parent()
+            return
+        if key in (curses.KEY_RIGHT, ord("\n")):
+            self.expand_or_move_to_child()
+            return
+        if key == ord(" "):
+            self.toggle_current_node()
+            return
+        if key == ord("d"):
+            self.start_action("download")
+            return
+        if key == ord("u"):
+            self.start_action("upload")
+            return
+        if key == ord("c"):
+            self.start_action("check")
+            return
+        if key == ord("r"):
+            self.message = "Refreshing manifests..."
+            self.refresh_manifests(initial_load=False)
+            return
+        if key == ord("p"):
+            self._try_preview_diff()
+            return
+        if key == ord("x"):
+            self.start_action("clear")
+            return
+        if key == ord("?"):
+            self._show_help_popup()
+            return
+
+
+# ------------------------------------------------------------------------ #
+#                                   entry                                   #
+# ------------------------------------------------------------------------ #
+
+
+def main() -> None:
+    args = parse_args()
+    local_root: Path = args.local_root or _default_local_root()
+    remote: str | None = args.remote or _default_remote()
+    if remote is None:
+        print(
+            "Error: --remote is required (or set the RSYNC_REMOTE environment variable)."
+        )
+        raise SystemExit(1)
+    if not local_root.exists():
+        raise FileNotFoundError(f"Local root does not exist: {local_root}")
+
+    os.environ.setdefault("TERM", "xterm-256color")
+    app = SyncApp(local_root=local_root, remote_spec=remote)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
