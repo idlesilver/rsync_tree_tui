@@ -7,12 +7,13 @@
 # Three modes (applied recursively to all content under each target):
 #   readonly  — group/others can browse and download, group cannot write [ro]  in TUI
 #   public    — group can browse, download, and upload (write)    [pub] in TUI
-#   private   — group has no access at all                        [pvt] in TUI
+#   private   — group/others have no access                       [pvt] in TUI
 #
 # Usage:
-#   setup_remote_permissions.sh [--dry-run] [-v] <mode> <path> [<path> ...]
+#   setup_remote_permissions.sh [--group GROUP] [--dry-run] [-v] <mode> <path> [<path> ...]
 #
 # Options:
+#   --group G   Shared group name (default: $GROUP or current primary group).
 #   --dry-run   Show how many entries would change, without modifying anything.
 #   -v          Verbose: list every entry whose permissions will be/were changed.
 #
@@ -40,7 +41,8 @@ set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
-GROUP="simvla"
+# Edit this line to persist a site-specific default, or pass --group.
+GROUP="${GROUP:-$(id -gn)}"
 
 # ─────────────────────────── arg parsing ────────────────────────────────── #
 
@@ -54,23 +56,37 @@ usage() {
     exit 1
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run)        DRY_RUN=1 ;;
-        -v|--verbose)     VERBOSE=1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --group)
+            [[ $# -lt 2 ]] && { echo "ERROR: --group requires a value" >&2; usage; }
+            GROUP="$2"
+            shift 2
+            ;;
+        --group=*)
+            GROUP="${1#*=}"
+            shift
+            ;;
+        --dry-run)        DRY_RUN=1; shift ;;
+        -v|--verbose)     VERBOSE=1; shift ;;
         --help|-h)        usage ;;
         readonly|public|private)
-            [[ -n "$MODE" ]] && { echo "ERROR: mode specified twice ('$MODE' and '$arg')"; exit 1; }
-            MODE="$arg" ;;
+            [[ -n "$MODE" ]] && { echo "ERROR: mode specified twice ('$MODE' and '$1')"; exit 1; }
+            MODE="$1"
+            shift
+            ;;
         -*)
-            echo "ERROR: unknown option: $arg" >&2; usage ;;
+            echo "ERROR: unknown option: $1" >&2; usage ;;
         *)
-            TARGETS+=("$arg") ;;
+            TARGETS+=("$1")
+            shift
+            ;;
     esac
 done
 
 [[ -z "$MODE"            ]] && { echo "ERROR: mode is required (readonly|public|private)"; echo; usage; }
 [[ ${#TARGETS[@]} -eq 0 ]] && { echo "ERROR: at least one path is required"; echo; usage; }
+[[ -z "$GROUP"           ]] && { echo "ERROR: group must not be empty"; echo; usage; }
 
 # ─────────────────────────── helpers ────────────────────────────────────── #
 
@@ -101,8 +117,8 @@ find_mismatched_dirs() {
             find -L "$target" -type d \( ! -perm -070 -o ! -perm /2000 \) -print
             ;;
         private)
-            # dirs that still have any group permission bit
-            find -L "$target" -type d -perm /070 -print
+            # dirs that still expose group/other access, or setgid inheritance
+            find -L "$target" -type d \( -perm /077 -o -perm /2000 \) -print
             ;;
     esac
 }
@@ -119,8 +135,8 @@ find_mismatched_files() {
             find -L "$target" -type f ! -perm -060 -print
             ;;
         private)
-            # files with any group permission bit
-            find -L "$target" -type f -perm /070 -print
+            # files that still expose group/other access
+            find -L "$target" -type f -perm /077 -print
             ;;
     esac
 }
@@ -180,8 +196,8 @@ fix_target() {
             find -L "$target" -type f -exec chmod g+rw      {} +
             ;;
         private)
-            find -L "$target" -type d -exec chmod g-rwx     {} +
-            find -L "$target" -type f -exec chmod g-rwx     {} +
+            find -L "$target" -type d -exec chmod go-rwx,g-s {} +
+            find -L "$target" -type f -exec chmod go-rwx     {} +
             ;;
     esac
 

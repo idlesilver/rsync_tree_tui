@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-04-17
+
+### Changed
+
+- `setup_remote_permissions.sh` 的默认 group 改为运行用户的 primary group，并支持 `GROUP=...` 或 `--group ...` 覆盖。
+- `private` 模式现在会移除目标目录和所有子项的 group/others 权限，避免从 `readonly` 切换后 others 仍可读取内部内容。
+- README 更新远程权限脚本的通用 group 和 private 语义说明。
+
 ## [0.1.4] - 2026-04-17
 
 ### Added

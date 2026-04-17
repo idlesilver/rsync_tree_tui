@@ -325,5 +325,36 @@ class MouseTests(unittest.TestCase):
         self.assertTrue(tui.visible_nodes(app.root_node)[0].is_expanded)
 
 
+class RemotePermissionsScriptTests(unittest.TestCase):
+    def test_private_mode_removes_group_and_other_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "private"
+            child_dir = target / "child"
+            child_dir.mkdir(parents=True)
+            child_file = child_dir / "data.txt"
+            child_file.write_text("secret\n")
+            target.chmod(0o777)
+            child_dir.chmod(0o777)
+            child_file.chmod(0o666)
+
+            subprocess.run(
+                [
+                    "bash",
+                    "setup_remote_permissions.sh",
+                    "--group",
+                    target.group(),
+                    "private",
+                    str(target),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            for path in (target, child_dir, child_file):
+                self.assertEqual(path.stat().st_mode & 0o077, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

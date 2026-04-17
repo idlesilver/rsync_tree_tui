@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.1.4`
+当前版本：`v0.1.5`
 
 ## 运行
 
@@ -64,7 +64,7 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 ```text
 public    -> [pub]  group read/write，可上传
 readonly  -> [ro]   group read only，可浏览和下载
-private   -> [pvt]  group 无访问权限
+private   -> [pvt]  group/others 无访问权限
 ```
 
 这个脚本应该在远程端运行。先把脚本复制到远程机器，再对远程目录执行 dry-run，确认后再应用：
@@ -72,8 +72,8 @@ private   -> [pvt]  group 无访问权限
 ```bash
 scp setup_remote_permissions.sh user@host:/tmp/setup_remote_permissions.sh
 
-ssh user@host 'bash /tmp/setup_remote_permissions.sh --dry-run public /remote/storage/staging'
-ssh user@host 'bash /tmp/setup_remote_permissions.sh public /remote/storage/staging'
+ssh user@host 'bash /tmp/setup_remote_permissions.sh --dry-run --group shared public /remote/storage/staging'
+ssh user@host 'bash /tmp/setup_remote_permissions.sh --group shared public /remote/storage/staging'
 ```
 
 常用模式：
@@ -89,7 +89,9 @@ bash /tmp/setup_remote_permissions.sh public /remote/storage/datasets/staging
 bash /tmp/setup_remote_permissions.sh private /remote/storage/wip_secret
 ```
 
-脚本默认 group 是 `simvla`。如果远端共享组名不同，先编辑脚本里的 `GROUP`。
+脚本默认 group 是运行用户的 primary group，也可以通过环境变量或 `--group` 指定。需要持久化站点默认值时，直接编辑脚本开头的 `GROUP="${GROUP:-$(id -gn)}"`。
+
+`private` 会让目标目录在父目录中仍可被看到，并显示为 `[pvt]`；目标目录和所有子项会移除 group/others 权限，因此其他人看不到内部文件。
 
 ## 快速上手
 
@@ -155,6 +157,7 @@ q / Esc            退出
 当前发布 tag：
 
 ```text
+v0.1.5
 v0.1.4
 v0.1.3
 v0.1.2
