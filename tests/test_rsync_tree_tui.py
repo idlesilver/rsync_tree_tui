@@ -126,5 +126,25 @@ class ChecksumPolicyTests(unittest.TestCase):
         self.assertNotIn("--checksum", quick_cmd)
 
 
+class RenderTests(unittest.TestCase):
+    def test_missing_side_renders_without_placeholder_text(self) -> None:
+        node = tui.TreeNode(name="asset.bin", rel_path="asset.bin")
+
+        cell = tui.render_side_cell(node, "left", 40)
+
+        self.assertNotIn("<missing>", cell)
+
+    def test_error_side_keeps_error_placeholder_text(self) -> None:
+        node = tui.TreeNode(
+            name="asset.bin",
+            rel_path="asset.bin",
+            left_load_error="failed",
+        )
+
+        cell = tui.render_side_cell(node, "left", 40)
+
+        self.assertIn("<error>", cell)
+
+
 if __name__ == "__main__":
     unittest.main()

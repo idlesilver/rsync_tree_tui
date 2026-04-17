@@ -23,7 +23,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -742,7 +742,7 @@ def render_side_cell(
         else "▶" if node_is_expandable(node)
         else " "
     )
-    node_name = node.name if entry is not None else "<error>" if load_error else "<missing>"
+    node_name = node.name if entry is not None else "<error>" if load_error else ""
     suffix = path_suffix_for_side(node, side)
     badge = ""
     if show_badge and entry is not None and node_is_directory(node):
