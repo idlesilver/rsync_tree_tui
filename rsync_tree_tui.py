@@ -6,9 +6,13 @@ import argparse
 import atexit
 import concurrent.futures
 import curses
+import hashlib
+import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -16,41 +20,210 @@ from enum import Enum
 from pathlib import Path
 
 # ------------------------------------------------------------------------ #
-#                               default paths                               #
+#                                  config                                  #
 # ------------------------------------------------------------------------ #
 
-_SCRIPT_DIR = Path(__file__).parent.resolve()
-_REPO_ROOT = _SCRIPT_DIR.parent
+APP_NAME = "rsync-tree-tui"
+CONFIG_VERSION = 1
+LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
+REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
+DEFAULT_CHECKSUM_THRESHOLD_MB = 512
+DEFAULT_CHECKSUM_SUFFIXES = [
+    ".json",
+    ".yaml",
+    ".yml",
+    ".txt",
+    ".py",
+    ".sh",
+    ".md",
+]
 
 
-def _get_env_or_dotenv(key: str) -> str | None:
-    """Read key from environment variables, then from .env at repo root."""
+def default_config_path() -> Path:
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    config_home = Path(xdg_config_home).expanduser() if xdg_config_home else Path.home() / ".config"
+    return config_home / APP_NAME / "config.json"
+
+
+def default_config_data() -> dict[str, object]:
+    return {
+        "version": CONFIG_VERSION,
+        "checksum_policy": {
+            "mode": "balanced",
+            "size_threshold_mb": DEFAULT_CHECKSUM_THRESHOLD_MB,
+            "checksum_suffixes": DEFAULT_CHECKSUM_SUFFIXES,
+        },
+        "known_connections": [],
+    }
+
+
+def load_json_config(config_path: Path) -> dict[str, object]:
+    if not config_path.exists():
+        data = default_config_data()
+        save_json_config(config_path, data)
+        return data
+
+    data = json.loads(config_path.read_text())
+    changed = False
+    default_data = default_config_data()
+    for key, default_value in default_data.items():
+        if key not in data:
+            data[key] = default_value
+            changed = True
+    if changed:
+        save_json_config(config_path, data)
+    return data
+
+
+def save_json_config(config_path: Path, data: dict[str, object]) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def read_dotenv(env_file: Path) -> dict[str, str]:
+    if not env_file.exists():
+        return {}
+
+    env: dict[str, str] = {}
+    for raw in env_file.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip().strip("\"'")
+    return env
+
+
+def get_env_or_dotenv(key: str, dotenv: dict[str, str]) -> str | None:
     val = os.environ.get(key)
     if val:
         return val
-    env_file = _REPO_ROOT / ".env"
-    if env_file.exists():
-        for raw in env_file.read_text().splitlines():
-            line = raw.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            if k.strip() == key:
-                return v.strip().strip("\"'")
-    return None
+    return dotenv.get(key)
 
 
-def _default_local_root() -> Path:
-    """Mirrors LHVLA_STORAGE_ROOT logic in long_horizon_vla.common.path."""
-    env_val = _get_env_or_dotenv("LHVLA_STORAGE_ROOT")
-    if env_val:
-        p = Path(env_val).expanduser()
-        return (p if p.is_absolute() else _REPO_ROOT / p).resolve()
-    return (_REPO_ROOT / "storage").resolve()
+def resolve_local_root(value: str | Path | None, cwd: Path) -> Path:
+    if value is None:
+        return cwd.resolve()
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else cwd / path).resolve()
 
 
-def _default_remote() -> str | None:
-    return _get_env_or_dotenv("RSYNC_REMOTE")
+def connection_id(local_root: Path, remote: str) -> str:
+    payload = f"{local_root.resolve()}\0{remote}".encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:8]
+
+
+def sorted_known_connections(config_data: dict[str, object]) -> list[dict[str, object]]:
+    entries = config_data.get("known_connections", [])
+    if not isinstance(entries, list):
+        return []
+    return sorted(
+        (entry for entry in entries if isinstance(entry, dict)),
+        key=lambda entry: int(entry.get("trigger_count", 0)),
+        reverse=True,
+    )
+
+
+def choose_known_connection(config_data: dict[str, object]) -> dict[str, object]:
+    entries = sorted_known_connections(config_data)
+    if not entries:
+        print(
+            "Error: --remote is required because no known connections exist yet."
+        )
+        raise SystemExit(1)
+
+    print("Known rsync-tree-tui connections:")
+    for index, entry in enumerate(entries):
+        trigger_count = int(entry.get("trigger_count", 0))
+        print(
+            f"  [{index}] {entry.get('local_root', '')}  <->  "
+            f"{entry.get('remote', '')}  ({trigger_count} runs)"
+        )
+    raw_index = input("Select connection index: ").strip()
+    index = int(raw_index)
+    if index < 0 or index >= len(entries):
+        raise IndexError(f"Invalid connection index: {index}")
+    return entries[index]
+
+
+def record_successful_connection(
+    config_path: Path,
+    config_data: dict[str, object],
+    local_root: Path,
+    remote: str,
+) -> None:
+    entries = config_data.setdefault("known_connections", [])
+    if not isinstance(entries, list):
+        entries = []
+        config_data["known_connections"] = entries
+
+    conn_id = connection_id(local_root, remote)
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == conn_id:
+            entry["local_root"] = str(local_root.resolve())
+            entry["remote"] = remote
+            entry["trigger_count"] = int(entry.get("trigger_count", 0)) + 1
+            save_json_config(config_path, config_data)
+            return
+
+    entries.append(
+        {
+            "id": conn_id,
+            "local_root": str(local_root.resolve()),
+            "remote": remote,
+            "trigger_count": 1,
+        }
+    )
+    save_json_config(config_path, config_data)
+
+
+def preflight(local_root: Path) -> None:
+    missing = [cmd for cmd in ("ssh", "rsync", "diff", "find") if shutil.which(cmd) is None]
+    if missing:
+        raise RuntimeError(f"Missing required command(s): {', '.join(missing)}")
+
+    subprocess.run(
+        ["find", ".", "-maxdepth", "0", "-printf", ""],
+        cwd=local_root,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def resolve_app_config(args: argparse.Namespace) -> AppConfig:
+    cwd = Path.cwd().resolve()
+    env_file = (args.env_file or cwd / ".env").expanduser()
+    if not env_file.is_absolute():
+        env_file = (cwd / env_file).resolve()
+    dotenv = read_dotenv(env_file)
+
+    config_path = args.config or default_config_path()
+    config_path = config_path.expanduser()
+    if not config_path.is_absolute():
+        config_path = (cwd / config_path).resolve()
+    config_data = load_json_config(config_path)
+
+    local_value = args.local_root or get_env_or_dotenv(LOCAL_ROOT_ENV, dotenv)
+    remote = args.remote or get_env_or_dotenv(REMOTE_ENV, dotenv)
+
+    selected_connection: dict[str, object] | None = None
+    if remote is None:
+        selected_connection = choose_known_connection(config_data)
+        remote = str(selected_connection["remote"])
+
+    if local_value is None and selected_connection is not None:
+        local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
+    else:
+        local_root = resolve_local_root(local_value, cwd)
+
+    return AppConfig(
+        local_root=local_root,
+        remote_spec=remote,
+        config_path=config_path,
+        config_data=config_data,
+        checksum_policy=ChecksumPolicy.from_config(config_data),
+    )
 
 # ------------------------------------------------------------------------ #
 #                                  models                                  #
@@ -79,6 +252,48 @@ class EntryMeta:
     group: str = ""
 
 
+@dataclass(slots=True)
+class ChecksumPolicy:
+    mode: str
+    size_threshold_bytes: int
+    checksum_suffixes: set[str]
+
+    @classmethod
+    def from_config(cls, config_data: dict[str, object]) -> ChecksumPolicy:
+        policy = config_data.get("checksum_policy", {})
+        if not isinstance(policy, dict):
+            policy = {}
+        threshold_mb = int(policy.get("size_threshold_mb", DEFAULT_CHECKSUM_THRESHOLD_MB))
+        suffixes = policy.get("checksum_suffixes", DEFAULT_CHECKSUM_SUFFIXES)
+        if not isinstance(suffixes, list):
+            suffixes = DEFAULT_CHECKSUM_SUFFIXES
+        return cls(
+            mode=str(policy.get("mode", "balanced")),
+            size_threshold_bytes=threshold_mb * 1024 * 1024,
+            checksum_suffixes={str(s).lower() for s in suffixes},
+        )
+
+    def should_checksum(self, rel_path: str, size: int | None) -> bool:
+        if self.mode == "strict":
+            return True
+        if self.mode == "fast":
+            return Path(rel_path).suffix.lower() in self.checksum_suffixes
+        if Path(rel_path).suffix.lower() in self.checksum_suffixes:
+            return True
+        if size is None:
+            return False
+        return size <= self.size_threshold_bytes
+
+
+@dataclass(slots=True)
+class AppConfig:
+    local_root: Path
+    remote_spec: str
+    config_path: Path
+    config_data: dict[str, object]
+    checksum_policy: ChecksumPolicy
+
+
 # ------------------------------------------------------------------------ #
 #                              manifest helpers                             #
 # ------------------------------------------------------------------------ #
@@ -86,25 +301,37 @@ class EntryMeta:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Interactive local/remote asset comparison and sync tool.",
+        description="Interactive local/remote tree comparison and rsync tool.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Defaults (in priority order):\n"
-            "  --local-root : $LHVLA_STORAGE_ROOT  →  .env LHVLA_STORAGE_ROOT"
-            "  →  <repo>/storage\n"
-            "  --remote     : $RSYNC_REMOTE\n"
+            f"  --local-root : ${LOCAL_ROOT_ENV} → .env {LOCAL_ROOT_ENV} → current pwd\n"
+            f"  --remote     : ${REMOTE_ENV} → .env {REMOTE_ENV} → known connection picker\n"
+            f"  --config     : {default_config_path()}\n"
         ),
     )
     parser.add_argument(
         "--local-root",
         type=Path,
         default=None,
-        help="Local storage root (default: LHVLA_STORAGE_ROOT / repo/storage).",
+        help="Local root (default: env / .env / current working directory).",
     )
     parser.add_argument(
         "--remote",
         default=None,
-        help="Remote target user@host:/path (default: RSYNC_REMOTE env var).",
+        help="Remote target user@host:/path (default: env / .env / known config picker).",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Dotenv file to read after terminal environment variables (default: ./.env).",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=f"Global JSON config path (default: {default_config_path()}).",
     )
     return parser.parse_args()
 
@@ -118,43 +345,92 @@ def split_remote_spec(remote_spec: str) -> tuple[str, str]:
     return remote_target, remote_root
 
 
+MANIFEST_FIELD_COUNT = 7
+MANIFEST_PRINTF = r"%P\0%y\0%s\0%T@\0%m\0%u\0%g\0"
+PATH_MANIFEST_PRINTF = r"%p\0%y\0%s\0%T@\0%m\0%u\0%g\0"
+
+
 def parse_manifest_output(output: bytes) -> dict[str, EntryMeta]:
     entry_by_rel_path: dict[str, EntryMeta] = {}
     if not output:
         return entry_by_rel_path
 
-    for record in output.split(b"\0"):
-        if not record:
-            continue
-        parts = record.decode("utf-8").split("\t")
-        rel_path_text, entry_type_text, size_text, mtime_text, perms_text, owner_text, group_text = parts
+    fields = output.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields = fields[:-1]
+    if len(fields) % MANIFEST_FIELD_COUNT != 0:
+        raise ValueError(
+            f"Invalid manifest field count: {len(fields)} is not divisible by {MANIFEST_FIELD_COUNT}"
+        )
+
+    for index in range(0, len(fields), MANIFEST_FIELD_COUNT):
+        (
+            rel_path_raw,
+            entry_type_raw,
+            size_raw,
+            mtime_raw,
+            perms_raw,
+            owner_raw,
+            group_raw,
+        ) = fields[index : index + MANIFEST_FIELD_COUNT]
+        rel_path_text = rel_path_raw.decode("utf-8")
+        entry_type_text = entry_type_raw.decode("utf-8")
         entry_type = EntryType.DIRECTORY if entry_type_text == "d" else EntryType.FILE
         entry_by_rel_path[rel_path_text] = EntryMeta(
             rel_path=rel_path_text,
             entry_type=entry_type,
-            size=int(size_text),
-            mtime_s=int(float(mtime_text)),
-            perms=int(perms_text, 8),
-            owner=owner_text,
-            group=group_text,
+            size=int(size_raw.decode("utf-8")),
+            mtime_s=int(float(mtime_raw.decode("utf-8"))),
+            perms=int(perms_raw.decode("utf-8"), 8),
+            owner=owner_raw.decode("utf-8"),
+            group=group_raw.decode("utf-8"),
         )
     return entry_by_rel_path
+
+
+def build_local_find_command(start_path: str, recursive: bool = False) -> list[str]:
+    command = ["find", "-L", start_path, "-mindepth", "1"]
+    if not recursive:
+        command.extend(["-maxdepth", "1"])
+    command.extend(["-printf", MANIFEST_PRINTF])
+    return command
+
+
+def build_remote_find_command(remote_root: str, start_path: str, recursive: bool = False) -> str:
+    maxdepth = "" if recursive else " -maxdepth 1"
+    return (
+        f"cd {shlex.quote(remote_root)} && "
+        f"find -L {shlex.quote(start_path)} -mindepth 1{maxdepth} "
+        f"-printf {shlex.quote(MANIFEST_PRINTF)}"
+    )
+
+
+def build_local_tree_manifest_command(start_path: str) -> list[str]:
+    return ["find", "-L", start_path, "-mindepth", "0", "-printf", PATH_MANIFEST_PRINTF]
+
+
+def build_remote_tree_manifest_command(remote_root: str, start_path: str) -> str:
+    return (
+        f"cd {shlex.quote(remote_root)} && "
+        f"find -L {shlex.quote(start_path)} -mindepth 0 "
+        f"-printf {shlex.quote(PATH_MANIFEST_PRINTF)}"
+    )
 
 
 def list_local_entries(local_root: Path, rel_path: str) -> dict[str, EntryMeta]:
     start_path = rel_path if rel_path else "."
     output = subprocess.run(
-        [
-            "find",
-            "-L",
-            start_path,
-            "-mindepth",
-            "1",
-            "-maxdepth",
-            "1",
-            "-printf",
-            r"%P\t%y\t%s\t%T@\t%m\t%u\t%g\0",
-        ],
+        build_local_find_command(start_path),
+        cwd=local_root,
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    return parse_manifest_output(output)
+
+
+def list_local_tree_entries(local_root: Path, rel_path: str) -> dict[str, EntryMeta]:
+    output = subprocess.run(
+        build_local_tree_manifest_command(rel_path),
         cwd=local_root,
         check=True,
         stdout=subprocess.PIPE,
@@ -169,11 +445,22 @@ def list_remote_entries(
     ssh_opts: list[str],
 ) -> dict[str, EntryMeta]:
     start_path = rel_path if rel_path else "."
-    remote_command = (
-        f"cd {shlex.quote(remote_root)} && "
-        f"find -L {shlex.quote(start_path)} -mindepth 1 -maxdepth 1 "
-        r"-printf '%P\t%y\t%s\t%T@\t%m\t%u\t%g\0'"
-    )
+    remote_command = build_remote_find_command(remote_root, start_path)
+    output = subprocess.run(
+        ["ssh", *ssh_opts, remote_target, remote_command],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    return parse_manifest_output(output)
+
+
+def list_remote_tree_entries(
+    remote_target: str,
+    remote_root: str,
+    rel_path: str,
+    ssh_opts: list[str],
+) -> dict[str, EntryMeta]:
+    remote_command = build_remote_tree_manifest_command(remote_root, rel_path)
     output = subprocess.run(
         ["ssh", *ssh_opts, remote_target, remote_command],
         check=True,
@@ -217,7 +504,15 @@ def node_exists_on_right(node: TreeNode) -> bool:
     return node.right_entry is not None
 
 
+def node_has_load_error(node: TreeNode) -> bool:
+    if node.left_load_error or node.right_load_error:
+        return True
+    return any(node_has_load_error(child_node) for child_node in node.children.values())
+
+
 def node_has_self_difference(node: TreeNode) -> bool:
+    if node.left_load_error or node.right_load_error:
+        return True
     if node.left_entry is None or node.right_entry is None:
         return node.left_entry is not None or node.right_entry is not None
 
@@ -293,6 +588,8 @@ def set_subtree_selection(node: TreeNode, is_selected: bool) -> None:
 
 def collect_selected_paths(node: TreeNode, source_side: str) -> list[str]:
     selected_rel_paths: list[str] = []
+    if node.is_selected and node_has_load_error(node):
+        return selected_rel_paths
     source_entry = node.left_entry if source_side == "left" else node.right_entry
     if node.rel_path and node.is_selected and source_entry is not None:
         if not node_is_directory(node) or selection_state(node) == SelectionState.SELECTED:
@@ -434,12 +731,13 @@ def render_side_cell(
     show_badge: bool = False,
 ) -> str:
     entry = node.left_entry if side == "left" else node.right_entry
+    load_error = node.left_load_error if side == "left" else node.right_load_error
     expand_icon = (
         "▼" if (node_is_expandable(node) and node.is_expanded)
         else "▶" if node_is_expandable(node)
         else " "
     )
-    node_name = node.name if entry is not None else "<missing>"
+    node_name = node.name if entry is not None else "<error>" if load_error else "<missing>"
     suffix = path_suffix_for_side(node, side)
     badge = ""
     if show_badge and entry is not None and node_is_directory(node):
@@ -460,6 +758,36 @@ def format_remote_root(remote_target: str, remote_root: str) -> str:
     return f"{remote_target}:{remote_root.rstrip('/')}/"
 
 
+def build_rsync_command(
+    file_list_path: Path,
+    source_root: str,
+    dest_root: str,
+    ssh_cmd: str,
+    use_checksum: bool,
+) -> list[str]:
+    command = [
+        "rsync",
+        "-av",
+        "--no-perms",
+        "--no-owner",
+        "--no-group",
+        "--omit-dir-times",
+        "--keep-dirlinks",      # -K: treat symlinked dirs on dest as real dirs
+        "--itemize-changes",
+        "--progress",
+        "--partial",
+        "--partial-dir=.rsync-partial",
+        "-e", ssh_cmd,
+        "--from0",
+        f"--files-from={file_list_path}",
+        source_root,
+        dest_root,
+    ]
+    if use_checksum:
+        command.insert(2, "--checksum")
+    return command
+
+
 def node_is_expandable(node: TreeNode) -> bool:
     return node_is_directory(node) and (not node.children_loaded or bool(node.children))
 
@@ -476,6 +804,8 @@ class TreeNode:
     parent: TreeNode | None = None
     left_entry: EntryMeta | None = None
     right_entry: EntryMeta | None = None
+    left_load_error: str = ""
+    right_load_error: str = ""
     children: dict[str, TreeNode] = field(default_factory=dict)
     children_loaded: bool = False
     is_expanded: bool = False
@@ -497,21 +827,18 @@ class TreeNode:
 
 
 class SyncApp:
-    def __init__(self, local_root: Path, remote_spec: str) -> None:
-        self.local_root = local_root.resolve()
-        self.remote_spec = remote_spec
-        self.remote_target, self.remote_root = split_remote_spec(remote_spec)
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.local_root = config.local_root.resolve()
+        self.remote_spec = config.remote_spec
+        self.remote_target, self.remote_root = split_remote_spec(config.remote_spec)
 
         # SSH ControlMaster: PID-scoped socket so concurrent instances do not
         # share a socket — if they did, the first instance to exit would send
         # "ssh -O exit" and break the remaining instances.
-        host_slug = (
-            self.remote_target.replace("@", "_at_")
-            .replace(".", "_")
-            .replace(":", "_")
-        )
+        host_slug = hashlib.sha1(self.remote_target.encode("utf-8")).hexdigest()[:12]
         self._ssh_socket_path: str = str(
-            Path.home() / ".ssh" / f"rsync_tui_{host_slug}_{os.getpid()}.sock"
+            Path(tempfile.gettempdir()) / f"{APP_NAME}_{host_slug}_{os.getpid()}.sock"
         )
         self._control_master_closed: bool = False
         atexit.register(self._close_control_master)
@@ -528,8 +855,10 @@ class SyncApp:
         self.message = "Loading manifests..."
         self.pending_action: str | None = None
         self.last_cursor_rel_path = ""
+        self.initial_connection_ok = False
 
         self.refresh_manifests(initial_load=True)
+        self.initial_connection_ok = not self.root_node.left_load_error and not self.root_node.right_load_error
 
     # ------------------------------- SSH helpers ---------------------------- #
 
@@ -564,18 +893,20 @@ class SyncApp:
         Owner/group of each entry is now embedded in EntryMeta (via find %u/%g),
         so only the SSH user's own identity is needed here for comparison.
         """
-        try:
-            id_out = subprocess.run(
-                ["ssh", *self._ssh_opts(), self.remote_target, "id -un && id -Gn"],
-                check=True,
-                stdout=subprocess.PIPE,
-                text=True,
-            ).stdout.strip().splitlines()
-            self.remote_user = id_out[0].strip()
-            self.remote_groups = set(id_out[1].strip().split())
-        except Exception:
-            # If identity query fails, fall back to no-permission-inference mode
-            pass
+        result = subprocess.run(
+            ["ssh", *self._ssh_opts(), self.remote_target, "id -un && id -Gn"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if result.returncode != 0:
+            return
+        id_out = result.stdout.strip().splitlines()
+        if len(id_out) < 2:
+            return
+        self.remote_user = id_out[0].strip()
+        self.remote_groups = set(id_out[1].strip().split())
 
     # ------------------------------- permission helpers --------------------- #
 
@@ -777,13 +1108,17 @@ class SyncApp:
 
             try:
                 left_entry_by_name = f_local.result()
-            except Exception as exc:
+                node.left_load_error = ""
+            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
                 left_entry_by_name = {}
+                node.left_load_error = str(exc)
                 self.message = f"Error listing local {node.rel_path or '/'}: {exc}"
             try:
                 right_entry_by_name = f_remote.result()
-            except Exception as exc:
+                node.right_load_error = ""
+            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
                 right_entry_by_name = {}
+                node.right_load_error = str(exc)
                 self.message = f"Error listing remote {node.rel_path or '/'}: {exc}"
 
         existing_children = node.children
@@ -1096,6 +1431,13 @@ class SyncApp:
         self.message = summary
 
     def start_action(self, action: str) -> None:
+        if action in ("download", "upload") and (
+            self.root_node.left_load_error or self.root_node.right_load_error
+        ):
+            self.message = "Cannot sync while root listing has errors. Press r to retry."
+            self.pending_action = None
+            return
+
         if action == "check":
             selected_nodes = collect_selected_nodes(self.root_node)
             if not selected_nodes:
@@ -1134,38 +1476,52 @@ class SyncApp:
 
     def _expand_selected_paths(
         self, rel_paths: list[str], source_side: str
-    ) -> list[str]:
+    ) -> tuple[list[str], dict[str, EntryMeta]]:
         """Expand directory paths into all contained paths so rsync transfers recursively.
 
         rsync --files-from does NOT recurse into directories even with -a/-r,
         so we must explicitly list all descendants.
         """
-        expanded: list[str] = []
+        entry_by_path: dict[str, EntryMeta] = {}
         for rel_path in rel_paths:
             if source_side == "left":
-                result = subprocess.run(
-                    ["find", "-L", rel_path, "-mindepth", "1", "-printf", r"%p\0"],
-                    cwd=self.local_root,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
+                entry_by_path.update(list_local_tree_entries(self.local_root, rel_path))
             else:
-                find_cmd = (
-                    f"cd {shlex.quote(self.remote_root)} && "
-                    f"find -L {shlex.quote(rel_path)} -mindepth 1 -printf '%p\\0'"
-                    f" 2>/dev/null || true"
+                entry_by_path.update(
+                    list_remote_tree_entries(
+                        self.remote_target,
+                        self.remote_root,
+                        rel_path,
+                        self._ssh_opts(),
+                    )
                 )
-                result = subprocess.run(
-                    ["ssh", *self._ssh_opts(), self.remote_target, find_cmd],
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-            sub_items = [x.decode() for x in result.stdout.split(b"\0") if x]
-            expanded.append(rel_path)
-            expanded.extend(sub_items)
-        return expanded
+        return sorted(entry_by_path.keys()), entry_by_path
+
+    def _split_paths_by_checksum(
+        self,
+        selected_paths: list[str],
+        entry_by_path: dict[str, EntryMeta],
+    ) -> list[tuple[bool, list[str]]]:
+        dirs: list[str] = []
+        checksum_files: list[str] = []
+        quick_files: list[str] = []
+        for rel_path in selected_paths:
+            entry = entry_by_path.get(rel_path)
+            if entry is not None and entry.entry_type == EntryType.DIRECTORY:
+                dirs.append(rel_path)
+                continue
+            size = entry.size if entry is not None else None
+            if self.config.checksum_policy.should_checksum(rel_path, size):
+                checksum_files.append(rel_path)
+            else:
+                quick_files.append(rel_path)
+
+        groups: list[tuple[bool, list[str]]] = []
+        if checksum_files:
+            groups.append((True, sorted(set(dirs + checksum_files))))
+        if quick_files or (dirs and not checksum_files):
+            groups.append((False, sorted(set(dirs + quick_files))))
+        return groups
 
     def execute_pending_action(self) -> None:
         if self.pending_action is None:
@@ -1198,13 +1554,14 @@ class SyncApp:
         self.pending_action = None  # clear first so render() shows message, not confirm prompt
         self.message = f"Starting {action} for {len(selected_paths)} entries..."
         self.render()
-        selected_paths = self._expand_selected_paths(selected_paths, source_side)
-
-        with tempfile.NamedTemporaryFile("wb", delete=False) as file_list_file:
-            for rel_path in selected_paths:
-                file_list_file.write(rel_path.encode("utf-8"))
-                file_list_file.write(b"\0")
-            file_list_path = Path(file_list_file.name)
+        selected_paths, entry_by_path = self._expand_selected_paths(
+            selected_paths,
+            source_side,
+        )
+        sync_groups = self._split_paths_by_checksum(selected_paths, entry_by_path)
+        if not sync_groups:
+            self.message = "No source paths were found during recursive expansion."
+            return
 
         source_root = (
             format_remote_root(self.remote_target, self.remote_root)
@@ -1218,31 +1575,34 @@ class SyncApp:
         )
 
         ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
-        command = [
-            "rsync",
-            "-av",
-            "--checksum",           # compare by content, not mtime; skips byte-identical files
-            "--no-perms",
-            "--no-owner",
-            "--no-group",
-            "--omit-dir-times",
-            "--keep-dirlinks",      # -K: treat symlinked dirs on dest as real dirs
-            "--itemize-changes",
-            "--progress",
-            "--partial",
-            "--partial-dir=.rsync-partial",
-            "-e", ssh_cmd,
-            "--from0",
-            f"--files-from={file_list_path}",
-            source_root,
-            dest_root,
-        ]
+        commands: list[tuple[Path, bool, list[str]]] = []
+        for use_checksum, group_paths in sync_groups:
+            with tempfile.NamedTemporaryFile("wb", delete=False) as file_list_file:
+                for rel_path in group_paths:
+                    file_list_file.write(rel_path.encode("utf-8"))
+                    file_list_file.write(b"\0")
+                file_list_path = Path(file_list_file.name)
+            commands.append(
+                (
+                    file_list_path,
+                    use_checksum,
+                    build_rsync_command(
+                        file_list_path,
+                        source_root,
+                        dest_root,
+                        ssh_cmd,
+                        use_checksum,
+                    ),
+                )
+            )
 
         self.suspend_tui()
         sync_ok = False
         try:
-            print(f"Running {' '.join(command)}")
-            subprocess.run(command, check=True)
+            for _file_list_path, use_checksum, command in commands:
+                mode = "checksum" if use_checksum else "size+mtime"
+                print(f"Running {mode}: {' '.join(command)}")
+                subprocess.run(command, check=True)
             input("Sync completed. Press Enter to return to the TUI...")
             sync_ok = True
         except subprocess.CalledProcessError as exc:
@@ -1251,7 +1611,8 @@ class SyncApp:
                 "Press Enter to return to the TUI..."
             )
         finally:
-            file_list_path.unlink(missing_ok=True)
+            for file_list_path, _use_checksum, _command in commands:
+                file_list_path.unlink(missing_ok=True)
             self.resume_tui()
 
         self.refresh_manifests(initial_load=False)
@@ -1501,18 +1862,20 @@ class SyncApp:
 
 def main() -> None:
     args = parse_args()
-    local_root: Path = args.local_root or _default_local_root()
-    remote: str | None = args.remote or _default_remote()
-    if remote is None:
-        print(
-            "Error: --remote is required (or set the RSYNC_REMOTE environment variable)."
-        )
-        raise SystemExit(1)
-    if not local_root.exists():
-        raise FileNotFoundError(f"Local root does not exist: {local_root}")
+    config = resolve_app_config(args)
+    if not config.local_root.exists():
+        raise FileNotFoundError(f"Local root does not exist: {config.local_root}")
+    preflight(config.local_root)
 
     os.environ.setdefault("TERM", "xterm-256color")
-    app = SyncApp(local_root=local_root, remote_spec=remote)
+    app = SyncApp(config)
+    if app.initial_connection_ok:
+        record_successful_connection(
+            config.config_path,
+            config.config_data,
+            config.local_root,
+            config.remote_spec,
+        )
     app.run()
 
 

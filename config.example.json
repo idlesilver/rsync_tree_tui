@@ -1,0 +1,24 @@
+{
+  "checksum_policy": {
+    "checksum_suffixes": [
+      ".json",
+      ".yaml",
+      ".yml",
+      ".txt",
+      ".py",
+      ".sh",
+      ".md"
+    ],
+    "mode": "balanced",
+    "size_threshold_mb": 512
+  },
+  "known_connections": [
+    {
+      "id": "example1",
+      "local_root": "/abs/local/path",
+      "remote": "user@host:/abs/remote/path",
+      "trigger_count": 1
+    }
+  ],
+  "version": 1
+}
