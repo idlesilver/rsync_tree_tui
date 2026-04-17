@@ -6,6 +6,17 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-04-17
+
+### Added
+
+- 复制 `setup_remote_permissions.sh` 作为远程端权限辅助脚本，配合 TUI 中的 `[pub]`、`[ro]`、`[pvt]` 目录标记使用。
+- README 增加远程端运行权限脚本的说明。
+
+### Changed
+
+- 主 TUI 在结构树和底部提示行之间增加分隔线。
+
 ## [0.1.3] - 2026-04-17
 
 ### Added

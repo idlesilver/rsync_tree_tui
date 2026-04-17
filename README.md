@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.1.3`
+当前版本：`v0.1.4`
 
 ## 运行
 
@@ -56,6 +56,40 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 该文件维护 checksum 策略和成功连接过的 local/remote。没有传入 remote 时，工具会按访问次数列出历史连接，让用户输入 index 选择。TTY 环境中，remote 的 user、host、path 会用不同颜色提示；非 TTY 或设置 `NO_COLOR` 时输出纯文本。
 
 配置样例见 `config.example.json`。
+
+## 远程权限辅助脚本
+
+`setup_remote_permissions.sh` 用于在远程机器上批量整理共享目录权限。它会影响 TUI 里远端目录旁边的权限标记：
+
+```text
+public    -> [pub]  group read/write，可上传
+readonly  -> [ro]   group read only，可浏览和下载
+private   -> [pvt]  group 无访问权限
+```
+
+这个脚本应该在远程端运行。先把脚本复制到远程机器，再对远程目录执行 dry-run，确认后再应用：
+
+```bash
+scp setup_remote_permissions.sh user@host:/tmp/setup_remote_permissions.sh
+
+ssh user@host 'bash /tmp/setup_remote_permissions.sh --dry-run public /remote/storage/staging'
+ssh user@host 'bash /tmp/setup_remote_permissions.sh public /remote/storage/staging'
+```
+
+常用模式：
+
+```bash
+# 远程端：发布后的数据集只允许浏览和下载
+bash /tmp/setup_remote_permissions.sh readonly /remote/storage/datasets/v1.0
+
+# 远程端：开放 staging 目录，允许团队上传
+bash /tmp/setup_remote_permissions.sh public /remote/storage/datasets/staging
+
+# 远程端：隐藏工作中目录
+bash /tmp/setup_remote_permissions.sh private /remote/storage/wip_secret
+```
+
+脚本默认 group 是 `simvla`。如果远端共享组名不同，先编辑脚本里的 `GROUP`。
 
 ## 快速上手
 
@@ -121,8 +155,9 @@ q / Esc            退出
 当前发布 tag：
 
 ```text
-v0.1.0
-v0.1.1
-v0.1.2
+v0.1.4
 v0.1.3
+v0.1.2
+v0.1.1
+v0.1.0
 ```

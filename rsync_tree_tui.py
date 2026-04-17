@@ -24,7 +24,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -1314,6 +1314,14 @@ class SyncApp:
             "Up/Down Move  Left/Right Fold  Space Toggle  "
             "d Download  u Upload  p Diff  c Check  x Clear  r Refresh  ? Help  q Quit"
         )
+        if height >= 5 and width > 1:
+            stdscr.addnstr(
+                height - 4,
+                0,
+                "─" * (width - 1),
+                width - 1,
+                curses.color_pair(2),
+            )
         stdscr.addnstr(height - 3, 0, nav_help, width - 1, curses.color_pair(3))
 
         # Color legend — each segment rendered in its actual color
@@ -1352,7 +1360,7 @@ class SyncApp:
             return
 
         row_start = 3
-        row_end = height - 3
+        row_end = height - 4
         list_height = max(row_end - row_start, 1)
         self.ensure_cursor_visible(list_height=list_height)
 
@@ -1444,7 +1452,7 @@ class SyncApp:
 
         if list_height is None:
             height, _ = self.stdscr.getmaxyx() if hasattr(self, "stdscr") else (24, 120)
-            list_height = max(height - 6, 1)
+            list_height = max(height - 7, 1)
 
         max_scroll = max(len(visible) - list_height, 0)
         self.scroll_offset = max(0, min(self.scroll_offset, max_scroll))
