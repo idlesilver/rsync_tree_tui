@@ -8,6 +8,14 @@
 
 ## [0.1.7] - 2026-04-21
 
+### Added
+
+- `setup_remote_permissions.sh` 增加 `--version` 和 `--update` 参数，支持版本显示和从 GitHub 自更新。
+
+### Changed
+
+- LOCAL/REMOTE 标题下划线延伸到整个面板宽度。
+
 ### Changed
 
 - LOCAL/REMOTE 标题下划线延伸到整个面板宽度。

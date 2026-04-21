@@ -11,11 +11,15 @@
 #
 # Usage:
 #   setup_remote_permissions.sh [--group GROUP] [--dry-run] [-v] <mode> <path> [<path> ...]
+#   setup_remote_permissions.sh --update
+#   setup_remote_permissions.sh --version
 #
 # Options:
 #   --group G   Shared group name (default: $GROUP or current primary group).
 #   --dry-run   Show how many entries would change, without modifying anything.
 #   -v          Verbose: list every entry whose permissions will be/were changed.
+#   --update    Download latest version from GitHub and replace local file.
+#   --version   Show version number.
 #
 # Examples:
 #   # Preview what would change, without applying
@@ -41,6 +45,9 @@ set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
+VERSION="0.1.0"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/setup_remote_permissions.sh"
+
 # Edit this line to persist a site-specific default, or pass --group.
 GROUP="${GROUP:-$(id -gn)}"
 
@@ -48,6 +55,7 @@ GROUP="${GROUP:-$(id -gn)}"
 
 DRY_RUN=0
 VERBOSE=0
+UPDATE=0
 MODE=""
 TARGETS=()
 
@@ -56,8 +64,69 @@ usage() {
     exit 1
 }
 
+do_self_update() {
+    local script_path
+    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    echo "setup_remote_permissions.sh $VERSION - Self Update"
+    echo "----------------------------------------"
+
+    echo "Downloading latest version from GitHub..."
+    local tmp_path
+    tmp_path="$(mktemp)"
+
+    if ! curl -fsSL "$GITHUB_RAW_URL" -o "$tmp_path"; then
+        echo "ERROR: Download failed"
+        rm -f "$tmp_path"
+        exit 1
+    fi
+
+    # Basic validation
+    if ! grep -q "setup_remote_permissions.sh" "$tmp_path"; then
+        echo "ERROR: Downloaded content does not appear to be a valid script"
+        rm -f "$tmp_path"
+        exit 1
+    fi
+
+    # Extract remote version
+    local remote_version
+    remote_version="$(grep '^VERSION=' "$tmp_path" | cut -d'"' -f2 || echo "unknown")"
+    echo "Remote version: $remote_version"
+    if [[ "$remote_version" == "$VERSION" ]]; then
+        echo "Already up to date!"
+        rm -f "$tmp_path"
+        exit 0
+    fi
+
+    echo ""
+    read -r -p "Update? [y/N] " answer
+    case "$answer" in
+        [yY][eE][sS]|[yY])
+            ;;
+        *)
+            echo "Cancelled."
+            rm -f "$tmp_path"
+            exit 0
+            ;;
+    esac
+
+    # Preserve permissions and replace
+    chmod --reference="$script_path" "$tmp_path" 2>/dev/null || chmod 755 "$tmp_path"
+
+    if mv "$tmp_path" "$script_path"; then
+        echo "Updated: $script_path"
+        echo "Successfully updated to version $remote_version"
+        exit 0
+    else
+        echo "ERROR: Permission denied - cannot write to $script_path"
+        rm -f "$tmp_path"
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --update)         UPDATE=1; shift ;;
+        --version)        echo "setup_remote_permissions.sh $VERSION"; exit 0 ;;
         --group)
             [[ $# -lt 2 ]] && { echo "ERROR: --group requires a value" >&2; usage; }
             GROUP="$2"
@@ -83,6 +152,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Handle --update before other validation
+if [[ $UPDATE -eq 1 ]]; then
+    do_self_update
+fi
 
 [[ -z "$MODE"            ]] && { echo "ERROR: mode is required (readonly|public|private)"; echo; usage; }
 [[ ${#TARGETS[@]} -eq 0 ]] && { echo "ERROR: at least one path is required"; echo; usage; }
