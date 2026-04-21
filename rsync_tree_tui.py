@@ -26,7 +26,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
@@ -1482,7 +1482,7 @@ class SyncApp:
             " " * selection_width
             + "LOCAL".ljust(panel_width)
             + " │ "
-            + "REMOTE"
+            + "REMOTE".ljust(panel_width)
         )
         stdscr.addnstr(2, 0, col_header, width - 1, curses.A_BOLD | curses.A_UNDERLINE)
 
