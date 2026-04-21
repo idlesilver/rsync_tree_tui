@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,7 +26,8 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.5"
+__version__ = "0.1.6"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -410,7 +413,106 @@ def parse_args() -> argparse.Namespace:
         action="version",
         version=f"{APP_NAME} {__version__}",
     )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Update to the latest version from GitHub.",
+    )
     return parser.parse_args()
+
+
+def extract_version_from_source(source: str) -> str | None:
+    """Extract __version__ value from Python source code.
+
+    Returns None if version cannot be determined.
+    """
+    import re
+
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def perform_self_update() -> None:
+    """Download and install the latest version from GitHub.
+
+    This function handles the complete update process:
+    1. Download latest version from GitHub
+    2. Validate the downloaded content
+    3. Compare versions
+    4. Ask user confirmation before replacing
+    5. Replace the current script file
+    6. Exit with appropriate status message
+    """
+    current_path = Path(sys.argv[0]).resolve()
+    print(f"{APP_NAME} {__version__} - Self Update")
+    print("-" * 40)
+
+    # Download
+    print("Downloading latest version from GitHub...")
+    try:
+        with urllib.request.urlopen(GITHUB_RAW_URL, timeout=30) as response:
+            if response.status != 200:
+                print(f"Error: HTTP {response.status} - {response.reason}")
+                raise SystemExit(1)
+            new_source = response.read().decode("utf-8")
+    except urllib.error.URLError as e:
+        print(f"Error: Network error - {e.reason}")
+        raise SystemExit(1)
+    except TimeoutError:
+        print("Error: Connection timed out after 30 seconds")
+        raise SystemExit(1)
+
+    # Validate
+    if '__version__' not in new_source or 'rsync' not in new_source.lower():
+        print("Error: Downloaded content does not appear to be a valid script")
+        raise SystemExit(1)
+
+    # Compare versions
+    new_version = extract_version_from_source(new_source)
+    if new_version:
+        print(f"Remote version: {new_version}")
+        if new_version == __version__:
+            print("Already up to date!")
+            raise SystemExit(0)
+    else:
+        print("Warning: Could not determine remote version, proceeding anyway")
+
+    # Ask user confirmation
+    print(f"\nCurrent: {__version__} → Remote: {new_version}")
+    try:
+        answer = input("Update? [y/N] ").strip().lower()
+    except EOFError:
+        answer = "n"
+
+    if answer not in ("y", "yes"):
+        print("Cancelled.")
+        raise SystemExit(0)
+
+    # Write to temp file
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8"
+    ) as f:
+        tmp_path = Path(f.name)
+        f.write(new_source)
+
+    # Preserve permissions
+    try:
+        tmp_path.chmod(current_path.stat().st_mode)
+    except OSError:
+        tmp_path.chmod(0o755)
+
+    # Atomic replace
+    try:
+        os.replace(tmp_path, current_path)
+        print(f"Updated: {current_path}")
+        if new_version:
+            print(f"Successfully updated to version {new_version}")
+        print("Please restart the application to use the new version.")
+        raise SystemExit(0)
+    except PermissionError:
+        tmp_path.unlink(missing_ok=True)
+        print(f"Error: Permission denied - cannot write to {current_path}")
+        raise SystemExit(1)
 
 
 def split_remote_spec(remote_spec: str) -> tuple[str, str]:
@@ -2045,6 +2147,11 @@ class SyncApp:
 
 def main() -> None:
     args = parse_args()
+
+    if args.update:
+        perform_self_update()
+        return
+
     config = resolve_app_config(args)
     if not config.local_root.exists():
         raise FileNotFoundError(f"Local root does not exist: {config.local_root}")
