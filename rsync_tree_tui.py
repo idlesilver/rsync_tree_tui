@@ -26,7 +26,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
@@ -41,6 +41,7 @@ DEFAULT_CHECKSUM_SUFFIXES = [
     ".sh",
     ".md",
 ]
+DEFAULT_PAGINATION_SIZE = 20
 ANSI_GREEN = "\033[32m"
 ANSI_CYAN = "\033[36m"
 ANSI_YELLOW = "\033[33m"
@@ -278,6 +279,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         config_path=config_path,
         config_data=config_data,
         checksum_policy=ChecksumPolicy.from_config(config_data),
+        pagination_size=int(config_data.get("pagination_size", DEFAULT_PAGINATION_SIZE)),
     )
 
 # ------------------------------------------------------------------------ #
@@ -347,6 +349,7 @@ class AppConfig:
     config_path: Path
     config_data: dict[str, object]
     checksum_policy: ChecksumPolicy
+    pagination_size: int = DEFAULT_PAGINATION_SIZE
 
 
 @dataclass(slots=True)
@@ -655,10 +658,35 @@ def join_rel_path(parent_rel_path: str, child_name: str) -> str:
 
 
 def sorted_children(node: TreeNode) -> list[TreeNode]:
-    def sort_key(child_node: TreeNode) -> tuple[int, str]:
-        return (0 if node_is_directory(child_node) else 1, child_node.name)
+    """Sort children by sync relevance.
 
-    return sorted(node.children.values(), key=sort_key)
+    Priority:
+    1. Items on both sides.
+    2. Single-side items by modification time, newest first.
+    3. Directories before files as a tie-breaker.
+    """
+    if node.sorted_children_cache is not None:
+        return node.sorted_children_cache
+
+    def sort_key(child_node: TreeNode) -> tuple[int, int, int, str]:
+        left_exists = node_exists_on_left(child_node)
+        right_exists = node_exists_on_right(child_node)
+        dir_key = 0 if node_is_directory(child_node) else 1
+
+        if left_exists and right_exists:
+            return (0, dir_key, 0, child_node.name)
+
+        if left_exists and child_node.left_entry:
+            mtime_key = -child_node.left_entry.mtime_s
+        elif right_exists and child_node.right_entry:
+            mtime_key = -child_node.right_entry.mtime_s
+        else:
+            mtime_key = 0
+
+        return (1, mtime_key, dir_key, child_node.name)
+
+    node.sorted_children_cache = sorted(node.children.values(), key=sort_key)
+    return node.sorted_children_cache
 
 
 def node_has_children(node: TreeNode) -> bool:
@@ -709,11 +737,16 @@ def node_has_self_difference(node: TreeNode) -> bool:
 
 
 def node_has_difference(node: TreeNode) -> bool:
-    if node_has_self_difference(node):
-        return True
-    if not node.children_loaded:
-        return False
-    return any(node_has_difference(child_node) for child_node in node.children.values())
+    if node.has_difference_cache is None:
+        if node_has_self_difference(node):
+            node.has_difference_cache = True
+        elif not node.children_loaded:
+            node.has_difference_cache = False
+        else:
+            node.has_difference_cache = any(
+                node_has_difference(child_node) for child_node in node.children.values()
+            )
+    return node.has_difference_cache
 
 
 def node_is_confirmed_same(node: TreeNode) -> bool:
@@ -722,47 +755,77 @@ def node_is_confirmed_same(node: TreeNode) -> bool:
     A directory with unexplored subdirectories returns False (shown as white),
     even if no difference has been detected yet.
     """
-    if node.left_entry is None or node.right_entry is None:
-        return False
-    if node_has_self_difference(node):
-        return False
-    if node_is_directory(node):
-        if not node.children_loaded:
-            return False
-        return all(
-            node_is_confirmed_same(child) for child in node.children.values()
-        )
-    return True
+    if node.confirmed_same_cache is None:
+        if node.left_entry is None or node.right_entry is None:
+            node.confirmed_same_cache = False
+        elif node_has_self_difference(node):
+            node.confirmed_same_cache = False
+        elif node_is_directory(node):
+            if not node.children_loaded:
+                node.confirmed_same_cache = False
+            else:
+                node.confirmed_same_cache = all(
+                    node_is_confirmed_same(child) for child in node.children.values()
+                )
+        else:
+            node.confirmed_same_cache = True
+    return node.confirmed_same_cache
 
 
 def selection_state(node: TreeNode) -> SelectionState:
+    if node.selection_state_cache is not None:
+        return node.selection_state_cache
+
     if not node_is_directory(node):
-        return (
+        node.selection_state_cache = (
             SelectionState.SELECTED if node.is_selected else SelectionState.UNSELECTED
         )
+        return node.selection_state_cache
 
     if node.is_selected and not node.children_loaded:
-        return SelectionState.SELECTED
+        node.selection_state_cache = SelectionState.SELECTED
+        return node.selection_state_cache
 
     if not node.children:
-        return (
+        node.selection_state_cache = (
             SelectionState.SELECTED if node.is_selected else SelectionState.UNSELECTED
         )
+        return node.selection_state_cache
 
     child_states = [selection_state(child_node) for child_node in node.children.values()]
     if all(child_state == SelectionState.SELECTED for child_state in child_states):
-        return SelectionState.SELECTED
+        node.selection_state_cache = SelectionState.SELECTED
+        return node.selection_state_cache
     if all(child_state == SelectionState.UNSELECTED for child_state in child_states):
         if node.is_selected:
-            return SelectionState.PARTIAL
-        return SelectionState.UNSELECTED
-    return SelectionState.PARTIAL
+            node.selection_state_cache = SelectionState.PARTIAL
+        else:
+            node.selection_state_cache = SelectionState.UNSELECTED
+        return node.selection_state_cache
+    node.selection_state_cache = SelectionState.PARTIAL
+    return node.selection_state_cache
 
 
 def set_subtree_selection(node: TreeNode, is_selected: bool) -> None:
     node.is_selected = is_selected
+    clear_node_caches(node)
     for child_node in node.children.values():
         set_subtree_selection(child_node, is_selected)
+
+
+def clear_node_caches(node: TreeNode, *, include_sorted: bool = False) -> None:
+    if include_sorted:
+        node.sorted_children_cache = None
+    node.has_difference_cache = None
+    node.confirmed_same_cache = None
+    node.selection_state_cache = None
+
+
+def clear_ancestor_caches(node: TreeNode | None, *, include_self: bool = True) -> None:
+    current_node = node if include_self else node.parent if node is not None else None
+    while current_node is not None:
+        clear_node_caches(current_node)
+        current_node = current_node.parent
 
 
 def collect_selected_paths(node: TreeNode, source_side: str) -> list[str]:
@@ -819,18 +882,64 @@ def collect_expanded_node_paths(node: TreeNode) -> set[str]:
     return expanded_node_paths
 
 
-def visible_nodes(root_node: TreeNode) -> list[TreeNode]:
+def visible_nodes(
+    root_node: TreeNode, pagination_size: int = DEFAULT_PAGINATION_SIZE
+) -> list[TreeNode]:
+    """Collect visible nodes with pagination support.
+
+    When a directory has more than pagination_size children,
+    only shows pagination_size items, followed by a "... N more" placeholder.
+    """
     nodes: list[TreeNode] = []
+
+    def make_more_placeholder(parent: TreeNode, remaining: int) -> TreeNode:
+        """Create a placeholder node for '... N more'."""
+        placeholder = TreeNode(
+            name=f"... {remaining} more",
+            rel_path=f"{parent.rel_path}/__more_placeholder__",
+            parent=parent,
+        )
+        return placeholder
 
     def append_visible_nodes(node: TreeNode) -> None:
         if node.rel_path:
             nodes.append(node)
         if node.is_expanded:
-            for child_node in sorted_children(node):
-                append_visible_nodes(child_node)
+            sorted_children_list = sorted_children(node)
+            total_children = len(sorted_children_list)
+
+            # Only apply pagination if children exceed threshold
+            if total_children <= pagination_size:
+                # Small directory: show all children
+                for child_node in sorted_children_list:
+                    append_visible_nodes(child_node)
+            else:
+                # Large directory: show first batch + placeholder
+                shown = node.children_shown_count
+                if shown == 0 or shown < pagination_size:
+                    # Initialize with first batch
+                    shown = pagination_size
+                    node.children_shown_count = shown
+
+                # Show the first `shown` children (from loaded list)
+                for i, child_node in enumerate(sorted_children_list):
+                    if i < shown:
+                        append_visible_nodes(child_node)
+                    else:
+                        break
+
+                # Add placeholder if there are more (using accurate total)
+                remaining = total_children - shown
+                if remaining > 0:
+                    nodes.append(make_more_placeholder(node, remaining))
 
     append_visible_nodes(root_node)
     return nodes
+
+
+def is_more_placeholder(node: TreeNode) -> bool:
+    """Check if a node is a '... N more' placeholder."""
+    return node.rel_path.endswith("/__more_placeholder__")
 
 
 # ------------------------------------------------------------------------ #
@@ -909,6 +1018,12 @@ def render_side_cell(
     tree_prefix: str = "",
     show_badge: bool = False,
 ) -> str:
+    # Special handling for "... more" placeholder
+    if is_more_placeholder(node):
+        expand_icon = "▶"
+        cell_text = f"{tree_prefix}{expand_icon} {node.name}"
+        return truncate_text(cell_text, width)
+
     entry = node.left_entry if side == "left" else node.right_entry
     load_error = node.left_load_error if side == "left" else node.right_load_error
     expand_icon = (
@@ -1018,6 +1133,12 @@ class TreeNode:
     content_verified_same: bool = (
         False  # True = hash-confirmed identical despite metadata diff
     )
+    children_shown_count: int = 0  # how many children are currently shown (pagination)
+    total_children_count: int = -1  # total children count, -1 means unknown
+    sorted_children_cache: list[TreeNode] | None = field(default=None, repr=False)
+    has_difference_cache: bool | None = field(default=None, repr=False)
+    confirmed_same_cache: bool | None = field(default=None, repr=False)
+    selection_state_cache: SelectionState | None = field(default=None, repr=False)
 
     @property
     def depth(self) -> int:
@@ -1062,9 +1183,18 @@ class SyncApp:
         self.last_cursor_rel_path = ""
         self.initial_connection_ok = False
         self.list_layout: ListLayout | None = None
+        self.pagination_size = config.pagination_size
+        self._interrupt_requested: bool = False
 
         self.refresh_manifests(initial_load=True)
         self.initial_connection_ok = not self.root_node.left_load_error and not self.root_node.right_load_error
+
+    def _visible_nodes(self) -> list[TreeNode]:
+        """Get visible nodes with pagination support."""
+        return visible_nodes(
+            self.root_node,
+            getattr(self, "pagination_size", DEFAULT_PAGINATION_SIZE),
+        )
 
     # ------------------------------- SSH helpers ---------------------------- #
 
@@ -1221,9 +1351,11 @@ class SyncApp:
         for node in candidates:
             if node.rel_path in same_paths:
                 node.content_verified_same = True
+                clear_ancestor_caches(node)
                 matched += 1
             elif node.rel_path in diff_paths:
                 node.content_verified_same = False
+                clear_ancestor_caches(node)
         return matched
 
     # ------------------------------- lifecycle ------------------------------ #
@@ -1249,7 +1381,7 @@ class SyncApp:
                 self.load_children(node)
                 node.is_expanded = True
 
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         if not visible:
             self.cursor_index = 0
             self.scroll_offset = 0
@@ -1292,17 +1424,47 @@ class SyncApp:
             current_node = next_node
         return current_node
 
-    def load_children(self, node: TreeNode) -> None:
+    def load_children(self, node: TreeNode, limited: bool = True) -> None:
+        """Load children of a directory node.
+
+        Args:
+            node: The directory node to load.
+            limited: If True, use pagination for large directories.
+                     If False, load all children (used for check operations).
+        """
         if node.children_loaded or not node_is_directory(node) and node.rel_path:
             return
 
+        # Check for interrupt
+        if self._interrupt_requested:
+            node.left_load_error = "Interrupted"
+            node.right_load_error = "Interrupted"
+            return
+
+        # Determine which sides exist
+        left_exists = node.left_entry is not None or not node.rel_path  # root always exists
+        right_exists = node.right_entry is not None or not node.rel_path
+
+        self.message = f"Loading {node.rel_path or '/'} ..."
+        if hasattr(self, "stdscr"):
+            self.render()
+
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f_local = pool.submit(self.list_local_child_entries, node)
-            f_remote = pool.submit(self.list_remote_child_entries, node)
+            f_local = pool.submit(
+                self.list_local_child_entries, node
+            ) if left_exists else pool.submit(lambda: {})
+            f_remote = pool.submit(
+                self.list_remote_child_entries, node
+            ) if right_exists else pool.submit(lambda: {})
 
             spin_i = 0
             pending = {f_local, f_remote}
             while pending:
+                if self._interrupt_requested:
+                    pool.shutdown(wait=False)
+                    node.left_load_error = "Interrupted"
+                    node.right_load_error = "Interrupted"
+                    return
                 done, pending = concurrent.futures.wait(pending, timeout=0.1)
                 if pending and hasattr(self, "stdscr"):
                     self.message = (
@@ -1327,9 +1489,16 @@ class SyncApp:
                 node.right_load_error = str(exc)
                 self.message = f"Error listing remote {node.rel_path or '/'}: {exc}"
 
+        # Build children nodes
         existing_children = node.children
         node.children = {}
         child_names = sorted(set(left_entry_by_name.keys()) | set(right_entry_by_name.keys()))
+        total_count = len(child_names)
+        node.total_children_count = total_count
+        if limited and total_count > self.pagination_size:
+            node.children_shown_count = self.pagination_size
+        else:
+            node.children_shown_count = total_count
         inherit_selection = node.is_selected
 
         for child_name in child_names:
@@ -1350,6 +1519,7 @@ class SyncApp:
             new_right = right_entry_by_name.get(child_name)
             if new_left != child_node.left_entry or new_right != child_node.right_entry:
                 child_node.content_verified_same = False
+                clear_node_caches(child_node, include_sorted=True)
             child_node.left_entry = new_left
             child_node.right_entry = new_right
             if not node_is_directory(child_node):
@@ -1358,6 +1528,23 @@ class SyncApp:
             node.children[child_name] = child_node
 
         node.children_loaded = True
+        clear_node_caches(node, include_sorted=True)
+        clear_ancestor_caches(node.parent)
+
+    def load_more_children(self, node: TreeNode) -> None:
+        """Reveal the next page of already-loaded children."""
+        if self._interrupt_requested:
+            return
+
+        current_shown = node.children_shown_count
+        total_count = len(node.children)
+        node.total_children_count = total_count
+        node.children_shown_count = min(current_shown + self.pagination_size, total_count)
+        remaining = total_count - node.children_shown_count
+        if remaining > 0:
+            self.message = f"Showing {node.children_shown_count} items, {remaining} more."
+        else:
+            self.message = f"All {total_count} items shown."
 
     def list_local_child_entries(self, node: TreeNode) -> dict[str, EntryMeta]:
         if node.rel_path and node.left_entry is None:
@@ -1379,6 +1566,12 @@ class SyncApp:
 
     def _run(self, stdscr: curses.window) -> None:
         self.stdscr = stdscr
+        self._interrupt_requested = False
+
+        # Set up SIGINT handler to interrupt operations without exiting TUI
+        import signal
+        original_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
+
         curses.curs_set(0)
         stdscr.keypad(True)
         curses.mousemask(mouse_event_mask())
@@ -1393,12 +1586,23 @@ class SyncApp:
         try:
             while True:
                 self.render()
+                # Check for interrupt after render
+                if self._interrupt_requested:
+                    self._interrupt_requested = False
+                    self.message = "Operation interrupted."
+                    continue
                 key = stdscr.getch()
                 if key in (ord("q"), 27):
                     return
                 self.handle_key(key)
         finally:
+            # Restore original SIGINT handler
+            signal.signal(signal.SIGINT, original_sigint)
             self._close_control_master()
+
+    def _handle_sigint(self, signum: int, frame) -> None:
+        """Handle Ctrl+C by setting interrupt flag instead of exiting."""
+        self._interrupt_requested = True
 
     # ------------------------------- rendering ------------------------------ #
 
@@ -1456,7 +1660,7 @@ class SyncApp:
                 )
         stdscr.addnstr(height - 1, 0, status_text, width - 1, curses.color_pair(2))
 
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         if not visible:
             stdscr.refresh()
             return
@@ -1464,7 +1668,7 @@ class SyncApp:
         row_start = 3
         row_end = height - 4
         list_height = max(row_end - row_start, 1)
-        self.ensure_cursor_visible(list_height=list_height)
+        self.ensure_cursor_visible(list_height=list_height, visible=visible)
 
         selection_width = 4
         divider_width = 3
@@ -1496,6 +1700,28 @@ class SyncApp:
             screen_row = row_start + list_row
             node = visible[visible_index]
             is_cursor_row = visible_index == self.cursor_index
+
+            # Special handling for "... more" placeholder
+            if is_more_placeholder(node):
+                row_color = 0  # white/default
+                row_attr = (curses.A_REVERSE if is_cursor_row else curses.A_DIM) | row_color
+                stdscr.addnstr(screen_row, 0, "    ", selection_width, row_attr)
+                stdscr.addnstr(
+                    screen_row,
+                    selection_width,
+                    render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=False),
+                    panel_width,
+                    row_attr,
+                )
+                stdscr.addnstr(screen_row, selection_width + panel_width, " │ ", divider_width, curses.A_DIM)
+                stdscr.addnstr(
+                    screen_row,
+                    selection_width + panel_width + divider_width,
+                    render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=False),
+                    panel_width,
+                    row_attr,
+                )
+                continue
 
             left_exists = node_exists_on_left(node)
             right_exists = node_exists_on_right(node)
@@ -1542,8 +1768,13 @@ class SyncApp:
 
     # ------------------------------- navigation ----------------------------- #
 
-    def ensure_cursor_visible(self, list_height: int | None = None) -> None:
-        visible = visible_nodes(self.root_node)
+    def ensure_cursor_visible(
+        self,
+        list_height: int | None = None,
+        visible: list[TreeNode] | None = None,
+    ) -> None:
+        if visible is None:
+            visible = self._visible_nodes()
         if not visible:
             self.cursor_index = 0
             self.scroll_offset = 0
@@ -1564,14 +1795,14 @@ class SyncApp:
             self.scroll_offset = self.cursor_index - list_height + 1
 
     def move_cursor_by(self, delta: int) -> None:
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         if not visible:
             return
         self.cursor_index = max(0, min(self.cursor_index + delta, len(visible) - 1))
-        self.ensure_cursor_visible()
+        self.ensure_cursor_visible(visible=visible)
 
     def current_node(self) -> TreeNode | None:
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         if not visible:
             return None
         return visible[self.cursor_index]
@@ -1582,6 +1813,7 @@ class SyncApp:
             return
         next_selected = selection_state(node) == SelectionState.UNSELECTED
         set_subtree_selection(node, next_selected)
+        clear_ancestor_caches(node.parent)
         selected_count = len(collect_selected_node_paths(self.root_node))
         self.message = f"Updated selection. Marked nodes: {selected_count}."
 
@@ -1597,7 +1829,7 @@ class SyncApp:
             return
 
         parent_rel_path = node.parent.rel_path
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         self.cursor_index = next(
             index for index, visible_node in enumerate(visible) if visible_node.rel_path == parent_rel_path
         )
@@ -1605,7 +1837,17 @@ class SyncApp:
 
     def expand_or_move_to_child(self) -> None:
         node = self.current_node()
-        if node is None or not node_is_directory(node):
+        if node is None:
+            return
+
+        # Handle "... more" placeholder - actually load more children
+        if is_more_placeholder(node):
+            parent = node.parent
+            if parent is not None:
+                self.load_more_children(parent)
+                return
+
+        if not node_is_directory(node):
             return
         if not node.children_loaded:
             self.message = f"Loading {node.rel_path or '/'} ..."
@@ -1615,7 +1857,7 @@ class SyncApp:
             node.is_expanded = True
             self.message = f"Expanded {node.rel_path or '/'}."
             return
-        self.cursor_index = min(self.cursor_index + 1, len(visible_nodes(self.root_node)) - 1)
+        self.cursor_index = min(self.cursor_index + 1, len(self._visible_nodes()) - 1)
         self.ensure_cursor_visible()
 
     def toggle_expand_current_directory(self) -> None:
@@ -1635,7 +1877,7 @@ class SyncApp:
 
     def handle_mouse_event(self) -> None:
         _mouse_id, x, y, _z, bstate = curses.getmouse()
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         if not visible:
             return
 
@@ -1660,6 +1902,13 @@ class SyncApp:
 
         self.cursor_index = visible_index
         self.ensure_cursor_visible()
+
+        # Check if clicked on "... more" placeholder
+        node = visible[visible_index]
+        if is_more_placeholder(node):
+            self.expand_or_move_to_child()
+            return
+
         if self.list_layout.is_selection_column(x):
             self.toggle_current_node()
             return
@@ -1670,13 +1919,17 @@ class SyncApp:
 
     def _load_subtree(self, node: TreeNode) -> None:
         """Recursively load all unloaded children of a node, updating the spinner."""
+        if self._interrupt_requested:
+            return
         if not node_is_directory(node):
             return
         if not node.children_loaded:
             self.message = f"Checking {node.rel_path or '/'} ..."
             self.render()
-            self.load_children(node)
+            self.load_children(node, limited=False)  # Unlimited for check operations
         for child in node.children.values():
+            if self._interrupt_requested:
+                return
             _load_subtree_node = child
             self._load_subtree(_load_subtree_node)
 
@@ -1990,6 +2243,7 @@ class SyncApp:
             "Up / Down          Move cursor",
             "Left               Collapse directory / go to parent",
             "Right / Enter      Expand directory / enter first child",
+            "                   Or expand pagination on '... more'",
             "Space              Toggle selection (file or whole subtree)",
             "Mouse wheel        Move cursor up/down",
             "Mouse click        Move cursor to row",
@@ -2010,6 +2264,10 @@ class SyncApp:
             "  blue             Remote only",
             "  green            Confirmed identical (size + mtime match)",
             "  red              Different (size or mtime differ)",
+            "",
+            "Pagination",
+            f"  Shows up to {self.pagination_size} items per directory",
+            "  '... N more' can be expanded with Right/Enter or click",
             "",
             "Remote badge (shown beside remote directory name)",
             "  [pub]            Group read + write",
@@ -2072,6 +2330,7 @@ class SyncApp:
             if not lines:
                 # diff exit 0 → identical content (mtime differs but bytes same)
                 node.content_verified_same = True
+                clear_ancestor_caches(node)
                 lines = ["(files are byte-identical; only metadata differs)"]
             self._show_popup(f"diff  {node.rel_path}", lines)
             self.message = f"Diff preview closed for {node.rel_path}."
@@ -2095,7 +2354,7 @@ class SyncApp:
                 self.message = "Cancelled pending sync action."
             return  # block all other keys while confirmation is pending
 
-        visible = visible_nodes(self.root_node)
+        visible = self._visible_nodes()
         if key == curses.KEY_MOUSE:
             self.handle_mouse_event()
             return

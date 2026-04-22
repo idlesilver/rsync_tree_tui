@@ -4,17 +4,35 @@
 
 格式遵循 Keep a Changelog，版本号遵循 Semantic Versioning。
 
-## [Unreleased]
+## [0.1.8] - 2026-04-22
+
+### Added
+
+- 目录分页显示：当目录子项超过 20 时，只显示前 20 个，剩余显示 `... N more`，按 Right/Enter 或点击可展开更多。
+- `pagination_size` 配置项：可在 `config.json` 中设置每页显示数量，默认 20。
+- Ctrl+C 中断：按 Ctrl+C 中断当前操作（加载/check/sync），但保持 TUI 运行。
+
+### Changed
+
+- 展开目录时加载一层完整 metadata，再按页显示，确保跨两侧排序和权限标记准确。
+- 目录子项排序改为两侧都存在的条目优先，剩余 local-only/remote-only 按最后修改时间倒序显示。
+- 缓存目录排序、选择状态和差异状态，避免在已加载大目录中移动光标时重复扫描全部子项。
+- check 操作时全量加载，不限制分页。
+- 修复 `... more` placeholder 渲染、计数、加载问题。
+
+### Fixed
+
+- `... more` placeholder 点击后真正加载下一页内容。
+- 单侧大目录的子目录不再被误识别为文件。
+- 分页加载后的远程目录保留真实权限标记和可展开状态。
+- 本地已下载但不在远端前 20 个名字中的目录不再被误判为 local-only。
+- 远程计数不再错误减 2。
 
 ## [0.1.7] - 2026-04-21
 
 ### Added
 
 - `setup_remote_permissions.sh` 增加 `--version` 和 `--update` 参数，支持版本显示和从 GitHub 自更新。
-
-### Changed
-
-- LOCAL/REMOTE 标题下划线延伸到整个面板宽度。
 
 ### Changed
 
