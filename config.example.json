@@ -21,9 +21,11 @@
     {
       "id": "example1",
       "local_root": "/abs/local/path",
+      "permission_group": "shared",
       "remote": "user@host:/abs/remote/path",
       "trigger_count": 1
     }
   ],
+  "permission_group": "",
   "version": 1
 }

@@ -28,11 +28,12 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.10"
+__version__ = "0.2.0"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
+PERMISSION_GROUP_ENV = "RSYNC_TREE_TUI_PERMISSION_GROUP"
 DEFAULT_CHECKSUM_THRESHOLD_MB = 512
 DEFAULT_CHECKSUM_SUFFIXES = [
     ".json",
@@ -67,6 +68,7 @@ def default_config_data() -> dict[str, object]:
             "checksum_suffixes": DEFAULT_CHECKSUM_SUFFIXES,
         },
         "diff_viewers": DEFAULT_DIFF_VIEWERS,
+        "permission_group": "",
         "known_connections": [],
     }
 
@@ -211,6 +213,7 @@ def record_successful_connection(
     config_data: dict[str, object],
     local_root: Path,
     remote: str,
+    permission_group: str | None = None,
 ) -> None:
     entries = config_data.setdefault("known_connections", [])
     if not isinstance(entries, list):
@@ -223,17 +226,20 @@ def record_successful_connection(
             entry["local_root"] = str(local_root.resolve())
             entry["remote"] = remote
             entry["trigger_count"] = int(entry.get("trigger_count", 0)) + 1
+            if permission_group:
+                entry["permission_group"] = permission_group
             save_json_config(config_path, config_data)
             return
 
-    entries.append(
-        {
-            "id": conn_id,
-            "local_root": str(local_root.resolve()),
-            "remote": remote,
-            "trigger_count": 1,
-        }
-    )
+    entry = {
+        "id": conn_id,
+        "local_root": str(local_root.resolve()),
+        "remote": remote,
+        "trigger_count": 1,
+    }
+    if permission_group:
+        entry["permission_group"] = permission_group
+    entries.append(entry)
     save_json_config(config_path, config_data)
 
 
@@ -266,6 +272,8 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
 
     local_value = args.local_root or get_env_or_dotenv(LOCAL_ROOT_ENV, dotenv)
     remote = args.remote or get_env_or_dotenv(REMOTE_ENV, dotenv)
+    cli_permission_group = getattr(args, "permission_group", None)
+    env_permission_group = get_env_or_dotenv(PERMISSION_GROUP_ENV, dotenv)
 
     selected_connection: dict[str, object] | None = None
     if remote is None:
@@ -277,6 +285,24 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     else:
         local_root = resolve_local_root(local_value, cwd)
 
+    permission_group = ""
+    permission_group_source = "none"
+    if cli_permission_group:
+        permission_group = str(cli_permission_group)
+        permission_group_source = "cli"
+    elif env_permission_group:
+        permission_group = env_permission_group
+        permission_group_source = "env/.env"
+    elif (
+        selected_connection is not None
+        and selected_connection.get("permission_group")
+    ):
+        permission_group = str(selected_connection["permission_group"])
+        permission_group_source = "known connection"
+    elif config_data.get("permission_group"):
+        permission_group = str(config_data["permission_group"])
+        permission_group_source = "global config"
+
     return AppConfig(
         local_root=local_root,
         remote_spec=remote,
@@ -284,6 +310,8 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         config_data=config_data,
         checksum_policy=ChecksumPolicy.from_config(config_data),
         diff_viewers=parse_diff_viewers(config_data),
+        permission_group=permission_group,
+        permission_group_source=permission_group_source,
         pagination_size=int(config_data.get("pagination_size", DEFAULT_PAGINATION_SIZE)),
     )
 
@@ -384,7 +412,16 @@ class AppConfig:
     config_data: dict[str, object]
     checksum_policy: ChecksumPolicy
     diff_viewers: list[str]
+    permission_group: str = ""
+    permission_group_source: str = "none"
     pagination_size: int = DEFAULT_PAGINATION_SIZE
+
+
+@dataclass(slots=True)
+class PermissionRequest:
+    mode: str
+    rel_paths: list[str]
+    permission_group: str
 
 
 @dataclass(slots=True)
@@ -394,6 +431,7 @@ class ListLayout:
     selection_width: int
     panel_width: int
     divider_width: int
+    badge_width: int = 7
 
     def visible_index_at(self, y: int, scroll_offset: int, visible_count: int) -> int | None:
         if y < self.row_start or y >= self.row_start + self.list_height:
@@ -431,6 +469,7 @@ def parse_args() -> argparse.Namespace:
             "Defaults (in priority order):\n"
             f"  --local-root : ${LOCAL_ROOT_ENV} → .env {LOCAL_ROOT_ENV} → current pwd\n"
             f"  --remote     : ${REMOTE_ENV} → .env {REMOTE_ENV} → known connection picker\n"
+            f"  --permission-group : ${PERMISSION_GROUP_ENV} → .env → known connection → config\n"
             f"  --config     : {default_config_path()}\n"
         ),
     )
@@ -456,6 +495,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=f"Global JSON config path (default: {default_config_path()}).",
+    )
+    parser.add_argument(
+        "--permission-group",
+        default=None,
+        help=(
+            "Shared remote group for permission changes "
+            f"(default: ${PERMISSION_GROUP_ENV} / .env / known config / global config)."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -695,6 +742,58 @@ def list_remote_tree_entries(
         stdout=subprocess.PIPE,
     ).stdout
     return parse_manifest_output(output)
+
+
+def build_remote_owner_preflight_command(
+    remote_root: str,
+    rel_path: str,
+    owner: str,
+) -> str:
+    return (
+        "set -e; "
+        f"cd {shlex.quote(remote_root)}; "
+        f"find -L {shlex.quote(rel_path)} -mindepth 0 "
+        f"! -user {shlex.quote(owner)} -print -quit"
+    )
+
+
+def permission_chmod_modes(mode: str, *, has_group: bool) -> tuple[str, str]:
+    if mode == "rdo":
+        return (
+            "u=rwx,go=rx,g+s" if has_group else "u=rwx,go=rx",
+            "u=rw,go=r",
+        )
+    if mode == "pub":
+        return (
+            "ug=rwx,o=rx,g+s" if has_group else "ug=rwx,o=rx",
+            "ug=rw,o=r",
+        )
+    if mode == "pvt":
+        return ("u=rwx,go-rwx,g-s", "u=rw,go-rwx")
+    raise ValueError(f"Invalid permission mode: {mode}")
+
+
+def build_remote_permission_command(
+    remote_root: str,
+    rel_paths: list[str],
+    mode: str,
+    permission_group: str = "",
+) -> str:
+    dir_mode, file_mode = permission_chmod_modes(mode, has_group=bool(permission_group))
+    commands = ["set -e", f"cd {shlex.quote(remote_root)}"]
+    for rel_path in rel_paths:
+        quoted_path = shlex.quote(rel_path)
+        if permission_group:
+            commands.append(
+                f"chgrp -R {shlex.quote(permission_group)} {quoted_path} 2>/dev/null || true"
+            )
+        commands.append(
+            f"find -L {quoted_path} -type d -exec chmod {shlex.quote(dir_mode)} {{}} +"
+        )
+        commands.append(
+            f"find -L {quoted_path} -type f -exec chmod {shlex.quote(file_mode)} {{}} +"
+        )
+    return "; ".join(commands)
 
 
 def join_rel_path(parent_rel_path: str, child_name: str) -> str:
@@ -1016,15 +1115,37 @@ def path_suffix_for_side(node: TreeNode, side: str) -> str:
     return ""
 
 
-def remote_dir_badge(entry: EntryMeta) -> str:
-    """Return a short access badge based on group permission bits."""
-    g_r = bool(entry.perms & 0o040)
-    g_w = bool(entry.perms & 0o020)
-    if g_r and g_w:
-        return " [pub]"
-    if g_r:
-        return " [ro]"
-    return " [pvt]"
+def remote_permission_badge(entry: EntryMeta) -> str:
+    """Return a short access badge for remote files and directories."""
+    mode = entry.perms & 0o777
+    if entry.entry_type == EntryType.DIRECTORY:
+        if mode == 0o700:
+            return "[pvt]"
+        if mode == 0o755:
+            return "[rdo]"
+        if mode == 0o775:
+            return "[pub]"
+    else:
+        if mode == 0o600:
+            return "[pvt]"
+        if mode == 0o644:
+            return "[rdo]"
+        if mode == 0o664:
+            return "[pub]"
+    return f"[{mode:03o}]"
+
+
+def badge_color_pair(entry: EntryMeta | None) -> int:
+    if entry is None:
+        return 0
+    badge = remote_permission_badge(entry)
+    if badge == "[pvt]":
+        return 6
+    if badge == "[pub]":
+        return 7
+    if badge == "[rdo]":
+        return 8
+    return 9
 
 
 _TREE_MID   = "├─ "
@@ -1063,7 +1184,6 @@ def render_side_cell(
     side: str,
     width: int,
     tree_prefix: str = "",
-    show_badge: bool = False,
 ) -> str:
     # Special handling for "... more" placeholder
     if is_more_placeholder(node):
@@ -1080,10 +1200,7 @@ def render_side_cell(
     )
     node_name = node.name if entry is not None else "<error>" if load_error else ""
     suffix = path_suffix_for_side(node, side)
-    badge = ""
-    if show_badge and entry is not None and node_is_directory(node):
-        badge = remote_dir_badge(entry)
-    cell_text = f"{tree_prefix}{expand_icon} {node_name}{suffix}{badge}"
+    cell_text = f"{tree_prefix}{expand_icon} {node_name}{suffix}"
     return truncate_text(cell_text, width)
 
 
@@ -1230,12 +1347,15 @@ class SyncApp:
         self.scroll_offset = 0
         self.message = "Loading manifests..."
         self.pending_action: str | None = None
+        self.pending_permission: PermissionRequest | None = None
         self.last_cursor_rel_path = ""
         self.initial_connection_ok = False
         self.list_layout: ListLayout | None = None
         self.footer_shortcut_hits: list[FooterShortcutHit] = []
         self.pagination_size = config.pagination_size
         self.diff_viewers = config.diff_viewers
+        self.permission_group = config.permission_group
+        self.permission_group_source = config.permission_group_source
         self._interrupt_requested: bool = False
 
         self.refresh_manifests(initial_load=True)
@@ -1322,6 +1442,38 @@ class SyncApp:
             node = node.parent
         # No remote entry found — assume writable (owner case or new upload)
         return True
+
+    def _selected_remote_permission_paths(self) -> list[str]:
+        return sorted(collect_selected_paths(self.root_node, "right"))
+
+    def _first_remote_non_owner_path(self, rel_paths: list[str]) -> str | None:
+        if not self.remote_user:
+            return "(remote user unknown)"
+        for rel_path in rel_paths:
+            remote_command = build_remote_owner_preflight_command(
+                self.remote_root,
+                rel_path,
+                self.remote_user,
+            )
+            result = subprocess.run(
+                ["ssh", *self._ssh_opts(), self.remote_target, remote_command],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip() or f"owner preflight failed for {rel_path}"
+                return err.splitlines()[0]
+            first_path = result.stdout.strip().splitlines()
+            if first_path:
+                return first_path[0]
+        return None
+
+    def _permission_group_display(self) -> str:
+        if self.permission_group:
+            return f"{self.permission_group} ({self.permission_group_source})"
+        return "<none>"
 
     # ------------------------------- content verification ------------------- #
 
@@ -1634,6 +1786,10 @@ class SyncApp:
         curses.init_pair(3, curses.COLOR_YELLOW, -1)  # help text / local-only
         curses.init_pair(4, curses.COLOR_CYAN, -1)  # remote-only
         curses.init_pair(5, curses.COLOR_GREEN,  -1)   # both exist, confirmed same
+        curses.init_pair(6, curses.COLOR_WHITE, -1)  # [pvt] dimmed gray
+        curses.init_pair(7, curses.COLOR_GREEN, -1)  # [pub]
+        curses.init_pair(8, curses.COLOR_YELLOW, -1)  # [rdo] (brown-ish)
+        curses.init_pair(9, curses.COLOR_MAGENTA, -1)  # numeric permission
 
         try:
             while True:
@@ -1702,6 +1858,12 @@ class SyncApp:
                 )
             elif self.pending_action == "clear":
                 status_text = "Clear ALL selections? Press y to confirm, n to cancel."
+            elif self.pending_action == "permission" and self.pending_permission is not None:
+                status_text = (
+                    f"Apply permission {self.pending_permission.mode} to "
+                    f"{len(self.pending_permission.rel_paths)} remote entries. "
+                    "Press y to confirm, n to cancel."
+                )
             else:
                 status_text = (
                     f"{self.pending_action} selected entries. Press y to confirm, n to cancel."
@@ -1719,21 +1881,23 @@ class SyncApp:
         self.ensure_cursor_visible(list_height=list_height, visible=visible)
 
         selection_width = 4
-        divider_width = 3
-        panel_width = max((width - selection_width - divider_width) // 2, 10)
+        badge_width = 7
+        divider_width = badge_width
+        panel_width = max((width - selection_width - badge_width) // 2, 10)
         self.list_layout = ListLayout(
             row_start=row_start,
             list_height=list_height,
             selection_width=selection_width,
             panel_width=panel_width,
             divider_width=divider_width,
+            badge_width=badge_width,
         )
 
         # Column header labels (row 2)
         col_header = (
             " " * selection_width
             + "LOCAL".ljust(panel_width)
-            + " │ "
+            + "PERM".center(badge_width)
             + "REMOTE".ljust(panel_width)
         )
         stdscr.addnstr(2, 0, col_header, width - 1, curses.A_BOLD | curses.A_UNDERLINE)
@@ -1757,15 +1921,21 @@ class SyncApp:
                 stdscr.addnstr(
                     screen_row,
                     selection_width,
-                    render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=False),
+                    render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index]),
                     panel_width,
                     row_attr,
                 )
-                stdscr.addnstr(screen_row, selection_width + panel_width, " │ ", divider_width, curses.A_DIM)
                 stdscr.addnstr(
                     screen_row,
-                    selection_width + panel_width + divider_width,
-                    render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=False),
+                    selection_width + panel_width,
+                    " " * badge_width,
+                    badge_width,
+                    curses.A_DIM,
+                )
+                stdscr.addnstr(
+                    screen_row,
+                    selection_width + panel_width + badge_width,
+                    render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index]),
                     panel_width,
                     row_attr,
                 )
@@ -1796,18 +1966,33 @@ class SyncApp:
             stdscr.addnstr(
                 screen_row,
                 selection_width,
-                render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=False),
+                render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index]),
                 panel_width,
                 left_attr,
             )
 
-            stdscr.addnstr(screen_row, selection_width + panel_width, " │ ", divider_width, curses.A_BOLD)
+            badge_text = ""
+            badge_attr = row_attr
+            if node.right_entry is not None:
+                badge_text = remote_permission_badge(node.right_entry)
+                badge_attr = curses.color_pair(badge_color_pair(node.right_entry))
+                if badge_text == "[pvt]":
+                    badge_attr |= curses.A_DIM
+                if is_cursor_row:
+                    badge_attr |= curses.A_REVERSE
+            stdscr.addnstr(
+                screen_row,
+                selection_width + panel_width,
+                badge_text.center(badge_width),
+                badge_width,
+                badge_attr,
+            )
 
             right_attr = row_attr | (curses.A_BOLD if right_exists else 0)
             stdscr.addnstr(
                 screen_row,
-                selection_width + panel_width + divider_width,
-                render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index], show_badge=True),
+                selection_width + panel_width + badge_width,
+                render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index]),
                 panel_width,
                 right_attr,
             )
@@ -1821,8 +2006,8 @@ class SyncApp:
             ("Space", "Toggle", ord(" ")),
             ("d", "Download", ord("d")),
             ("u", "Upload", ord("u")),
-            ("p", "Diff", ord("p")),
-            ("P", "External", None),
+            ("f/F", "Diff", ord("f")),
+            ("p", "Permission", ord("p")),
             ("c", "Check", ord("c")),
             ("x", "Clear", ord("x")),
             ("r", "Refresh", ord("r")),
@@ -2094,6 +2279,52 @@ class SyncApp:
             self.pending_action = "clear"
             return
 
+        if action == "permission":
+            selected_paths = self._selected_remote_permission_paths()
+            if not selected_paths:
+                self.message = "No selected remote entries for permission change."
+                self.pending_action = None
+                self.pending_permission = None
+                return
+            self.message = (
+                f"Checking ownership for {len(selected_paths)} selected remote entries..."
+            )
+            if hasattr(self, "stdscr"):
+                self.render()
+            first_non_owner = self._first_remote_non_owner_path(selected_paths)
+            if first_non_owner is not None:
+                self.message = f"Cannot change permission: not owner of {first_non_owner}."
+                self.pending_action = None
+                self.pending_permission = None
+                if hasattr(self, "stdscr"):
+                    self._show_popup(
+                        "Permission Denied",
+                        [
+                            "Permission change requires the SSH user to own",
+                            "every selected remote path and its descendants.",
+                            "",
+                            f"First blocked path: {first_non_owner}",
+                        ],
+                    )
+                return
+            mode = self._choose_permission_mode(len(selected_paths))
+            if mode is None:
+                self.message = "Cancelled permission mode selection."
+                self.pending_action = None
+                self.pending_permission = None
+                return
+            self.pending_permission = PermissionRequest(
+                mode=mode,
+                rel_paths=selected_paths,
+                permission_group=self.permission_group,
+            )
+            self.pending_action = "permission"
+            self.message = (
+                f"Apply permission {mode} to {len(selected_paths)} remote entries. "
+                "Press y to confirm, n to cancel."
+            )
+            return
+
         source_side = "right" if action == "download" else "left"
         selected_paths = collect_selected_paths(self.root_node, source_side)
 
@@ -2163,6 +2394,42 @@ class SyncApp:
             groups.append((False, sorted(set(dirs + quick_files))))
         return groups
 
+    def execute_permission_request(self) -> None:
+        request = self.pending_permission
+        if request is None:
+            self.pending_action = None
+            self.message = "No pending permission request."
+            return
+
+        self.pending_action = None
+        self.pending_permission = None
+        self.message = (
+            f"Applying permission {request.mode} to {len(request.rel_paths)} remote entries..."
+        )
+        self.render()
+        remote_command = build_remote_permission_command(
+            self.remote_root,
+            request.rel_paths,
+            request.mode,
+            request.permission_group,
+        )
+        result = subprocess.run(
+            ["ssh", *self._ssh_opts(), self.remote_target, remote_command],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip() or result.stdout.strip() or "remote command failed"
+            self.message = f"Permission change failed: {err.splitlines()[0]}"
+            return
+
+        self.refresh_manifests(initial_load=False)
+        self.message = (
+            f"Applied permission {request.mode} to {len(request.rel_paths)} remote entries."
+        )
+
     def execute_pending_action(self) -> None:
         if self.pending_action is None:
             return
@@ -2175,6 +2442,10 @@ class SyncApp:
             self.pending_action = None
             count = deselect_all_nodes(self.root_node)
             self.message = f"Cleared {count} selection(s)."
+            return
+
+        if self.pending_action == "permission":
+            self.execute_permission_request()
             return
 
         action = self.pending_action
@@ -2414,7 +2685,7 @@ class SyncApp:
             win.refresh()
 
             key = self.stdscr.getch()
-            if key in (ord("q"), 27, ord("\n"), ord(" "), ord("?"), ord("p")):
+            if key in (ord("q"), 27, ord("\n"), ord(" "), ord("?"), ord("f")):
                 return
             elif key == curses.KEY_UP:
                 scroll = max(0, scroll - 1)
@@ -2433,6 +2704,53 @@ class SyncApp:
             elif key == getattr(curses, "KEY_END", -1):
                 hscroll = max(0, max_line_len - content_w)
 
+    def _choose_permission_mode(self, target_count: int) -> str | None:
+        lines = [
+            "Select remote permission mode",
+            "",
+            f"Targets: {target_count} selected remote entries",
+            f"Group:   {self._permission_group_display()}",
+            "",
+            "1 / r    read-only (rdo)",
+            "2 / v    private  (pvt)",
+            "3 / u    public   (pub)",
+            "",
+            "q / Esc  cancel",
+        ]
+        key_to_mode = {
+            ord("1"): "rdo",
+            ord("r"): "rdo",
+            ord("R"): "rdo",
+            ord("2"): "pvt",
+            ord("v"): "pvt",
+            ord("V"): "pvt",
+            ord("3"): "pub",
+            ord("u"): "pub",
+            ord("U"): "pub",
+        }
+        while True:
+            self.render()
+            height, width = self.stdscr.getmaxyx()
+            content_w = min(max((self._text_cell_width(line) for line in lines), default=0), 56)
+            box_w = min(max(content_w + 4, 34), max(width - 8, 10))
+            box_h = min(len(lines) + 4, max(height - 4, 5))
+            start_y = max((height - box_h) // 2, 0)
+            start_x = max((width - box_w) // 2, 0)
+            win = curses.newwin(box_h, box_w, start_y, start_x)
+            win.erase()
+            win.box()
+            title = " Permission "
+            title_x = max((box_w - self._text_cell_width(title)) // 2, 1)
+            self._popup_add_cells(win, 0, title_x, title, box_w - title_x - 1, curses.A_BOLD)
+            for row, line in enumerate(lines[: max(box_h - 2, 0)]):
+                self._popup_add_cells(win, row + 1, 2, line, box_w - 4)
+            win.refresh()
+            key = self.stdscr.getch()
+            if key in key_to_mode:
+                return key_to_mode[key]
+            if key in (ord("q"), ord("Q"), 27):
+                return None
+
     def _show_help_popup(self) -> None:
         lines = [
             "Up / Down          Move cursor",
@@ -2446,8 +2764,9 @@ class SyncApp:
             "Double click       Expand/collapse directory",
             "d                  Download selected  (remote → local)",
             "u                  Upload selected    (local → remote)",
-            "p                  Preview diff in built-in popup (red entries only)",
-            "P                  Preview diff with external viewer",
+            "f                  Preview diff in built-in popup (red entries only)",
+            "F                  Preview diff with external viewer (vim -d by default)",
+            "p                  Change remote permissions for selected entries",
             "c                  Recursively check selected entries",
             "x                  Clear all selections (with confirmation)",
             "r                  Refresh manifests",
@@ -2465,14 +2784,18 @@ class SyncApp:
             f"  Shows up to {self.pagination_size} items per directory",
             "  '... N more' can be expanded with Right/Enter or click",
             "",
-            "Remote badge (shown beside remote directory name)",
-            "  [pub]            Group read + write",
-            "  [ro]             Group read only",
-            "  [pvt]            No group access",
+            "PERM badge (middle column)",
+            "  [pub]            Public: dirs 775, files 664",
+            "  [rdo]            Read-only: dirs 755, files 644",
+            "  [pvt]            Private: dirs 700, files 600",
+            "  [640]            Non-standard numeric mode",
             "",
             "Diff preview",
-            "  p uses built-in popup with Left/Right horizontal pan",
-            "  P uses vim -d by default, or configured diff viewer",
+            "  f uses built-in popup with Left/Right horizontal pan",
+            "  F uses vim -d by default, or configured diff viewer",
+            "",
+            "Remote permissions",
+            "  p offers pvt/rdo/pub after owner preflight",
         ]
         self._show_popup("Help", lines)
 
@@ -2560,7 +2883,7 @@ class SyncApp:
     def _show_external_diff(self, local_path: Path, remote_copy_path: Path, diff_text: str) -> bool:
         viewer_command = self._available_diff_viewer()
         if viewer_command is None:
-            self.message = "No supported external diff viewer found; use p for built-in popup."
+            self.message = "No supported external diff viewer found; use f for built-in popup."
             return False
         return self._run_external_diff_viewer(
             viewer_command,
@@ -2631,8 +2954,13 @@ class SyncApp:
             if key == ord("y"):
                 self.execute_pending_action()
             elif key == ord("n"):
+                cancelled_action = self.pending_action
                 self.pending_action = None
-                self.message = "Cancelled pending sync action."
+                self.pending_permission = None
+                if cancelled_action == "permission":
+                    self.message = "Cancelled pending permission action."
+                else:
+                    self.message = "Cancelled pending sync action."
             return  # block all other keys while confirmation is pending
 
         visible = self._visible_nodes()
@@ -2669,11 +2997,14 @@ class SyncApp:
             self.message = "Refreshing manifests..."
             self.refresh_manifests(initial_load=False)
             return
-        if key == ord("p"):
+        if key == ord("f"):
             self._try_preview_diff()
             return
-        if key == ord("P"):
+        if key == ord("F"):
             self._try_preview_diff(external=True)
+            return
+        if key == ord("p"):
+            self.start_action("permission")
             return
         if key == ord("x"):
             self.start_action("clear")
@@ -2708,6 +3039,7 @@ def main() -> None:
             config.config_data,
             config.local_root,
             config.remote_spec,
+            config.permission_group,
         )
     app.run()
 

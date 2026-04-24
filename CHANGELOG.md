@@ -4,13 +4,22 @@
 
 格式遵循 Keep a Changelog，版本号遵循 Semantic Versioning。
 
-## [0.1.10] - 2026-04-24
+## [0.2.0] - 2026-04-24
+
+### Added
+
+- TUI 新增 `p` 远端权限操作，可对选中远端文件/目录递归应用 `pvt`、`rdo`、`pub`，执行前检查 owner 并要求 `y/n` 二次确认。
+- 新增 `--permission-group` 和 `RSYNC_TREE_TUI_PERMISSION_GROUP`，并支持全局配置与 known connection 记录。
 
 ### Changed
 
 - download 同步命令增加 rsync `--backup`，覆盖本地文件时保留 rsync 备份文件。
-- `p` 固定使用内置 diff 弹窗，新增 `P` 使用外部 diff 工具；外部工具默认使用 `vim -d`，配置支持 `vimdiff`、`vim -d`、`nvim -d`，并兼容 `delta`。
+- 底部快捷键提示将 diff 改为 `f/F Diff`，`p` 改为远端权限操作入口。
+- `f` 使用内置 diff 弹窗，`F` 使用外部 diff 工具；外部工具默认使用 `vim -d`，配置支持 `vimdiff`、`vim -d`、`nvim -d`，并兼容 `delta`。
 - 内置 diff 弹窗支持左右横向移动长行，并避免长行或 ANSI 控制序列残片覆盖弹窗边框。
+- 远端权限标记改为文件和目录都显示，标准类别为 `[pvt]`、`[rdo]`、`[pub]`；非标准权限显示为 `[640]` 等数字 mode，并在 LOCAL/REMOTE 中间独立 `PERM` 列对齐显示。
+- 权限操作在执行远端归属检查前先更新 statusline，避免多选时界面看起来无响应。
+- `setup_remote_permissions.sh` 同步精确权限模板：`pvt=700/600`、`rdo=755/644`、`pub=775/664`。
 
 ## [0.1.9] - 2026-04-24
 

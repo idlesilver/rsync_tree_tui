@@ -5,9 +5,9 @@
 # Normalize group access on shared storage directories.
 #
 # Three modes (applied recursively to all content under each target):
-#   readonly  — group/others can browse and download, group cannot write [ro]  in TUI
-#   public    — group can browse, download, and upload (write)    [pub] in TUI
-#   private   — group/others have no access                       [pvt] in TUI
+#   pvt — private:   dirs 700, files 600
+#   rdo — read-only: dirs 755, files 644
+#   pub — public:    dirs 775, files 664
 #
 # Usage:
 #   setup_remote_permissions.sh [--group GROUP] [--dry-run] [-v] <mode> <path> [<path> ...]
@@ -23,29 +23,29 @@
 #
 # Examples:
 #   # Preview what would change, without applying
-#   ./setup_remote_permissions.sh --dry-run readonly /data/storage/sn_assets
+#   ./setup_remote_permissions.sh --dry-run rdo /data/storage/sn_assets
 #
 #   # Lock a released dataset so teammates can only download it
-#   ./setup_remote_permissions.sh readonly /data/storage/datasets/v1.0
+#   ./setup_remote_permissions.sh rdo /data/storage/datasets/v1.0
 #
 #   # Open a staging area so teammates can upload into it
-#   ./setup_remote_permissions.sh public /data/storage/datasets/staging
+#   ./setup_remote_permissions.sh pub /data/storage/datasets/staging
 #
 #   # Hide a work-in-progress directory from teammates
-#   ./setup_remote_permissions.sh private /data/storage/wip_secret
+#   ./setup_remote_permissions.sh pvt /data/storage/wip_secret
 #
 #   # Apply to multiple paths at once
-#   ./setup_remote_permissions.sh readonly /data/storage/v1.0 /data/storage/v1.1
+#   ./setup_remote_permissions.sh rdo /data/storage/v1.0 /data/storage/v1.1
 #
 # Run remotely from local machine:
-#   ssh user@host "bash /path/to/scripts/setup_remote_permissions.sh readonly /remote/path"
+#   ssh user@host "bash /path/to/scripts/setup_remote_permissions.sh rdo /remote/path"
 #
 
 set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/setup_remote_permissions.sh"
 
 # Edit this line to persist a site-specific default, or pass --group.
@@ -139,7 +139,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=1; shift ;;
         -v|--verbose)     VERBOSE=1; shift ;;
         --help|-h)        usage ;;
-        readonly|public|private)
+        pvt|rdo|pub)
             [[ -n "$MODE" ]] && { echo "ERROR: mode specified twice ('$MODE' and '$1')"; exit 1; }
             MODE="$1"
             shift
@@ -158,7 +158,7 @@ if [[ $UPDATE -eq 1 ]]; then
     do_self_update
 fi
 
-[[ -z "$MODE"            ]] && { echo "ERROR: mode is required (readonly|public|private)"; echo; usage; }
+[[ -z "$MODE"            ]] && { echo "ERROR: mode is required (pvt|rdo|pub)"; echo; usage; }
 [[ ${#TARGETS[@]} -eq 0 ]] && { echo "ERROR: at least one path is required"; echo; usage; }
 [[ -z "$GROUP"           ]] && { echo "ERROR: group must not be empty"; echo; usage; }
 
@@ -177,22 +177,34 @@ log_ok()    { echo -e "${GREEN}  ${*}${RESET}"; }
 log_warn()  { echo -e "${YELLOW}  WARN: ${*}${RESET}" >&2; }
 log_error() { echo -e "${RED}  ERROR: ${*}${RESET}" >&2; }
 
+find_mode_mismatches() {
+    local target="$1"
+    local type="$2"
+    local wanted_mode="$3"
+    find -L "$target" -type "$type" -exec sh -c '
+        wanted_mode="$0"
+        for path do
+            mode=$(stat -c "%a" "$path") || exit 1
+            if [ "$mode" != "$wanted_mode" ]; then
+                printf "%s\n" "$path"
+            fi
+        done
+    ' "$wanted_mode" {} +
+}
+
 # find predicates: return entries whose permissions DO NOT yet match the target
 # (these are the entries that would be changed)
 find_mismatched_dirs() {
     local target="$1"
     case "$MODE" in
-        readonly)
-            # dirs that have group-write, OR are missing group/other read/exec
-            find -L "$target" -type d \( -perm /020 -o ! -perm -055 \) -print
+        pvt)
+            find_mode_mismatches "$target" d 700
             ;;
-        public)
-            # dirs missing group-rwx, OR missing setgid bit
-            find -L "$target" -type d \( ! -perm -070 -o ! -perm /2000 \) -print
+        rdo)
+            find_mode_mismatches "$target" d 2755
             ;;
-        private)
-            # dirs that still expose group/other access, or setgid inheritance
-            find -L "$target" -type d \( -perm /077 -o -perm /2000 \) -print
+        pub)
+            find_mode_mismatches "$target" d 2775
             ;;
     esac
 }
@@ -200,17 +212,14 @@ find_mismatched_dirs() {
 find_mismatched_files() {
     local target="$1"
     case "$MODE" in
-        readonly)
-            # files with group-write, OR missing group/other read
-            find -L "$target" -type f \( -perm /020 -o ! -perm -044 \) -print
+        pvt)
+            find_mode_mismatches "$target" f 600
             ;;
-        public)
-            # files missing group-rw
-            find -L "$target" -type f ! -perm -060 -print
+        rdo)
+            find_mode_mismatches "$target" f 644
             ;;
-        private)
-            # files that still expose group/other access
-            find -L "$target" -type f -perm /077 -print
+        pub)
+            find_mode_mismatches "$target" f 664
             ;;
     esac
 }
@@ -261,17 +270,17 @@ fix_target() {
     changed_files=$(echo -n "$file_list" | grep -c . || true)
 
     case "$MODE" in
-        readonly)
-            find -L "$target" -type d -exec chmod go+rx,g-w,g+s {} +
-            find -L "$target" -type f -exec chmod go+r,g-w      {} +
+        pvt)
+            find -L "$target" -type d -exec chmod u=rwx,go-rwx,g-s {} +
+            find -L "$target" -type f -exec chmod u=rw,go-rwx      {} +
             ;;
-        public)
-            find -L "$target" -type d -exec chmod g+rwxs    {} +
-            find -L "$target" -type f -exec chmod g+rw      {} +
+        rdo)
+            find -L "$target" -type d -exec chmod u=rwx,go=rx,g+s {} +
+            find -L "$target" -type f -exec chmod u=rw,go=r       {} +
             ;;
-        private)
-            find -L "$target" -type d -exec chmod go-rwx,g-s {} +
-            find -L "$target" -type f -exec chmod go-rwx     {} +
+        pub)
+            find -L "$target" -type d -exec chmod ug=rwx,o=rx,g+s {} +
+            find -L "$target" -type f -exec chmod ug=rw,o=r       {} +
             ;;
     esac
 

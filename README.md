@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.1.10`
+当前版本：`v0.2.0`
 
 ## 运行
 
@@ -36,11 +36,18 @@ GNU find with -printf
 --remote > RSYNC_TREE_TUI_REMOTE > .env > known connection picker
 ```
 
+`permission_group` 的来源优先级：
+
+```text
+--permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > selected known connection > global config > 空
+```
+
 环境变量示例：
 
 ```bash
 RSYNC_TREE_TUI_LOCAL_ROOT=/path/to/local
 RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
+RSYNC_TREE_TUI_PERMISSION_GROUP=shared
 ```
 
 `.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。
@@ -59,7 +66,7 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 
 ### Diff Viewer
 
-`p` 使用内置弹窗预览 diff；内置弹窗支持左右方向键横向移动长行。`P` 使用外部工具预览 diff，默认使用 `vim -d {local} {remote}`。
+`f` 使用内置弹窗预览 diff；内置弹窗支持左右方向键横向移动长行。`F` 使用外部工具预览 diff，默认使用 `vim -d {local} {remote}`。
 
 `diff_viewers` 允许配置 `vim -d`、`vimdiff`、`nvim -d`，也兼容 `delta`。vim/nvim 命令使用 `{local}`、`{remote}` 接收本地文件和临时远端副本路径；`delta` 从 stdin 读取 unified diff。
 
@@ -75,39 +82,41 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 
 ## 远程权限辅助脚本
 
-`setup_remote_permissions.sh` 用于在远程机器上批量整理共享目录权限。它会影响 TUI 里远端目录旁边的权限标记：
+TUI 中按 `p` 可以直接对选中的远端文件或目录递归应用权限模式。执行前会检查选中路径及其递归内容是否都属于当前 SSH 用户；发现非 owner 路径会拒绝执行。选择模式后仍需按 `y` 二次确认。`setup_remote_permissions.sh` 提供同样的权限规则，可作为独立远程端工具使用。
 
 ```text
-public    -> [pub]  group read/write，可上传
-readonly  -> [ro]   group read only，可浏览和下载
-private   -> [pvt]  group/others 无访问权限
+pvt  private    目录 700，文件 600
+rdo  read-only  目录 755，文件 644
+pub  public     目录 775，文件 664
 ```
 
-这个脚本应该在远程端运行。先把脚本复制到远程机器，再对远程目录执行 dry-run，确认后再应用：
+TUI 在 LOCAL 和 REMOTE 中间使用独立 `PERM` 列显示远端权限。完整显示规则、颜色、文件/目录权限、owner/group/others 行为和修改语义见 [Permission Rules](docs/permission-rules.md)。
+
+脚本应该在远程端运行。先把脚本复制到远程机器，再对远程目录执行 dry-run，确认后再应用：
 
 ```bash
 scp setup_remote_permissions.sh user@host:/tmp/setup_remote_permissions.sh
 
-ssh user@host 'bash /tmp/setup_remote_permissions.sh --dry-run --group shared public /remote/storage/staging'
-ssh user@host 'bash /tmp/setup_remote_permissions.sh --group shared public /remote/storage/staging'
+ssh user@host 'bash /tmp/setup_remote_permissions.sh --dry-run --group shared pub /remote/storage/staging'
+ssh user@host 'bash /tmp/setup_remote_permissions.sh --group shared pub /remote/storage/staging'
 ```
 
 常用模式：
 
 ```bash
 # 远程端：发布后的数据集只允许浏览和下载
-bash /tmp/setup_remote_permissions.sh readonly /remote/storage/datasets/v1.0
+bash /tmp/setup_remote_permissions.sh rdo /remote/storage/datasets/v1.0
 
 # 远程端：开放 staging 目录，允许团队上传
-bash /tmp/setup_remote_permissions.sh public /remote/storage/datasets/staging
+bash /tmp/setup_remote_permissions.sh pub /remote/storage/datasets/staging
 
 # 远程端：隐藏工作中目录
-bash /tmp/setup_remote_permissions.sh private /remote/storage/wip_secret
+bash /tmp/setup_remote_permissions.sh pvt /remote/storage/wip_secret
 ```
 
 脚本默认 group 是运行用户的 primary group，也可以通过环境变量或 `--group` 指定。需要持久化站点默认值时，直接编辑脚本开头的 `GROUP="${GROUP:-$(id -gn)}"`。
 
-`private` 会让目标目录在父目录中仍可被看到，并显示为 `[pvt]`；目标目录和所有子项会移除 group/others 权限，因此其他人看不到内部文件。
+`pvt` 会让目标目录在父目录中仍可被看到，并显示为 `[pvt]`；目标目录和所有子项会移除 group/others 权限，因此其他人看不到内部文件。
 
 ## 快速上手
 
@@ -149,8 +158,9 @@ Right / Enter      展开目录 / 进入第一个子节点
 Space              切换选择
 d                  下载选中项
 u                  上传选中项
-p                  内置弹窗预览当前文件 diff
-P                  外部工具预览当前文件 diff
+f                  内置弹窗预览当前文件 diff
+F                  外部工具预览当前文件 diff（默认 vim -d）
+p                  对选中远端项递归变更权限
 c                  递归检查选中项
 x                  清空选择
 r                  刷新 manifest
@@ -165,7 +175,7 @@ q / Esc            退出
 单击行             移动光标到该行
 单击复选框列       切换该行选择
 双击目录           展开或折叠目录
-双击底部快捷键     触发 Space/d/u/p/c/x/r/? 对应功能
+双击底部快捷键     触发 Space/d/u/f/p/c/x/r/? 对应功能
 ```
 
 ## 版本
@@ -175,6 +185,7 @@ q / Esc            退出
 当前发布 tag：
 
 ```text
+v0.2.0
 v0.1.10
 v0.1.9
 v0.1.8
