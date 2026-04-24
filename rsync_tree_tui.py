@@ -26,7 +26,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
@@ -370,6 +370,17 @@ class ListLayout:
 
     def is_selection_column(self, x: int) -> bool:
         return 0 <= x < self.selection_width
+
+
+@dataclass(slots=True)
+class FooterShortcutHit:
+    y: int
+    start_x: int
+    end_x: int
+    key: int
+
+    def contains(self, x: int, y: int) -> bool:
+        return self.y == y and self.start_x <= x < self.end_x
 
 
 # ------------------------------------------------------------------------ #
@@ -857,6 +868,7 @@ def deselect_all_nodes(node: TreeNode) -> int:
     if node.is_selected:
         node.is_selected = False
         cleared += 1
+    clear_node_caches(node)
     for child in node.children.values():
         cleared += deselect_all_nodes(child)
     return cleared
@@ -1183,6 +1195,7 @@ class SyncApp:
         self.last_cursor_rel_path = ""
         self.initial_connection_ok = False
         self.list_layout: ListLayout | None = None
+        self.footer_shortcut_hits: list[FooterShortcutHit] = []
         self.pagination_size = config.pagination_size
         self._interrupt_requested: bool = False
 
@@ -1616,10 +1629,6 @@ class SyncApp:
         stdscr.addnstr(0, 0, header_left, width - 1, curses.A_BOLD)
         stdscr.addnstr(1, 0, header_right, width - 1, curses.A_BOLD)
 
-        nav_help = (
-            "Up/Down Move  Left/Right Fold  Space Toggle  "
-            "d Download  u Upload  p Diff  c Check  x Clear  r Refresh  ? Help  q Quit"
-        )
         if height >= 5 and width > 1:
             stdscr.addnstr(
                 height - 4,
@@ -1628,7 +1637,7 @@ class SyncApp:
                 width - 1,
                 curses.color_pair(2),
             )
-        stdscr.addnstr(height - 3, 0, nav_help, width - 1, curses.color_pair(3))
+        self._render_footer_shortcuts(height - 3, width)
 
         # Color legend — each segment rendered in its actual color
         _legend = [
@@ -1766,6 +1775,55 @@ class SyncApp:
 
         stdscr.refresh()
 
+    def _render_footer_shortcuts(self, y: int, width: int) -> None:
+        shortcuts = [
+            ("Up/Down", "Move", None),
+            ("Left/Right", "Fold", None),
+            ("Space", "Toggle", ord(" ")),
+            ("d", "Download", ord("d")),
+            ("u", "Upload", ord("u")),
+            ("p", "Diff", ord("p")),
+            ("c", "Check", ord("c")),
+            ("x", "Clear", ord("x")),
+            ("r", "Refresh", ord("r")),
+            ("?", "Help", ord("?")),
+            ("q", "Quit", None),
+        ]
+        self.footer_shortcut_hits = []
+        if y < 0 or width <= 1:
+            return
+
+        x = 0
+        max_x = width - 1
+        for key_text, label, trigger_key in shortcuts:
+            if x >= max_x:
+                break
+            key_start = x
+            x = self._add_footer_text(y, x, key_text, max_x, curses.color_pair(3))
+            if x >= max_x:
+                break
+            x = self._add_footer_text(y, x, f" {label}", max_x, curses.A_NORMAL)
+            key_end = x
+            if trigger_key is not None and key_end > key_start:
+                self.footer_shortcut_hits.append(
+                    FooterShortcutHit(
+                        y=y,
+                        start_x=key_start,
+                        end_x=key_end,
+                        key=trigger_key,
+                    )
+                )
+            if x >= max_x:
+                break
+            x = self._add_footer_text(y, x, "  ", max_x, curses.A_NORMAL)
+
+    def _add_footer_text(self, y: int, x: int, text: str, max_x: int, attr: int) -> int:
+        remaining = max_x - x
+        if remaining <= 0:
+            return x
+        self.stdscr.addnstr(y, x, text, remaining, attr)
+        return x + min(len(text), remaining)
+
     # ------------------------------- navigation ----------------------------- #
 
     def ensure_cursor_visible(
@@ -1875,11 +1933,19 @@ class SyncApp:
         node.is_expanded = True
         self.message = f"Expanded {node.rel_path or '/'}."
 
+    def footer_shortcut_key_at(self, x: int, y: int) -> int | None:
+        for hit in getattr(self, "footer_shortcut_hits", []):
+            if hit.contains(x, y):
+                return hit.key
+        return None
+
     def handle_mouse_event(self) -> None:
         _mouse_id, x, y, _z, bstate = curses.getmouse()
-        visible = self._visible_nodes()
-        if not visible:
-            return
+        if mouse_has_button(bstate, "BUTTON1_DOUBLE_CLICKED"):
+            shortcut_key = self.footer_shortcut_key_at(x, y)
+            if shortcut_key is not None:
+                self.handle_key(shortcut_key)
+                return
 
         if mouse_has_button(bstate, "BUTTON4_PRESSED"):
             self.move_cursor_by(-3)
@@ -1889,6 +1955,9 @@ class SyncApp:
             return
 
         if not mouse_is_primary_click(bstate):
+            return
+        visible = self._visible_nodes()
+        if not visible:
             return
         if self.list_layout is None:
             return

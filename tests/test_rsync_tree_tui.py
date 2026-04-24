@@ -228,7 +228,9 @@ class MouseTests(unittest.TestCase):
             panel_width=40,
             divider_width=3,
         )
+        app.footer_shortcut_hits = []
         app.message = ""
+        app.pending_action = None
         return app
 
     def test_list_layout_hit_test(self) -> None:
@@ -323,6 +325,123 @@ class MouseTests(unittest.TestCase):
             app.handle_mouse_event()
 
         self.assertTrue(tui.visible_nodes(app.root_node)[0].is_expanded)
+
+    def test_deselect_all_nodes_clears_selection_cache(self) -> None:
+        app = self.make_app_with_nodes()
+        node = tui.visible_nodes(app.root_node)[0]
+        node.is_selected = True
+        self.assertEqual(tui.selection_state(node), tui.SelectionState.SELECTED)
+
+        cleared = tui.deselect_all_nodes(app.root_node)
+
+        self.assertEqual(cleared, 1)
+        self.assertEqual(tui.selection_state(node), tui.SelectionState.UNSELECTED)
+
+    def test_mouse_double_click_footer_shortcut_triggers_key(self) -> None:
+        app = self.make_app_with_nodes()
+        app.footer_shortcut_hits = [
+            tui.FooterShortcutHit(y=20, start_x=5, end_x=12, key=ord(" "))
+        ]
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 6, 20, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_DOUBLE_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertTrue(tui.visible_nodes(app.root_node)[0].is_selected)
+
+    def test_mouse_double_click_footer_clear_uses_confirmation_flow(self) -> None:
+        app = self.make_app_with_nodes()
+        node = tui.visible_nodes(app.root_node)[0]
+        node.is_selected = True
+        app.footer_shortcut_hits = [
+            tui.FooterShortcutHit(y=20, start_x=5, end_x=12, key=ord("x"))
+        ]
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 6, 20, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_DOUBLE_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertEqual(app.pending_action, "clear")
+        app.handle_key(ord("y"))
+        self.assertFalse(node.is_selected)
+        self.assertEqual(tui.selection_state(node), tui.SelectionState.UNSELECTED)
+
+    def test_mouse_single_click_footer_shortcut_does_not_trigger_key(self) -> None:
+        app = self.make_app_with_nodes()
+        app.footer_shortcut_hits = [
+            tui.FooterShortcutHit(y=20, start_x=5, end_x=12, key=ord(" "))
+        ]
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 6, 20, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertFalse(tui.visible_nodes(app.root_node)[0].is_selected)
+
+    def test_footer_unregistered_position_does_not_trigger_key(self) -> None:
+        app = self.make_app_with_nodes()
+        app.footer_shortcut_hits = [
+            tui.FooterShortcutHit(y=20, start_x=5, end_x=12, key=ord(" "))
+        ]
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 30, 20, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_DOUBLE_CLICKED" in names,
+            ),
+        ):
+            app.handle_mouse_event()
+
+        self.assertFalse(tui.visible_nodes(app.root_node)[0].is_selected)
+
+    def test_footer_shortcuts_render_key_and_label_with_separate_attrs(self) -> None:
+        app = self.make_app_with_nodes()
+        app.stdscr = mock.Mock()
+
+        with mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100):
+            app._render_footer_shortcuts(y=20, width=120)
+
+        calls = app.stdscr.addnstr.call_args_list
+        self.assertEqual(calls[0].args, (20, 0, "Up/Down", 119, 300))
+        self.assertEqual(calls[1].args, (20, 7, " Move", 112, tui.curses.A_NORMAL))
+        hit_keys = {hit.key for hit in app.footer_shortcut_hits}
+        self.assertIn(ord(" "), hit_keys)
+        self.assertIn(ord("?"), hit_keys)
+        self.assertNotIn(ord("q"), hit_keys)
+
+    def test_mouse_double_click_footer_refresh_triggers_refresh(self) -> None:
+        app = self.make_app_with_nodes()
+        app.footer_shortcut_hits = [
+            tui.FooterShortcutHit(y=20, start_x=5, end_x=12, key=ord("r"))
+        ]
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 6, 20, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON1_DOUBLE_CLICKED" in names,
+            ),
+            mock.patch.object(app, "refresh_manifests") as refresh,
+        ):
+            app.handle_mouse_event()
+
+        refresh.assert_called_once_with(initial_load=False)
 
 
 class RemotePermissionsScriptTests(unittest.TestCase):
