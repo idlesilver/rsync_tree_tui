@@ -12,6 +12,11 @@
     "mode": "balanced",
     "size_threshold_mb": 512
   },
+  "diff_viewers": [
+    "vim -d {local} {remote}",
+    "vimdiff {local} {remote}",
+    "nvim -d {local} {remote}"
+  ],
   "known_connections": [
     {
       "id": "example1",

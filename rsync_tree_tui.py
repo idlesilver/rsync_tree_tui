@@ -9,11 +9,13 @@ import curses
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +28,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
@@ -42,6 +44,7 @@ DEFAULT_CHECKSUM_SUFFIXES = [
     ".md",
 ]
 DEFAULT_PAGINATION_SIZE = 20
+DEFAULT_DIFF_VIEWERS = ["vim -d {local} {remote}"]
 ANSI_GREEN = "\033[32m"
 ANSI_CYAN = "\033[36m"
 ANSI_YELLOW = "\033[33m"
@@ -63,6 +66,7 @@ def default_config_data() -> dict[str, object]:
             "size_threshold_mb": DEFAULT_CHECKSUM_THRESHOLD_MB,
             "checksum_suffixes": DEFAULT_CHECKSUM_SUFFIXES,
         },
+        "diff_viewers": DEFAULT_DIFF_VIEWERS,
         "known_connections": [],
     }
 
@@ -279,6 +283,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         config_path=config_path,
         config_data=config_data,
         checksum_policy=ChecksumPolicy.from_config(config_data),
+        diff_viewers=parse_diff_viewers(config_data),
         pagination_size=int(config_data.get("pagination_size", DEFAULT_PAGINATION_SIZE)),
     )
 
@@ -342,6 +347,35 @@ class ChecksumPolicy:
         return size <= self.size_threshold_bytes
 
 
+def parse_diff_viewers(config_data: dict[str, object]) -> list[str]:
+    value = config_data.get("diff_viewers", DEFAULT_DIFF_VIEWERS)
+    if isinstance(value, str):
+        viewers = [value]
+    elif isinstance(value, list):
+        viewers = [str(item) for item in value if str(item).strip()]
+    else:
+        viewers = DEFAULT_DIFF_VIEWERS
+    return viewers or DEFAULT_DIFF_VIEWERS
+
+
+def is_supported_external_diff_viewer(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    executable = Path(argv[0]).name
+    if executable == "delta":
+        return True
+    if executable == "vimdiff":
+        return True
+    if executable in {"vim", "nvim"} and "-d" in argv[1:]:
+        return True
+    return False
+
+
 @dataclass(slots=True)
 class AppConfig:
     local_root: Path
@@ -349,6 +383,7 @@ class AppConfig:
     config_path: Path
     config_data: dict[str, object]
     checksum_policy: ChecksumPolicy
+    diff_viewers: list[str]
     pagination_size: int = DEFAULT_PAGINATION_SIZE
 
 
@@ -1070,6 +1105,7 @@ def build_rsync_command(
     dest_root: str,
     ssh_cmd: str,
     use_checksum: bool,
+    backup: bool = False,
 ) -> list[str]:
     command = [
         "rsync",
@@ -1091,6 +1127,8 @@ def build_rsync_command(
     ]
     if use_checksum:
         command.insert(2, "--checksum")
+    if backup:
+        command.insert(2, "--backup")
     return command
 
 
@@ -1197,6 +1235,7 @@ class SyncApp:
         self.list_layout: ListLayout | None = None
         self.footer_shortcut_hits: list[FooterShortcutHit] = []
         self.pagination_size = config.pagination_size
+        self.diff_viewers = config.diff_viewers
         self._interrupt_requested: bool = False
 
         self.refresh_manifests(initial_load=True)
@@ -1783,6 +1822,7 @@ class SyncApp:
             ("d", "Download", ord("d")),
             ("u", "Upload", ord("u")),
             ("p", "Diff", ord("p")),
+            ("P", "External", None),
             ("c", "Check", ord("c")),
             ("x", "Clear", ord("x")),
             ("r", "Refresh", ord("r")),
@@ -2192,6 +2232,7 @@ class SyncApp:
                         dest_root,
                         ssh_cmd,
                         use_checksum,
+                        backup=action == "download",
                     ),
                 )
             )
@@ -2237,40 +2278,104 @@ class SyncApp:
 
     # ------------------------------- popup overlay -------------------------- #
 
+    def _text_cell_width(self, text: str) -> int:
+        width = 0
+        for char in text:
+            if unicodedata.combining(char):
+                continue
+            width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        return width
+
+    def _sanitize_popup_text(self, text: str) -> str:
+        expanded = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text.expandtabs(4))
+        return "".join(
+            " " if unicodedata.category(char)[0] == "C" else char
+            for char in expanded
+        )
+
+    def _slice_popup_cells(self, text: str, start: int, width: int) -> str:
+        if width <= 0:
+            return ""
+        sanitized = self._sanitize_popup_text(text)
+        cells = 0
+        used = 0
+        result: list[str] = []
+        for char in sanitized:
+            char_width = 0 if unicodedata.combining(char) else (
+                2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+            )
+            next_cells = cells + char_width
+            if next_cells <= start:
+                cells = next_cells
+                continue
+            if cells < start:
+                char = " "
+                char_width = 1
+            if used + char_width > width:
+                break
+            result.append(char)
+            used += char_width
+            cells = next_cells
+        if used < width:
+            result.append(" " * (width - used))
+        return "".join(result)
+
+    def _popup_add_cells(
+        self,
+        win: curses.window,
+        y: int,
+        x: int,
+        text: str,
+        width: int,
+        attr: int = 0,
+    ) -> None:
+        if width <= 0:
+            return
+        safe_text = self._slice_popup_cells(text, 0, width)
+        try:
+            win.addnstr(y, x, safe_text, len(safe_text), attr)
+        except curses.error:
+            pass
+
     def _show_popup(self, title: str, lines: list[str]) -> None:
-        """Scrollable centered overlay. ↑↓/PgUp/PgDn to scroll, q/Esc/Enter to close.
+        """Scrollable centered overlay. Arrows scroll/pan, q/Esc/Enter closes.
 
         Lines starting with +/-/@ are colored as unified-diff output.
         """
         scroll = 0
+        hscroll = 0
         while True:
             self.render()
             height, width = self.stdscr.getmaxyx()
 
-            max_line_len = max((len(l) for l in lines), default=0)
-            inner_w = min(max(max_line_len, len(title) + 4, 24), width - 6)
-            box_w = inner_w + 2
-            inner_h = min(max(len(lines), 1), height - 8)
-            # rows: top-border(1) + separator(1) + content(inner_h) + bottom-border(1)
-            box_h = inner_h + 3
+            max_line_len = max((self._text_cell_width(self._sanitize_popup_text(l)) for l in lines), default=0)
+            title_width = self._text_cell_width(self._sanitize_popup_text(title))
+            content_w = min(max(max_line_len, title_width + 4, 24), max(width - 8, 10))
+            box_w = content_w + 4
+            inner_h = min(max(len(lines), 1), max(height - 8, 1))
+            # rows: top-border + separator + content + footer + bottom-border
+            box_h = inner_h + 4
 
             start_y = max((height - box_h) // 2, 0)
             start_x = max((width - box_w) // 2, 0)
             box_h = min(box_h, height - start_y)
             box_w = min(box_w, width - start_x)
-            inner_h = box_h - 3
-            inner_w = box_w - 2
+            inner_h = max(box_h - 4, 1)
+            content_w = max(box_w - 4, 1)
+            hscroll = max(0, min(hscroll, max(max_line_len - content_w, 0)))
 
             win = curses.newwin(box_h, box_w, start_y, start_x)
+            win.scrollok(False)
             win.erase()
             win.box()
 
             # Title in top border
             title_str = f" {title} "
-            win.addnstr(0, max((box_w - len(title_str)) // 2, 1), title_str, box_w - 2, curses.A_BOLD)
+            title_x = max((box_w - self._text_cell_width(title_str)) // 2, 1)
+            self._popup_add_cells(win, 0, title_x, title_str, box_w - title_x - 1, curses.A_BOLD)
 
             # Separator under title
-            win.addnstr(1, 1, "─" * inner_w, inner_w)
+            self._popup_add_cells(win, 1, 1, "-" * (box_w - 2), box_w - 2)
 
             # Content lines with diff coloring
             for row, line in enumerate(lines[scroll : scroll + inner_h]):
@@ -2282,16 +2387,29 @@ class SyncApp:
                     attr = curses.color_pair(2)  # cyan
                 else:
                     attr = 0
-                win.addnstr(2 + row, 1, line[:inner_w].ljust(inner_w), inner_w, attr)
+                visible_line = self._slice_popup_cells(line, hscroll, content_w)
+                self._popup_add_cells(win, 2 + row, 1, " " * (box_w - 2), box_w - 2)
+                self._popup_add_cells(win, 2 + row, 2, visible_line, content_w, attr)
 
-            # Footer in bottom border: hint left, scroll position right
-            hint = " q/Esc:close  ↑↓:scroll "
-            win.addnstr(box_h - 1, 1, hint, min(len(hint), box_w - 2), curses.color_pair(3))
+            # Footer is inside the border, not on top of it.
+            footer_y = box_h - 2
+            hint = " q/Esc:close  Up/Down:scroll  Left/Right:pan "
+            self._popup_add_cells(win, footer_y, 1, " " * (box_w - 2), box_w - 2)
+            self._popup_add_cells(win, footer_y, 1, hint, min(self._text_cell_width(hint), box_w - 2), curses.color_pair(3))
+            status_parts = []
             if len(lines) > inner_h:
-                pos = f" {scroll + 1}-{min(scroll + inner_h, len(lines))}/{len(lines)} "
-                pos_x = max(box_w - len(pos) - 1, 1)
-                if pos_x > len(hint) + 1:
-                    win.addnstr(box_h - 1, pos_x, pos, box_w - pos_x - 1, curses.color_pair(2))
+                status_parts.append(f"{scroll + 1}-{min(scroll + inner_h, len(lines))}/{len(lines)}")
+            if max_line_len > content_w:
+                status_parts.append(f"col {hscroll + 1}-{min(hscroll + content_w, max_line_len)}/{max_line_len}")
+            if status_parts:
+                pos = f" {'  '.join(status_parts)} "
+                pos_width = self._text_cell_width(pos)
+                pos_x = max(box_w - pos_width - 1, 1)
+                if pos_x > min(self._text_cell_width(hint), box_w - 2) + 1:
+                    self._popup_add_cells(win, footer_y, pos_x, pos, box_w - pos_x - 1, curses.color_pair(2))
+
+            win.box()
+            self._popup_add_cells(win, 0, title_x, title_str, box_w - title_x - 1, curses.A_BOLD)
 
             win.refresh()
 
@@ -2302,10 +2420,18 @@ class SyncApp:
                 scroll = max(0, scroll - 1)
             elif key == curses.KEY_DOWN:
                 scroll = min(max(0, len(lines) - inner_h), scroll + 1)
+            elif key == curses.KEY_LEFT:
+                hscroll = max(0, hscroll - 8)
+            elif key == curses.KEY_RIGHT:
+                hscroll = min(max(0, max_line_len - content_w), hscroll + 8)
             elif key == curses.KEY_PPAGE:
                 scroll = max(0, scroll - inner_h)
             elif key == curses.KEY_NPAGE:
                 scroll = min(max(0, len(lines) - inner_h), scroll + inner_h)
+            elif key == getattr(curses, "KEY_HOME", -1):
+                hscroll = 0
+            elif key == getattr(curses, "KEY_END", -1):
+                hscroll = max(0, max_line_len - content_w)
 
     def _show_help_popup(self) -> None:
         lines = [
@@ -2320,7 +2446,8 @@ class SyncApp:
             "Double click       Expand/collapse directory",
             "d                  Download selected  (remote → local)",
             "u                  Upload selected    (local → remote)",
-            "p                  Preview diff for current file (red entries only)",
+            "p                  Preview diff in built-in popup (red entries only)",
+            "P                  Preview diff with external viewer",
             "c                  Recursively check selected entries",
             "x                  Clear all selections (with confirmation)",
             "r                  Refresh manifests",
@@ -2342,10 +2469,14 @@ class SyncApp:
             "  [pub]            Group read + write",
             "  [ro]             Group read only",
             "  [pvt]            No group access",
+            "",
+            "Diff preview",
+            "  p uses built-in popup with Left/Right horizontal pan",
+            "  P uses vim -d by default, or configured diff viewer",
         ]
         self._show_popup("Help", lines)
 
-    def _try_preview_diff(self) -> None:
+    def _try_preview_diff(self, *, external: bool = False) -> None:
         """Gate-check then launch diff preview for the node under the cursor."""
         node = self.current_node()
         if node is None:
@@ -2359,9 +2490,86 @@ class SyncApp:
         if not node_has_self_difference(node):
             self.message = "File appears identical on both sides (same size and mtime)."
             return
-        self._preview_diff(node)
+        self._preview_diff(node, external=external)
 
-    def _preview_diff(self, node: TreeNode) -> None:
+    def _available_diff_viewer(self) -> str | None:
+        for command in self.diff_viewers:
+            try:
+                argv = shlex.split(command)
+            except ValueError:
+                continue
+            if (
+                argv
+                and is_supported_external_diff_viewer(command)
+                and shutil.which(argv[0]) is not None
+            ):
+                return command
+        return None
+
+    def _run_external_diff_viewer(
+        self,
+        viewer_command: str,
+        local_path: Path,
+        remote_copy_path: Path,
+        diff_text: str,
+    ) -> bool:
+        try:
+            argv = shlex.split(viewer_command)
+        except ValueError as exc:
+            self.message = f"Invalid diff viewer command: {exc}"
+            return False
+        if not argv:
+            return False
+        if not is_supported_external_diff_viewer(viewer_command):
+            self.message = "Unsupported diff viewer. Use vim -d, vimdiff, nvim -d, or delta."
+            return False
+
+        uses_local = any("{local}" in part for part in argv)
+        uses_remote = any("{remote}" in part for part in argv)
+        uses_diff = any("{diff}" in part for part in argv)
+        diff_file_path: Path | None = None
+        try:
+            if uses_diff:
+                with tempfile.NamedTemporaryFile(
+                    "w", delete=False, suffix=".diff", encoding="utf-8"
+                ) as diff_file:
+                    diff_file.write(diff_text)
+                    diff_file_path = Path(diff_file.name)
+            format_values = {
+                "local": str(local_path),
+                "remote": str(remote_copy_path),
+                "diff": str(diff_file_path) if diff_file_path is not None else "",
+            }
+            try:
+                command = [part.format(**format_values) for part in argv]
+            except (KeyError, ValueError) as exc:
+                self.message = f"Invalid diff viewer placeholder: {exc}"
+                return False
+            stdin_text = None if uses_local or uses_remote or uses_diff else diff_text
+
+            self.suspend_tui()
+            try:
+                subprocess.run(command, input=stdin_text, text=stdin_text is not None)
+            finally:
+                self.resume_tui()
+            return True
+        finally:
+            if diff_file_path is not None:
+                diff_file_path.unlink(missing_ok=True)
+
+    def _show_external_diff(self, local_path: Path, remote_copy_path: Path, diff_text: str) -> bool:
+        viewer_command = self._available_diff_viewer()
+        if viewer_command is None:
+            self.message = "No supported external diff viewer found; use p for built-in popup."
+            return False
+        return self._run_external_diff_viewer(
+            viewer_command,
+            local_path,
+            remote_copy_path,
+            diff_text,
+        )
+
+    def _preview_diff(self, node: TreeNode, *, external: bool = False) -> None:
         """Fetch the remote copy to a temp file and show unified diff in a popup."""
         local_path = self.local_root / node.rel_path
         remote_path = f"{self.remote_root.rstrip('/')}/{node.rel_path}"
@@ -2401,7 +2609,11 @@ class SyncApp:
                 node.content_verified_same = True
                 clear_ancestor_caches(node)
                 lines = ["(files are byte-identical; only metadata differs)"]
-            self._show_popup(f"diff  {node.rel_path}", lines)
+                self._show_popup(f"diff  {node.rel_path}", lines)
+            elif external:
+                self._show_external_diff(local_path, tmp_path, diff_result.stdout)
+            else:
+                self._show_popup(f"diff  {node.rel_path}", lines)
             self.message = f"Diff preview closed for {node.rel_path}."
         except subprocess.CalledProcessError as exc:
             err = exc.stderr.decode(errors="replace").strip() if exc.stderr else str(exc)
@@ -2459,6 +2671,9 @@ class SyncApp:
             return
         if key == ord("p"):
             self._try_preview_diff()
+            return
+        if key == ord("P"):
+            self._try_preview_diff(external=True)
             return
         if key == ord("x"):
             self.start_action("clear")

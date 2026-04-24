@@ -4,6 +4,14 @@
 
 格式遵循 Keep a Changelog，版本号遵循 Semantic Versioning。
 
+## [0.1.10] - 2026-04-24
+
+### Changed
+
+- download 同步命令增加 rsync `--backup`，覆盖本地文件时保留 rsync 备份文件。
+- `p` 固定使用内置 diff 弹窗，新增 `P` 使用外部 diff 工具；外部工具默认使用 `vim -d`，配置支持 `vimdiff`、`vim -d`、`nvim -d`，并兼容 `delta`。
+- 内置 diff 弹窗支持左右横向移动长行，并避免长行或 ANSI 控制序列残片覆盖弹窗边框。
+
 ## [0.1.9] - 2026-04-24
 
 ### Changed

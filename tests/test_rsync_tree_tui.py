@@ -39,6 +39,7 @@ class ConfigTests(unittest.TestCase):
         config_path = Path(self.tmp.name) / "config.json"
         data = tui.load_json_config(config_path)
         self.assertEqual(data["version"], tui.CONFIG_VERSION)
+        self.assertEqual(data["diff_viewers"], tui.DEFAULT_DIFF_VIEWERS)
         self.assertTrue(config_path.exists())
 
     def test_connection_trigger_count_updates(self) -> None:
@@ -73,6 +74,17 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.local_root, (Path(self.tmp.name) / "cli_local").resolve())
         self.assertEqual(config.remote_spec, "cli@example:/data")
+        self.assertEqual(config.diff_viewers, tui.DEFAULT_DIFF_VIEWERS)
+
+    def test_parse_diff_viewers_accepts_string_or_list(self) -> None:
+        self.assertEqual(
+            tui.parse_diff_viewers({"diff_viewers": "nvim -d {local} {remote}"}),
+            ["nvim -d {local} {remote}"],
+        )
+        self.assertEqual(
+            tui.parse_diff_viewers({"diff_viewers": ["delta", "vimdiff {local} {remote}"]}),
+            ["delta", "vimdiff {local} {remote}"],
+        )
 
 
 class KnownConnectionDisplayTests(unittest.TestCase):
@@ -166,6 +178,26 @@ class ChecksumPolicyTests(unittest.TestCase):
         self.assertIn("--checksum", checksum_cmd)
         self.assertNotIn("--checksum", quick_cmd)
 
+    def test_build_rsync_command_adds_backup_only_when_requested(self) -> None:
+        backup_cmd = tui.build_rsync_command(
+            Path("/tmp/list"),
+            "/src/",
+            "/dst/",
+            "ssh",
+            False,
+            backup=True,
+        )
+        default_cmd = tui.build_rsync_command(
+            Path("/tmp/list"),
+            "/src/",
+            "/dst/",
+            "ssh",
+            False,
+        )
+
+        self.assertIn("--backup", backup_cmd)
+        self.assertNotIn("--backup", default_cmd)
+
 
 class RenderTests(unittest.TestCase):
     def test_missing_side_renders_without_placeholder_text(self) -> None:
@@ -185,6 +217,106 @@ class RenderTests(unittest.TestCase):
         cell = tui.render_side_cell(node, "left", 40)
 
         self.assertIn("<error>", cell)
+
+
+class PopupTextTests(unittest.TestCase):
+    def make_app(self) -> tui.SyncApp:
+        return tui.SyncApp.__new__(tui.SyncApp)
+
+    def test_slice_popup_cells_replaces_control_chars_and_pads(self) -> None:
+        app = self.make_app()
+
+        self.assertEqual(app._slice_popup_cells("\x1b[0mabc", 0, 6), "abc   ")
+
+    def test_slice_popup_cells_respects_horizontal_cell_offset(self) -> None:
+        app = self.make_app()
+
+        self.assertEqual(app._slice_popup_cells("abcdef", 2, 3), "cde")
+
+    def test_slice_popup_cells_does_not_exceed_wide_char_width(self) -> None:
+        app = self.make_app()
+
+        self.assertEqual(app._text_cell_width(app._slice_popup_cells("中abc", 0, 3)), 3)
+
+
+class DiffViewerTests(unittest.TestCase):
+    def make_app(self) -> tui.SyncApp:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        app.diff_viewers = ["missing-viewer", "vim -d {local} {remote}"]
+        app.message = ""
+        return app
+
+    def test_available_diff_viewer_uses_first_installed_command(self) -> None:
+        app = self.make_app()
+
+        with mock.patch(
+            "rsync_tree_tui.shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}" if name == "vim" else None,
+        ):
+            viewer = app._available_diff_viewer()
+
+        self.assertEqual(viewer, "vim -d {local} {remote}")
+
+    def test_available_diff_viewer_skips_unsupported_configured_commands(self) -> None:
+        app = self.make_app()
+        app.diff_viewers = ["less -S", "nvim -d {local} {remote}"]
+
+        with mock.patch(
+            "rsync_tree_tui.shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}" if name == "nvim" else None,
+        ):
+            viewer = app._available_diff_viewer()
+
+        self.assertEqual(viewer, "nvim -d {local} {remote}")
+
+    def test_supported_external_diff_viewer_allowlist(self) -> None:
+        self.assertTrue(tui.is_supported_external_diff_viewer("delta"))
+        self.assertTrue(tui.is_supported_external_diff_viewer("vimdiff {local} {remote}"))
+        self.assertTrue(tui.is_supported_external_diff_viewer("vim -d {local} {remote}"))
+        self.assertTrue(tui.is_supported_external_diff_viewer("nvim -d {local} {remote}"))
+        self.assertFalse(tui.is_supported_external_diff_viewer("less -S"))
+
+    def test_external_diff_viewer_receives_diff_on_stdin_without_placeholders(self) -> None:
+        app = self.make_app()
+        app.suspend_tui = mock.Mock()
+        app.resume_tui = mock.Mock()
+
+        with mock.patch("rsync_tree_tui.subprocess.run") as run:
+            handled = app._run_external_diff_viewer(
+                "delta --wrap-max-lines=unlimited",
+                Path("/tmp/local"),
+                Path("/tmp/remote"),
+                "diff text",
+            )
+
+        self.assertTrue(handled)
+        run.assert_called_once_with(
+            ["delta", "--wrap-max-lines=unlimited"],
+            input="diff text",
+            text=True,
+        )
+        app.suspend_tui.assert_called_once()
+        app.resume_tui.assert_called_once()
+
+    def test_external_diff_viewer_expands_local_remote_placeholders(self) -> None:
+        app = self.make_app()
+        app.suspend_tui = mock.Mock()
+        app.resume_tui = mock.Mock()
+
+        with mock.patch("rsync_tree_tui.subprocess.run") as run:
+            handled = app._run_external_diff_viewer(
+                "nvim -d {local} {remote}",
+                Path("/tmp/local"),
+                Path("/tmp/remote"),
+                "diff text",
+            )
+
+        self.assertTrue(handled)
+        run.assert_called_once_with(
+            ["nvim", "-d", "/tmp/local", "/tmp/remote"],
+            input=None,
+            text=False,
+        )
 
 
 class MouseTests(unittest.TestCase):
@@ -231,6 +363,7 @@ class MouseTests(unittest.TestCase):
         app.footer_shortcut_hits = []
         app.message = ""
         app.pending_action = None
+        app.diff_viewers = tui.DEFAULT_DIFF_VIEWERS
         return app
 
     def test_list_layout_hit_test(self) -> None:

@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.1.9`
+当前版本：`v0.1.10`
 
 ## 运行
 
@@ -56,6 +56,22 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 该文件维护 checksum 策略和成功连接过的 local/remote。没有传入 remote 时，工具会按访问次数列出历史连接，让用户输入 index 选择。TTY 环境中，remote 的 user、host、path 会用不同颜色提示；非 TTY 或设置 `NO_COLOR` 时输出纯文本。
 
 配置样例见 `config.example.json`。
+
+### Diff Viewer
+
+`p` 使用内置弹窗预览 diff；内置弹窗支持左右方向键横向移动长行。`P` 使用外部工具预览 diff，默认使用 `vim -d {local} {remote}`。
+
+`diff_viewers` 允许配置 `vim -d`、`vimdiff`、`nvim -d`，也兼容 `delta`。vim/nvim 命令使用 `{local}`、`{remote}` 接收本地文件和临时远端副本路径；`delta` 从 stdin 读取 unified diff。
+
+```json
+{
+  "diff_viewers": [
+    "vim -d {local} {remote}",
+    "vimdiff {local} {remote}",
+    "nvim -d {local} {remote}"
+  ]
+}
+```
 
 ## 远程权限辅助脚本
 
@@ -133,7 +149,8 @@ Right / Enter      展开目录 / 进入第一个子节点
 Space              切换选择
 d                  下载选中项
 u                  上传选中项
-p                  预览当前文件 diff
+p                  内置弹窗预览当前文件 diff
+P                  外部工具预览当前文件 diff
 c                  递归检查选中项
 x                  清空选择
 r                  刷新 manifest
@@ -158,6 +175,7 @@ q / Esc            退出
 当前发布 tag：
 
 ```text
+v0.1.10
 v0.1.9
 v0.1.8
 v0.1.7
