@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.2.0`
+当前版本：`v0.2.1`
 
 ## 运行
 
@@ -11,6 +11,7 @@ python rsync_tree_tui.py --local-root /path/to/local --remote user@host:/path/to
 python rsync_tree_tui.py --remote user@host:/path/to/remote
 python rsync_tree_tui.py
 python rsync_tree_tui.py --version
+python rsync_tree_tui.py --update
 ```
 
 依赖命令：
@@ -50,7 +51,7 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 RSYNC_TREE_TUI_PERMISSION_GROUP=shared
 ```
 
-`.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。
+`.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。`.env` 中的 `RSYNC_TREE_TUI_LOCAL_ROOT=./storage` 这类相对路径会相对 `.env` 所在目录解析；CLI 参数和 shell 环境变量中的相对路径仍相对启动目录解析。
 
 ## 全局配置
 
@@ -63,6 +64,25 @@ RSYNC_TREE_TUI_PERMISSION_GROUP=shared
 该文件维护 checksum 策略和成功连接过的 local/remote。没有传入 remote 时，工具会按访问次数列出历史连接，让用户输入 index 选择。TTY 环境中，remote 的 user、host、path 会用不同颜色提示；非 TTY 或设置 `NO_COLOR` 时输出纯文本。
 
 配置样例见 `config.example.json`。
+
+### 自动更新检查
+
+常规启动默认会在后台用短超时读取 GitHub 上的 `VERSION` 文件。发现新版本后先记录到配置中；下次启动时如果记录的远端版本仍高于本地版本，会提示选择立即更新、稍后提醒、跳过当前版本或关闭自动检查。网络失败、非交互式输入或版本无法解析时会静默继续启动。
+
+可在全局配置中关闭或管理跳过版本：
+
+```json
+{
+  "auto_update": {
+    "enabled": true,
+    "latest_version": "",
+    "latest_checked_at": "",
+    "skipped_version": "",
+    "last_prompted_version": "",
+    "last_prompted_at": ""
+  }
+}
+```
 
 ### Diff Viewer
 
@@ -185,6 +205,7 @@ q / Esc            退出
 当前发布 tag：
 
 ```text
+v0.2.1
 v0.2.0
 v0.1.10
 v0.1.9

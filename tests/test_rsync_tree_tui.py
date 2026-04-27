@@ -39,8 +39,39 @@ class ConfigTests(unittest.TestCase):
         config_path = Path(self.tmp.name) / "config.json"
         data = tui.load_json_config(config_path)
         self.assertEqual(data["version"], tui.CONFIG_VERSION)
+        self.assertEqual(
+            data["auto_update"],
+            {
+                "enabled": True,
+                "skipped_version": "",
+                "latest_version": "",
+                "latest_checked_at": "",
+                "last_prompted_version": "",
+                "last_prompted_at": "",
+            },
+        )
         self.assertEqual(data["diff_viewers"], tui.DEFAULT_DIFF_VIEWERS)
         self.assertTrue(config_path.exists())
+
+    def test_config_file_backfills_auto_update_defaults(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        config_path.write_text(
+            '{"version": 1, "auto_update": {"enabled": false}, "known_connections": []}'
+        )
+
+        data = tui.load_json_config(config_path)
+
+        self.assertEqual(
+            data["auto_update"],
+            {
+                "enabled": False,
+                "skipped_version": "",
+                "latest_version": "",
+                "latest_checked_at": "",
+                "last_prompted_version": "",
+                "last_prompted_at": "",
+            },
+        )
 
     def test_connection_trigger_count_updates(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
@@ -80,6 +111,60 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.diff_viewers, tui.DEFAULT_DIFF_VIEWERS)
         self.assertEqual(config.permission_group, "cli_group")
         self.assertEqual(config.permission_group_source, "cli")
+
+    def test_dotenv_local_root_relative_to_dotenv_parent(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        project_dir = Path("project")
+        project_dir.mkdir()
+        env_file = project_dir / ".env"
+        env_file.write_text(
+            "RSYNC_TREE_TUI_LOCAL_ROOT=./storage\n"
+            "RSYNC_TREE_TUI_REMOTE=dotenv@example:/data\n"
+        )
+        args = argparse.Namespace(
+            local_root=None,
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(
+            config.local_root,
+            (Path(self.tmp.name) / "project" / "storage").resolve(),
+        )
+
+    def test_shell_env_local_root_stays_relative_to_cwd(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        os.environ["RSYNC_TREE_TUI_LOCAL_ROOT"] = "./storage"
+        os.environ["RSYNC_TREE_TUI_REMOTE"] = "env@example:/data"
+        args = argparse.Namespace(
+            local_root=None,
+            remote=None,
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.local_root, (Path(self.tmp.name) / "storage").resolve())
+
+    def test_cli_local_root_stays_relative_to_cwd(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        args = argparse.Namespace(
+            local_root=Path("./storage"),
+            remote="cli@example:/data",
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.local_root, (Path(self.tmp.name) / "storage").resolve())
 
     def test_permission_group_uses_known_connection_before_global_config(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
@@ -132,6 +217,217 @@ class ConfigTests(unittest.TestCase):
             tui.parse_diff_viewers({"diff_viewers": ["delta", "vimdiff {local} {remote}"]}),
             ["delta", "vimdiff {local} {remote}"],
         )
+
+
+class AutoUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.tmp.name) / "config.json"
+        self.config_data = tui.default_config_data()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def remote_source(self, version: str | None) -> tui.RemoteUpdateSource:
+        source_version = version or "0.2.2"
+        source = f'#!/usr/bin/env python3\n__version__ = "{source_version}"\n# rsync\n'
+        return tui.RemoteUpdateSource(source=source, version=version)
+
+    def run_prompt_with_input(self, answer: str) -> None:
+        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.print"),
+            mock.patch("builtins.input", return_value=answer),
+        ):
+            tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
+
+    def test_semver_comparison_uses_numeric_segments(self) -> None:
+        self.assertEqual(tui.compare_semver_versions("0.10.0", "0.2.0"), 1)
+        self.assertEqual(tui.compare_semver_versions("0.2.0", "0.2.0"), 0)
+        self.assertEqual(tui.compare_semver_versions("0.1.9", "0.2.0"), -1)
+        self.assertIsNone(tui.compare_semver_versions("bad", "0.2.0"))
+
+    def test_cached_auto_update_ignores_equal_or_older_remote_versions(self) -> None:
+        for version in ("0.2.0", "0.1.9"):
+            self.config_data["auto_update"]["latest_version"] = version
+            with (
+                self.subTest(version=version),
+                mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+                mock.patch("builtins.input", side_effect=AssertionError("no prompt")),
+            ):
+                tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
+
+    def test_cached_auto_update_skips_configured_version(self) -> None:
+        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        self.config_data["auto_update"]["skipped_version"] = "0.2.2"
+
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.input", side_effect=AssertionError("no prompt")),
+        ):
+            tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
+
+    def test_cached_auto_update_later_records_prompt_metadata(self) -> None:
+        with mock.patch(
+            "rsync_tree_tui.current_local_iso8601",
+            return_value="2026-04-27T12:00:00+08:00",
+        ):
+            self.run_prompt_with_input("")
+
+        auto_update = self.config_data["auto_update"]
+        self.assertEqual(auto_update["last_prompted_version"], "0.2.2")
+        self.assertEqual(auto_update["last_prompted_at"], "2026-04-27T12:00:00+08:00")
+        self.assertEqual(auto_update["skipped_version"], "")
+
+    def test_cached_auto_update_skip_records_skipped_version(self) -> None:
+        self.run_prompt_with_input("s")
+
+        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.2")
+
+    def test_cached_auto_update_disable_turns_off_checks(self) -> None:
+        self.run_prompt_with_input("d")
+
+        self.assertFalse(self.config_data["auto_update"]["enabled"])
+
+    def test_cached_auto_update_update_downloads_payload_installs_and_exits(self) -> None:
+        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.print"),
+            mock.patch("builtins.input", return_value="u"),
+            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.2") as install,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
+
+        self.assertEqual(raised.exception.code, 0)
+        install.assert_called_once_with("0.2.2")
+
+    def test_cached_auto_update_payload_failure_exits_without_replacing(self) -> None:
+        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+            mock.patch("builtins.print"),
+            mock.patch("builtins.input", return_value="u"),
+            mock.patch("rsync_tree_tui.install_remote_update", side_effect=tui.UpdateError("bad payload")),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
+
+        self.assertEqual(raised.exception.code, 1)
+
+    def test_background_check_records_new_remote_version(self) -> None:
+        tui.save_json_config(self.config_path, self.config_data)
+
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+            mock.patch("rsync_tree_tui.current_local_iso8601", return_value="2026-04-27T12:00:00+08:00"),
+            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.2"),
+        ):
+            tui.background_refresh_latest_version(self.config_path, self.config_data)
+
+        data = tui.load_json_config(self.config_path)
+        self.assertEqual(data["auto_update"]["latest_version"], "0.2.2")
+        self.assertEqual(data["auto_update"]["latest_checked_at"], "2026-04-27T12:00:00+08:00")
+
+    def test_background_check_treats_version_failure_as_no_update(self) -> None:
+        tui.save_json_config(self.config_path, self.config_data)
+
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
+            mock.patch("rsync_tree_tui.download_remote_version", return_value=None),
+        ):
+            tui.background_refresh_latest_version(self.config_path, self.config_data)
+
+        data = tui.load_json_config(self.config_path)
+        self.assertEqual(data["auto_update"]["latest_version"], "")
+
+    def test_auto_update_non_interactive_does_not_check_network(self) -> None:
+        with (
+            mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=False),
+            mock.patch("rsync_tree_tui.download_remote_version") as download,
+        ):
+            thread = tui.start_background_auto_update_check(
+                self.config_path,
+                self.config_data,
+            )
+
+        self.assertIsNone(thread)
+        download.assert_not_called()
+
+    def test_download_remote_version_uses_small_version_file(self) -> None:
+        class Response:
+            status = 200
+            reason = "OK"
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"0.2.2\n"
+
+        with mock.patch("rsync_tree_tui.urllib.request.urlopen", return_value=Response()) as urlopen:
+            version = tui.download_remote_version()
+
+        self.assertEqual(version, "0.2.2")
+        urlopen.assert_called_once_with(
+            tui.GITHUB_VERSION_URL,
+            timeout=tui.AUTO_UPDATE_VERSION_TIMEOUT,
+        )
+
+    def test_download_remote_version_invalid_payload_is_no_update(self) -> None:
+        class Response:
+            status = 200
+            reason = "OK"
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"\xff"
+
+        with mock.patch("rsync_tree_tui.urllib.request.urlopen", return_value=Response()):
+            self.assertIsNone(tui.download_remote_version())
+
+    def test_download_remote_update_source_invalid_payload_raises_update_error(self) -> None:
+        class Response:
+            status = 200
+            reason = "OK"
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"\xff"
+
+        with (
+            mock.patch("rsync_tree_tui.urllib.request.urlopen", return_value=Response()),
+            self.assertRaises(tui.UpdateError),
+        ):
+            tui.download_remote_update_source()
+
+    def test_install_remote_update_rejects_payload_version_mismatch(self) -> None:
+        with (
+            mock.patch(
+                "rsync_tree_tui.download_remote_update_source",
+                return_value=self.remote_source("0.2.3"),
+            ),
+            mock.patch("rsync_tree_tui.install_update_source") as install,
+            self.assertRaises(tui.UpdateError),
+        ):
+            tui.install_remote_update("0.2.2")
+
+        install.assert_not_called()
 
 
 class KnownConnectionDisplayTests(unittest.TestCase):

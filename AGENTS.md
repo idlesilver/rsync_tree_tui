@@ -16,7 +16,7 @@
 - 保持此目录为独立 git 仓库，不通过父仓库管理。
 - 常规任务只需更新代码、测试、README 和 CHANGELOG，除非用户明确要求 release，否则不要打 tag 或推送。
 - 任务完成后告知用户可以触发 release。
-- 用户明确触发 release 时，一次性完成完整发布流程：bump `__version__`、更新 `CHANGELOG.md` 和 `README.md`、创建 annotated `vX.Y.Z` tag、推送到 `origin` 和 `galbot`。
+- 用户明确触发 release 时，一次性完成完整发布流程：bump `__version__` 和 `VERSION` 文件、更新 `CHANGELOG.md` 和 `README.md`、创建 annotated `vX.Y.Z` tag、推送到 `origin` 和 `galbot`。
 - 远程配置仅存在于本地 `.git/config`，不得写入已追踪文件。
 - 忽略无关的未追踪文件，除非用户要求包含。
 

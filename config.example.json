@@ -1,4 +1,12 @@
 {
+  "auto_update": {
+    "enabled": true,
+    "latest_checked_at": "",
+    "latest_version": "",
+    "last_prompted_at": "",
+    "last_prompted_version": "",
+    "skipped_version": ""
+  },
   "checksum_policy": {
     "checksum_suffixes": [
       ".json",

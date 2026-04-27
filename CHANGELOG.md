@@ -4,6 +4,20 @@
 
 格式遵循 Keep a Changelog，版本号遵循 Semantic Versioning。
 
+## [Unreleased]
+
+## [0.2.1] - 2026-04-27
+
+### Added
+
+- 增加轻量 `VERSION` 文件用于远端版本探测。
+- 默认启动时后台短超时检查 GitHub 最新版本并记录到配置；下次启动发现记录版本较新时，可选择立即更新、稍后提醒、跳过当前版本或关闭自动检查。
+
+### Changed
+
+- `.env` 中 `RSYNC_TREE_TUI_LOCAL_ROOT` 的相对路径现在相对 `.env` 所在目录解析，CLI 参数和 shell 环境变量保持相对启动目录解析。
+- `--update` 和自动更新提示共用远端源码下载、版本解析和安装逻辑，并使用 SemVer 数字段比较版本；版本探测失败视为无更新，payload 下载或校验失败不会替换本地文件。
+
 ## [0.2.0] - 2026-04-24
 
 ### Added

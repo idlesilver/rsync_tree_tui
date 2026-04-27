@@ -6,6 +6,7 @@ import argparse
 import atexit
 import concurrent.futures
 import curses
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
 import urllib.error
 import urllib.request
@@ -28,8 +30,11 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
+AUTO_UPDATE_VERSION_TIMEOUT = 2
+UPDATE_PAYLOAD_TIMEOUT = 10
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
@@ -62,6 +67,14 @@ def default_config_path() -> Path:
 def default_config_data() -> dict[str, object]:
     return {
         "version": CONFIG_VERSION,
+        "auto_update": {
+            "enabled": True,
+            "skipped_version": "",
+            "latest_version": "",
+            "latest_checked_at": "",
+            "last_prompted_version": "",
+            "last_prompted_at": "",
+        },
         "checksum_policy": {
             "mode": "balanced",
             "size_threshold_mb": DEFAULT_CHECKSUM_THRESHOLD_MB,
@@ -86,6 +99,15 @@ def load_json_config(config_path: Path) -> dict[str, object]:
         if key not in data:
             data[key] = default_value
             changed = True
+        elif isinstance(default_value, dict):
+            if not isinstance(data[key], dict):
+                data[key] = default_value
+                changed = True
+                continue
+            for nested_key, nested_default_value in default_value.items():
+                if nested_key not in data[key]:
+                    data[key][nested_key] = nested_default_value
+                    changed = True
     if changed:
         save_json_config(config_path, data)
     return data
@@ -115,6 +137,22 @@ def get_env_or_dotenv(key: str, dotenv: dict[str, str]) -> str | None:
     if val:
         return val
     return dotenv.get(key)
+
+
+def get_local_root_value(
+    args: argparse.Namespace,
+    dotenv: dict[str, str],
+    dotenv_base_dir: Path,
+    cwd: Path,
+) -> tuple[str | Path | None, Path]:
+    if args.local_root is not None:
+        return args.local_root, cwd
+    val = os.environ.get(LOCAL_ROOT_ENV)
+    if val:
+        return val, cwd
+    if dotenv.get(LOCAL_ROOT_ENV):
+        return dotenv[LOCAL_ROOT_ENV], dotenv_base_dir
+    return None, cwd
 
 
 def resolve_local_root(value: str | Path | None, cwd: Path) -> Path:
@@ -263,6 +301,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     if not env_file.is_absolute():
         env_file = (cwd / env_file).resolve()
     dotenv = read_dotenv(env_file)
+    dotenv_base_dir = env_file.parent
 
     config_path = args.config or default_config_path()
     config_path = config_path.expanduser()
@@ -270,7 +309,12 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         config_path = (cwd / config_path).resolve()
     config_data = load_json_config(config_path)
 
-    local_value = args.local_root or get_env_or_dotenv(LOCAL_ROOT_ENV, dotenv)
+    local_value, local_root_base_dir = get_local_root_value(
+        args,
+        dotenv,
+        dotenv_base_dir,
+        cwd,
+    )
     remote = args.remote or get_env_or_dotenv(REMOTE_ENV, dotenv)
     cli_permission_group = getattr(args, "permission_group", None)
     env_permission_group = get_env_or_dotenv(PERMISSION_GROUP_ENV, dotenv)
@@ -283,7 +327,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     if local_value is None and selected_connection is not None:
         local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
     else:
-        local_root = resolve_local_root(local_value, cwd)
+        local_root = resolve_local_root(local_value, local_root_base_dir)
 
     permission_group = ""
     permission_group_source = "none"
@@ -522,10 +566,118 @@ def extract_version_from_source(source: str) -> str | None:
 
     Returns None if version cannot be determined.
     """
-    import re
-
     match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', source, re.MULTILINE)
     return match.group(1) if match else None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteUpdateSource:
+    source: str
+    version: str | None
+
+
+class UpdateError(RuntimeError):
+    pass
+
+
+def semver_numeric_tuple(version: str) -> tuple[int, int, int] | None:
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", version.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def compare_semver_versions(left: str, right: str) -> int | None:
+    left_tuple = semver_numeric_tuple(left)
+    right_tuple = semver_numeric_tuple(right)
+    if left_tuple is None or right_tuple is None:
+        return None
+    if left_tuple > right_tuple:
+        return 1
+    if left_tuple < right_tuple:
+        return -1
+    return 0
+
+
+def decode_update_response(response: object) -> str:
+    try:
+        return response.read().decode("utf-8")  # type: ignore[attr-defined]
+    except UnicodeDecodeError as e:
+        raise UpdateError("Remote payload is not valid UTF-8") from e
+    except OSError as e:
+        raise UpdateError(f"Remote payload could not be read - {e}") from e
+
+
+def check_update_response_status(response: object) -> None:
+    status = getattr(response, "status", 200)
+    reason = getattr(response, "reason", "")
+    if status != 200:
+        raise UpdateError(f"HTTP {status} - {reason}".rstrip())
+
+
+def download_remote_version(timeout: int = AUTO_UPDATE_VERSION_TIMEOUT) -> str | None:
+    try:
+        with urllib.request.urlopen(GITHUB_VERSION_URL, timeout=timeout) as response:
+            check_update_response_status(response)
+            remote_version = decode_update_response(response).strip()
+    except (urllib.error.URLError, TimeoutError, OSError, UpdateError):
+        return None
+
+    if semver_numeric_tuple(remote_version) is None:
+        return None
+    return remote_version
+
+
+def download_remote_update_source(timeout: int = UPDATE_PAYLOAD_TIMEOUT) -> RemoteUpdateSource:
+    try:
+        with urllib.request.urlopen(GITHUB_RAW_URL, timeout=timeout) as response:
+            check_update_response_status(response)
+            new_source = decode_update_response(response)
+    except urllib.error.URLError as e:
+        raise UpdateError(f"Network error - {e.reason}") from e
+    except TimeoutError as e:
+        raise UpdateError(f"Connection timed out after {timeout} seconds") from e
+    except OSError as e:
+        raise UpdateError(f"Network error - {e}") from e
+
+    if "__version__" not in new_source or "rsync" not in new_source.lower():
+        raise UpdateError("Downloaded content does not appear to be a valid script")
+
+    return RemoteUpdateSource(
+        source=new_source,
+        version=extract_version_from_source(new_source),
+    )
+
+
+def install_remote_update(remote_version: str | None = None) -> str | None:
+    remote_source = download_remote_update_source()
+    source_version = remote_source.version
+    if remote_version and source_version != remote_version:
+        raise UpdateError(
+            f"Downloaded payload version {source_version or 'unknown'} "
+            f"does not match expected version {remote_version}"
+        )
+    install_update_source(remote_source.source, Path(sys.argv[0]).resolve())
+    return source_version
+
+
+def install_update_source(new_source: str, current_path: Path) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8"
+    ) as f:
+        tmp_path = Path(f.name)
+        f.write(new_source)
+
+    try:
+        try:
+            tmp_path.chmod(current_path.stat().st_mode)
+        except OSError:
+            tmp_path.chmod(0o755)
+
+        os.replace(tmp_path, current_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def perform_self_update() -> None:
@@ -543,37 +695,20 @@ def perform_self_update() -> None:
     print(f"{APP_NAME} {__version__} - Self Update")
     print("-" * 40)
 
-    # Download
-    print("Downloading latest version from GitHub...")
-    try:
-        with urllib.request.urlopen(GITHUB_RAW_URL, timeout=30) as response:
-            if response.status != 200:
-                print(f"Error: HTTP {response.status} - {response.reason}")
-                raise SystemExit(1)
-            new_source = response.read().decode("utf-8")
-    except urllib.error.URLError as e:
-        print(f"Error: Network error - {e.reason}")
-        raise SystemExit(1)
-    except TimeoutError:
-        print("Error: Connection timed out after 30 seconds")
-        raise SystemExit(1)
+    print("Checking latest version from GitHub...")
+    new_version = download_remote_version()
+    if not new_version:
+        print("No update installed: remote version could not be checked.")
+        print("Start again without --update to use the current version.")
+        raise SystemExit(0)
 
-    # Validate
-    if '__version__' not in new_source or 'rsync' not in new_source.lower():
-        print("Error: Downloaded content does not appear to be a valid script")
-        raise SystemExit(1)
+    print(f"Remote version: {new_version}")
+    version_comparison = compare_semver_versions(new_version, __version__)
+    if version_comparison != 1:
+        print("Already up to date. No files were changed.")
+        print("Start again without --update to use the current version.")
+        raise SystemExit(0)
 
-    # Compare versions
-    new_version = extract_version_from_source(new_source)
-    if new_version:
-        print(f"Remote version: {new_version}")
-        if new_version == __version__:
-            print("Already up to date!")
-            raise SystemExit(0)
-    else:
-        print("Warning: Could not determine remote version, proceeding anyway")
-
-    # Ask user confirmation
     print(f"\nCurrent: {__version__} → Remote: {new_version}")
     try:
         answer = input("Update? [y/N] ").strip().lower()
@@ -581,34 +716,152 @@ def perform_self_update() -> None:
         answer = "n"
 
     if answer not in ("y", "yes"):
-        print("Cancelled.")
+        print("Cancelled. No files were changed.")
+        print("Start again without --update to use the current version.")
         raise SystemExit(0)
 
-    # Write to temp file
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8"
-    ) as f:
-        tmp_path = Path(f.name)
-        f.write(new_source)
-
-    # Preserve permissions
+    print("Downloading update payload from GitHub...")
     try:
-        tmp_path.chmod(current_path.stat().st_mode)
-    except OSError:
-        tmp_path.chmod(0o755)
-
-    # Atomic replace
-    try:
-        os.replace(tmp_path, current_path)
+        installed_version = install_remote_update(new_version)
         print(f"Updated: {current_path}")
-        if new_version:
-            print(f"Successfully updated to version {new_version}")
+        print(f"Successfully updated to version {installed_version or new_version}")
         print("Please restart the application to use the new version.")
         raise SystemExit(0)
-    except PermissionError:
-        tmp_path.unlink(missing_ok=True)
-        print(f"Error: Permission denied - cannot write to {current_path}")
+    except UpdateError as e:
+        print(f"Error: {e}")
+        print("No files were replaced.")
+        print("Start again without --update or choose not to update at startup.")
         raise SystemExit(1)
+    except PermissionError:
+        print(f"Error: Permission denied - cannot write to {current_path}")
+        print("No files were replaced.")
+        print("Start again without --update or choose not to update at startup.")
+        raise SystemExit(1)
+
+
+def auto_update_config(config_data: dict[str, object]) -> dict[str, object]:
+    default_auto_update = default_config_data()["auto_update"]
+    value = config_data.get("auto_update")
+    if not isinstance(value, dict):
+        value = dict(default_auto_update)
+        config_data["auto_update"] = value
+    for key, default_value in default_auto_update.items():
+        value.setdefault(key, default_value)
+    return value
+
+
+def current_local_iso8601() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def record_latest_remote_version(
+    config_path: Path,
+    remote_version: str,
+) -> None:
+    config_data = load_json_config(config_path)
+    config = auto_update_config(config_data)
+    config["latest_version"] = remote_version
+    config["latest_checked_at"] = current_local_iso8601()
+    save_json_config(config_path, config_data)
+
+
+def background_refresh_latest_version(
+    config_path: Path,
+    config_data: dict[str, object],
+) -> None:
+    config = auto_update_config(config_data)
+    if config.get("enabled") is False:
+        return
+    if not sys.stdin.isatty():
+        return
+
+    remote_version = download_remote_version()
+    if not remote_version:
+        return
+    if compare_semver_versions(remote_version, __version__) != 1:
+        return
+    record_latest_remote_version(config_path, remote_version)
+
+
+def start_background_auto_update_check(
+    config_path: Path,
+    config_data: dict[str, object],
+) -> threading.Thread | None:
+    config = auto_update_config(config_data)
+    if config.get("enabled") is False:
+        return None
+    if not sys.stdin.isatty():
+        return None
+
+    thread = threading.Thread(
+        target=background_refresh_latest_version,
+        args=(config_path, config_data),
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def maybe_prompt_for_cached_auto_update(
+    config_path: Path,
+    config_data: dict[str, object],
+) -> None:
+    config = auto_update_config(config_data)
+    if config.get("enabled") is False:
+        return
+    if not sys.stdin.isatty():
+        return
+
+    remote_version = str(config.get("latest_version") or "")
+    if not remote_version:
+        return
+    if compare_semver_versions(remote_version, __version__) != 1:
+        return
+    if remote_version == config.get("skipped_version"):
+        return
+
+    print(f"\nA new {APP_NAME} version is available: {__version__} → {remote_version}")
+    print(
+        "Choose: [u/y] update, [l/n/Enter] later, "
+        "[s] skip this version, [d] disable auto checks"
+    )
+    try:
+        answer = input("Update choice [later]: ").strip().lower()
+    except EOFError:
+        return
+
+    if answer in ("u", "y", "yes"):
+        current_path = Path(sys.argv[0]).resolve()
+        try:
+            installed_version = install_remote_update(remote_version)
+        except UpdateError as e:
+            print(f"Error: {e}")
+            print("No files were replaced.")
+            print("Start again without --update or choose not to update at startup.")
+            raise SystemExit(1)
+        except OSError as e:
+            print(f"Error: {e}")
+            print("No files were replaced.")
+            print("Start again without --update or choose not to update at startup.")
+            raise SystemExit(1)
+        print(f"Updated: {current_path}")
+        print(f"Successfully updated to version {installed_version or remote_version}")
+        print("Please restart the application to use the new version.")
+        raise SystemExit(0)
+
+    if answer == "s":
+        config["skipped_version"] = remote_version
+        save_json_config(config_path, config_data)
+        return
+
+    if answer == "d":
+        config["enabled"] = False
+        save_json_config(config_path, config_data)
+        return
+
+    config["last_prompted_version"] = remote_version
+    config["last_prompted_at"] = current_local_iso8601()
+    save_json_config(config_path, config_data)
 
 
 def split_remote_spec(remote_spec: str) -> tuple[str, str]:
@@ -3027,6 +3280,8 @@ def main() -> None:
         return
 
     config = resolve_app_config(args)
+    maybe_prompt_for_cached_auto_update(config.config_path, config.config_data)
+    start_background_auto_update_check(config.config_path, config.config_data)
     if not config.local_root.exists():
         raise FileNotFoundError(f"Local root does not exist: {config.local_root}")
     preflight(config.local_root)
