@@ -229,12 +229,12 @@ class AutoUpdateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def remote_source(self, version: str | None) -> tui.RemoteUpdateSource:
-        source_version = version or "0.2.3"
+        source_version = version or "0.2.4"
         source = f'#!/usr/bin/env python3\n__version__ = "{source_version}"\n# rsync\n'
         return tui.RemoteUpdateSource(source=source, version=version)
 
     def run_prompt_with_input(self, answer: str) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.3"
+        self.config_data["auto_update"]["latest_version"] = "0.2.4"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -259,8 +259,8 @@ class AutoUpdateTests(unittest.TestCase):
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
     def test_cached_auto_update_skips_configured_version(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.3"
-        self.config_data["auto_update"]["skipped_version"] = "0.2.3"
+        self.config_data["auto_update"]["latest_version"] = "0.2.4"
+        self.config_data["auto_update"]["skipped_version"] = "0.2.4"
 
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
@@ -276,14 +276,14 @@ class AutoUpdateTests(unittest.TestCase):
             self.run_prompt_with_input("")
 
         auto_update = self.config_data["auto_update"]
-        self.assertEqual(auto_update["last_prompted_version"], "0.2.3")
+        self.assertEqual(auto_update["last_prompted_version"], "0.2.4")
         self.assertEqual(auto_update["last_prompted_at"], "2026-04-27T12:00:00+08:00")
         self.assertEqual(auto_update["skipped_version"], "")
 
     def test_cached_auto_update_skip_records_skipped_version(self) -> None:
         self.run_prompt_with_input("s")
 
-        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.3")
+        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.4")
 
     def test_cached_auto_update_disable_turns_off_checks(self) -> None:
         self.run_prompt_with_input("d")
@@ -291,21 +291,21 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertFalse(self.config_data["auto_update"]["enabled"])
 
     def test_cached_auto_update_update_downloads_payload_installs_and_exits(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.3"
+        self.config_data["auto_update"]["latest_version"] = "0.2.4"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
             mock.patch("builtins.input", return_value="u"),
-            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.3") as install,
+            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.4") as install,
         ):
             with self.assertRaises(SystemExit) as raised:
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
         self.assertEqual(raised.exception.code, 0)
-        install.assert_called_once_with("0.2.3")
+        install.assert_called_once_with("0.2.4")
 
     def test_cached_auto_update_payload_failure_exits_without_replacing(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.3"
+        self.config_data["auto_update"]["latest_version"] = "0.2.4"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -323,12 +323,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("rsync_tree_tui.current_local_iso8601", return_value="2026-04-27T12:00:00+08:00"),
-            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.3"),
+            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.4"),
         ):
             tui.background_refresh_latest_version(self.config_path, self.config_data)
 
         data = tui.load_json_config(self.config_path)
-        self.assertEqual(data["auto_update"]["latest_version"], "0.2.3")
+        self.assertEqual(data["auto_update"]["latest_version"], "0.2.4")
         self.assertEqual(data["auto_update"]["latest_checked_at"], "2026-04-27T12:00:00+08:00")
 
     def test_background_check_treats_version_failure_as_no_update(self) -> None:
@@ -368,12 +368,12 @@ class AutoUpdateTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b"0.2.3\n"
+                return b"0.2.4\n"
 
         with mock.patch("rsync_tree_tui.urllib.request.urlopen", return_value=Response()) as urlopen:
             version = tui.download_remote_version()
 
-        self.assertEqual(version, "0.2.3")
+        self.assertEqual(version, "0.2.4")
         urlopen.assert_called_once_with(
             tui.GITHUB_VERSION_URL,
             timeout=tui.AUTO_UPDATE_VERSION_TIMEOUT,
@@ -420,12 +420,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch(
                 "rsync_tree_tui.download_remote_update_source",
-                return_value=self.remote_source("0.2.4"),
+                return_value=self.remote_source("0.2.5"),
             ),
             mock.patch("rsync_tree_tui.install_update_source") as install,
             self.assertRaises(tui.UpdateError),
         ):
-            tui.install_remote_update("0.2.3")
+            tui.install_remote_update("0.2.4")
 
         install.assert_not_called()
 
@@ -692,6 +692,39 @@ class PopupTextTests(unittest.TestCase):
         app = self.make_app()
 
         self.assertEqual(app._text_cell_width(app._slice_popup_cells("中abc", 0, 3)), 3)
+
+    def test_popup_only_esc_closes(self) -> None:
+        app = self.make_app()
+        app.render = mock.Mock()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("q"), ord("\n"), 27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            app._show_popup("Help", ["line"])
+
+        self.assertEqual(app.stdscr.getch.call_count, 3)
+
+    def test_popup_ignores_ctrl_c_interrupt_flag(self) -> None:
+        app = self.make_app()
+        app._interrupt_requested = True
+        app.render = mock.Mock()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            app._show_popup("Help", ["line"])
+
+        self.assertFalse(app._interrupt_requested)
 
 
 class DiffViewerTests(unittest.TestCase):
@@ -1536,23 +1569,72 @@ class PermissionActionTests(unittest.TestCase):
 
         self.assertEqual(app.pending_action, "permission")
 
+    def test_permission_owner_preflight_ctrl_c_terminates_ssh_and_cancels(self) -> None:
+        app = self.make_app()
+        app._interrupt_requested = True
+        process = mock.Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["ssh"], 0.1),
+        ]
+        process.returncode = -15
+
+        with (
+            mock.patch("rsync_tree_tui.subprocess.Popen", return_value=process),
+            mock.patch.object(app, "_reap_interrupted_process") as reap,
+            mock.patch.object(app, "_choose_permission_mode") as choose_mode,
+        ):
+            app.start_action("permission")
+
+        process.terminate.assert_called_once()
+        reap.assert_called_once_with(process)
+        choose_mode.assert_not_called()
+        self.assertIsNone(app.pending_action)
+        self.assertIsNone(app.pending_permission)
+        self.assertFalse(app._interrupt_requested)
+        self.assertEqual(app.message, "Permission action interrupted. Press r to refresh.")
+
     def test_permission_confirmation_executes_remote_command_and_refreshes(self) -> None:
         app = self.make_app()
         app.pending_action = "permission"
         app.pending_permission = tui.PermissionRequest("pub", ["remote.txt"], "shared")
+        process = mock.Mock()
+        process.communicate.return_value = ("", "")
+        process.returncode = 0
 
-        with mock.patch(
-            "rsync_tree_tui.subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""),
-        ) as run:
+        with mock.patch("rsync_tree_tui.subprocess.Popen", return_value=process) as popen:
             app.handle_key(ord("y"))
 
-        command = run.call_args.args[0]
+        command = popen.call_args.args[0]
         self.assertEqual(command[:2], ["ssh", "host"])
         self.assertIn("chgrp -R shared remote.txt", command[2])
         self.assertIn("chmod ug=rwx,o=rx,g+s", command[2])
         self.assertIn("chmod ug=rw,o=r", command[2])
         app.refresh_manifests.assert_called_once_with(initial_load=False)
+
+    def test_permission_execution_ctrl_c_terminates_ssh_and_requests_refresh(self) -> None:
+        app = self.make_app()
+        app.pending_action = "permission"
+        app.pending_permission = tui.PermissionRequest("pub", ["remote.txt"], "shared")
+        app._interrupt_requested = True
+        process = mock.Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["ssh"], 0.1),
+        ]
+        process.returncode = -15
+
+        with (
+            mock.patch("rsync_tree_tui.subprocess.Popen", return_value=process),
+            mock.patch.object(app, "_reap_interrupted_process") as reap,
+        ):
+            app.handle_key(ord("y"))
+
+        process.terminate.assert_called_once()
+        reap.assert_called_once_with(process)
+        app.refresh_manifests.assert_not_called()
+        self.assertIsNone(app.pending_action)
+        self.assertIsNone(app.pending_permission)
+        self.assertFalse(app._interrupt_requested)
+        self.assertEqual(app.message, "Permission action interrupted. Press r to refresh.")
 
     def test_permission_confirmation_cancel_clears_request(self) -> None:
         app = self.make_app()
@@ -1564,6 +1646,77 @@ class PermissionActionTests(unittest.TestCase):
         self.assertIsNone(app.pending_action)
         self.assertIsNone(app.pending_permission)
         self.assertEqual(app.message, "Cancelled pending permission action.")
+
+    def test_permission_mode_popup_only_esc_cancels(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("q"), 27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertIsNone(mode)
+        self.assertEqual(app.stdscr.getch.call_count, 2)
+
+    def test_permission_mode_popup_ignores_ctrl_c_interrupt_flag(self) -> None:
+        app = self.make_app()
+        app._interrupt_requested = True
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("1")]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, "rdo")
+        self.assertFalse(app._interrupt_requested)
+
+    def test_permission_mode_popup_colors_configured_group_value_green(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+        ):
+            app._choose_permission_mode(1)
+
+        calls = win.addnstr.call_args_list
+        self.assertTrue(
+            any(call.args[2].startswith("shared (cli)") and call.args[4] == 500 for call in calls)
+        )
+
+    def test_permission_mode_popup_colors_missing_group_value_yellow(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+        ):
+            app._choose_permission_mode(1)
+
+        calls = win.addnstr.call_args_list
+        self.assertTrue(
+            any(call.args[2].startswith("<none>") and call.args[4] == 300 for call in calls)
+        )
 
     def test_diff_shortcuts_use_f_and_permission_uses_p(self) -> None:
         app = self.make_app()
@@ -1590,6 +1743,7 @@ class RemotePermissionCommandTests(unittest.TestCase):
         )
 
         self.assertIn("cd '/root path'", command)
+        self.assertIn("trap 'exit 130' INT TERM HUP", command)
         self.assertIn("chgrp -R 'shared team' 'dir one'", command)
         self.assertIn("chmod u=rwx,go=rx,g+s", command)
         self.assertIn("chmod u=rw,go=r", command)

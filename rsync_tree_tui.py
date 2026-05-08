@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -30,7 +31,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -466,6 +467,10 @@ class PermissionRequest:
     mode: str
     rel_paths: list[str]
     permission_group: str
+
+
+class PermissionActionInterrupted(Exception):
+    pass
 
 
 @dataclass(slots=True)
@@ -1033,7 +1038,7 @@ def build_remote_permission_command(
     permission_group: str = "",
 ) -> str:
     dir_mode, file_mode = permission_chmod_modes(mode, has_group=bool(permission_group))
-    commands = ["set -e", f"cd {shlex.quote(remote_root)}"]
+    commands = ["set -e", "trap 'exit 130' INT TERM HUP", f"cd {shlex.quote(remote_root)}"]
     for rel_path in rel_paths:
         quoted_path = shlex.quote(rel_path)
         if permission_group:
@@ -1713,13 +1718,14 @@ class SyncApp:
                 rel_path,
                 self.remote_user,
             )
-            result = subprocess.run(
+            result, interrupted = self._run_interruptible_subprocess(
                 ["ssh", *self._ssh_opts(), self.remote_target, remote_command],
-                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            if interrupted:
+                raise PermissionActionInterrupted()
             if result.returncode != 0:
                 err = result.stderr.strip() or f"owner preflight failed for {rel_path}"
                 return err.splitlines()[0]
@@ -1732,6 +1738,11 @@ class SyncApp:
         if self.permission_group:
             return f"{self.permission_group} ({self.permission_group_source})"
         return "<none>"
+
+    def _permission_group_display_attr(self) -> int:
+        if self.permission_group:
+            return curses.color_pair(5)
+        return curses.color_pair(3)
 
     # ------------------------------- content verification ------------------- #
 
@@ -2031,7 +2042,6 @@ class SyncApp:
         self._interrupt_requested = False
 
         # Set up SIGINT handler to interrupt operations without exiting TUI
-        import signal
         original_sigint = signal.signal(signal.SIGINT, self._handle_sigint)
 
         curses.curs_set(0)
@@ -2058,7 +2068,7 @@ class SyncApp:
                     self.message = "Operation interrupted."
                     continue
                 key = stdscr.getch()
-                if key in (ord("q"), 27):
+                if key == ord("q"):
                     return
                 self.handle_key(key)
         finally:
@@ -2665,7 +2675,13 @@ class SyncApp:
             )
             if hasattr(self, "stdscr"):
                 self.render()
-            first_non_owner = self._first_remote_non_owner_path(selected_paths)
+            try:
+                first_non_owner = self._first_remote_non_owner_path(selected_paths)
+            except PermissionActionInterrupted:
+                self.message = "Permission action interrupted. Press r to refresh."
+                self.pending_action = None
+                self.pending_permission = None
+                return
             if first_non_owner is not None:
                 self.message = f"Cannot change permission: not owner of {first_non_owner}."
                 self.pending_action = None
@@ -2787,13 +2803,15 @@ class SyncApp:
             request.mode,
             request.permission_group,
         )
-        result = subprocess.run(
+        result, interrupted = self._run_interruptible_subprocess(
             ["ssh", *self._ssh_opts(), self.remote_target, remote_command],
-            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
+        if interrupted:
+            self.message = "Permission action interrupted. Press r to refresh."
+            return
         if result.returncode != 0:
             err = result.stderr.strip() or result.stdout.strip() or "remote command failed"
             self.message = f"Permission change failed: {err.splitlines()[0]}"
@@ -2803,6 +2821,81 @@ class SyncApp:
         self.message = (
             f"Applied permission {request.mode} to {len(request.rel_paths)} remote entries."
         )
+
+    def _run_interruptible_subprocess(
+        self,
+        argv: list[str],
+        **kwargs: object,
+    ) -> tuple[subprocess.CompletedProcess[str], bool]:
+        kwargs.setdefault("start_new_session", True)
+        process = subprocess.Popen(argv, **kwargs)
+        while True:
+            if getattr(self, "_interrupt_requested", False):
+                self._interrupt_requested = False
+                self._terminate_interrupted_process(process)
+                self._reap_interrupted_process(process)
+                return (
+                    subprocess.CompletedProcess(
+                        argv,
+                        process.returncode if process.returncode is not None else -signal.SIGTERM,
+                        stdout="",
+                        stderr="",
+                    ),
+                    True,
+                )
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                return (
+                    subprocess.CompletedProcess(
+                        argv,
+                        process.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                    ),
+                    False,
+                )
+            except subprocess.TimeoutExpired:
+                if not getattr(self, "_interrupt_requested", False):
+                    continue
+                self._interrupt_requested = False
+                self._terminate_interrupted_process(process)
+                self._reap_interrupted_process(process)
+                return (
+                    subprocess.CompletedProcess(
+                        argv,
+                        process.returncode if process.returncode is not None else -signal.SIGTERM,
+                        stdout="",
+                        stderr="",
+                    ),
+                    True,
+                )
+
+    def _terminate_interrupted_process(self, process: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (AttributeError, OSError, ProcessLookupError, TypeError):
+            process.terminate()
+
+    def _kill_interrupted_process(self, process: subprocess.Popen[str]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError, ProcessLookupError, TypeError):
+            process.kill()
+
+    def _reap_interrupted_process(self, process: subprocess.Popen[str]) -> None:
+        def reap() -> None:
+            try:
+                process.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._kill_interrupted_process(process)
+                try:
+                    process.communicate()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        threading.Thread(target=reap, daemon=True).start()
 
     def execute_pending_action(self) -> None:
         if self.pending_action is None:
@@ -2984,13 +3077,15 @@ class SyncApp:
             pass
 
     def _show_popup(self, title: str, lines: list[str]) -> None:
-        """Scrollable centered overlay. Arrows scroll/pan, q/Esc/Enter closes.
+        """Scrollable centered overlay. Arrows scroll/pan, Esc closes.
 
         Lines starting with +/-/@ are colored as unified-diff output.
         """
         scroll = 0
         hscroll = 0
         while True:
+            if getattr(self, "_interrupt_requested", False):
+                self._interrupt_requested = False
             self.render()
             height, width = self.stdscr.getmaxyx()
 
@@ -3039,7 +3134,7 @@ class SyncApp:
 
             # Footer is inside the border, not on top of it.
             footer_y = box_h - 2
-            hint = " q/Esc:close  Up/Down:scroll  Left/Right:pan "
+            hint = " Esc:close  Up/Down:scroll  Left/Right:pan "
             self._popup_add_cells(win, footer_y, 1, " " * (box_w - 2), box_w - 2)
             self._popup_add_cells(win, footer_y, 1, hint, min(self._text_cell_width(hint), box_w - 2), curses.color_pair(3))
             status_parts = []
@@ -3060,7 +3155,7 @@ class SyncApp:
             win.refresh()
 
             key = self.stdscr.getch()
-            if key in (ord("q"), 27, ord("\n"), ord(" "), ord("?"), ord("f")):
+            if key == 27:
                 return
             elif key == curses.KEY_UP:
                 scroll = max(0, scroll - 1)
@@ -3080,17 +3175,19 @@ class SyncApp:
                 hscroll = max(0, max_line_len - content_w)
 
     def _choose_permission_mode(self, target_count: int) -> str | None:
+        group_label = "Group:   "
+        group_value = self._permission_group_display()
         lines = [
             "Select remote permission mode",
             "",
             f"Targets: {target_count} selected remote entries",
-            f"Group:   {self._permission_group_display()}",
+            f"{group_label}{group_value}",
             "",
             "1 / r    read-only (rdo)",
             "2 / v    private  (pvt)",
             "3 / u    public   (pub)",
             "",
-            "q / Esc  cancel",
+            "Esc      cancel",
         ]
         key_to_mode = {
             ord("1"): "rdo",
@@ -3104,6 +3201,8 @@ class SyncApp:
             ord("U"): "pub",
         }
         while True:
+            if getattr(self, "_interrupt_requested", False):
+                self._interrupt_requested = False
             self.render()
             height, width = self.stdscr.getmaxyx()
             content_w = min(max((self._text_cell_width(line) for line in lines), default=0), 56)
@@ -3118,12 +3217,23 @@ class SyncApp:
             title_x = max((box_w - self._text_cell_width(title)) // 2, 1)
             self._popup_add_cells(win, 0, title_x, title, box_w - title_x - 1, curses.A_BOLD)
             for row, line in enumerate(lines[: max(box_h - 2, 0)]):
-                self._popup_add_cells(win, row + 1, 2, line, box_w - 4)
+                if line.startswith(group_label):
+                    self._popup_add_cells(win, row + 1, 2, group_label, box_w - 4)
+                    self._popup_add_cells(
+                        win,
+                        row + 1,
+                        2 + len(group_label),
+                        group_value,
+                        box_w - 4 - len(group_label),
+                        self._permission_group_display_attr(),
+                    )
+                else:
+                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4)
             win.refresh()
             key = self.stdscr.getch()
             if key in key_to_mode:
                 return key_to_mode[key]
-            if key in (ord("q"), ord("Q"), 27):
+            if key == 27:
                 return None
 
     def _show_help_popup(self) -> None:
@@ -3146,7 +3256,7 @@ class SyncApp:
             "x                  Clear all selections (with confirmation)",
             "r                  Refresh manifests",
             "?                  Show this help",
-            "q / Esc            Quit",
+            "q                  Quit",
             "",
             "Colors",
             "  white            Both sides exist, not fully explored",
