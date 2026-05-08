@@ -541,6 +541,26 @@ class ChecksumPolicyTests(unittest.TestCase):
         self.assertIn("--backup", backup_cmd)
         self.assertNotIn("--backup", default_cmd)
 
+    def test_build_rsync_command_adds_whole_file_only_when_requested(self) -> None:
+        whole_file_cmd = tui.build_rsync_command(
+            Path("/tmp/list"),
+            "/src/",
+            "/dst/",
+            "ssh",
+            False,
+            whole_file=True,
+        )
+        default_cmd = tui.build_rsync_command(
+            Path("/tmp/list"),
+            "/src/",
+            "/dst/",
+            "ssh",
+            False,
+        )
+
+        self.assertIn("--whole-file", whole_file_cmd)
+        self.assertNotIn("--whole-file", default_cmd)
+
 
 class RenderTests(unittest.TestCase):
     def test_missing_side_renders_without_placeholder_text(self) -> None:
@@ -1365,6 +1385,57 @@ class CheckActionTests(unittest.TestCase):
         self.assertTrue(tui.node_has_difference(dataset.children["scene_b"]))
         self.assertNotIn("dataset/scene_a/local_new", loaded)
         self.assertNotIn("dataset/scene_b/remote_new", loaded)
+
+
+class SyncActionTests(unittest.TestCase):
+    def make_download_app(self) -> tui.SyncApp:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        remote_file = tui.TreeNode(
+            name="remote.txt",
+            rel_path="remote.txt",
+            parent=root,
+            is_selected=True,
+            right_entry=tui.EntryMeta(
+                rel_path="remote.txt",
+                entry_type=tui.EntryType.FILE,
+                size=1,
+                mtime_s=1,
+                perms=0o644,
+            ),
+            children_loaded=True,
+        )
+        root.children = {"remote.txt": remote_file}
+        app.root_node = root
+        app.pending_action = "download"
+        app.local_root = Path("/local")
+        app.remote_target = "host"
+        app.remote_root = "/remote"
+        app.message = ""
+        app.render = mock.Mock()
+        app.suspend_tui = mock.Mock()
+        app.resume_tui = mock.Mock()
+        app.refresh_manifests = mock.Mock()
+        app._ssh_opts = mock.Mock(return_value=[])
+        app._expand_selected_paths = mock.Mock(return_value=(["remote.txt"], {
+            "remote.txt": remote_file.right_entry,
+        }))
+        app._split_paths_by_checksum = mock.Mock(return_value=[(True, ["remote.txt"])])
+        return app
+
+    def test_download_rsync_command_uses_whole_file(self) -> None:
+        app = self.make_download_app()
+
+        with (
+            mock.patch("rsync_tree_tui.subprocess.run") as run,
+            mock.patch("builtins.input"),
+            mock.patch("builtins.print"),
+        ):
+            app.execute_pending_action()
+
+        command = run.call_args.args[0]
+        self.assertIn("--whole-file", command)
+        self.assertIn("--backup", command)
 
 
 class PermissionActionTests(unittest.TestCase):

@@ -169,6 +169,15 @@ python rsync_tree_tui.py \
 - 其他大文件使用 size+mtime。
 - TUI 内 `c` 检查动作默认会对 same-size/different-mtime 文件执行 checksum 内容校验，用于忽略 metadata-only 差异。
 
+## 同步行为
+
+下载会使用 rsync `--backup --whole-file`。`--whole-file` 让远端覆盖本地时直接传完整文件，避免用本地旧文件作为 delta basis 时出现 verification failed。`--backup` 没有配置 `--backup-dir`，所以被覆盖的本地旧文件会保存在原文件同目录，默认文件名追加 `~` 后缀，例如：
+
+```text
+model/mjcf/mjcf_simready.xml
+model/mjcf/mjcf_simready.xml~
+```
+
 ## Check
 
 按 `c` 后会进入 check 配置确认态。此时只接受 `m`、数字、Backspace、`?`、`y`、`n`，其他按键会被屏蔽，避免误触主界面操作。

@@ -15,6 +15,7 @@
 
 - check 默认启用 ignore metadata：same-size/different-mtime 文件会用 checksum 消除 metadata-only 误报；关闭后保留旧式 mtime diff 判断。
 - check 不再深入 local-only 或 remote-only 目录；local-only 不触发 stop-depth 短路，remote-only 会触发短路。
+- download rsync 命令增加 `--whole-file`，远端覆盖本地时不再依赖本地旧文件作为 delta basis。
 
 ### Fixed
 

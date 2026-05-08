@@ -1476,6 +1476,7 @@ def build_rsync_command(
     ssh_cmd: str,
     use_checksum: bool,
     backup: bool = False,
+    whole_file: bool = False,
 ) -> list[str]:
     command = [
         "rsync",
@@ -1499,6 +1500,8 @@ def build_rsync_command(
         command.insert(2, "--checksum")
     if backup:
         command.insert(2, "--backup")
+    if whole_file:
+        command.insert(2, "--whole-file")
     return command
 
 
@@ -2875,6 +2878,7 @@ class SyncApp:
                         ssh_cmd,
                         use_checksum,
                         backup=action == "download",
+                        whole_file=action == "download",
                     ),
                 )
             )
