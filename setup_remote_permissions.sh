@@ -2,12 +2,14 @@
 #
 # setup_remote_permissions.sh
 #
-# Normalize group access on shared storage directories.
+# Normalize access on shared storage directories.
 #
-# Three modes (applied recursively to all content under each target):
-#   pvt — private:   dirs 700, files 600
-#   rdo — read-only: dirs 755, files 644
-#   pub — public:    dirs 775, files 664
+# Modes (applied recursively to all content under each target):
+#   pvt   — owner only
+#   grp:r — owner + group read
+#   grp:w — owner + group write
+#   any:r — owner + group + other read
+#   any:w — owner + group + other write
 #
 # Usage:
 #   setup_remote_permissions.sh [--group GROUP] [--dry-run] [-v] <mode> <path> [<path> ...]
@@ -15,7 +17,7 @@
 #   setup_remote_permissions.sh --version
 #
 # Options:
-#   --group G   Shared group name (default: $GROUP or current primary group).
+#   --group G   Selected group name for grp:* modes.
 #   --dry-run   Show how many entries would change, without modifying anything.
 #   -v          Verbose: list every entry whose permissions will be/were changed.
 #   --update    Download latest version from GitHub and replace local file.
@@ -23,33 +25,33 @@
 #
 # Examples:
 #   # Preview what would change, without applying
-#   ./setup_remote_permissions.sh --dry-run rdo /data/storage/sn_assets
+#   ./setup_remote_permissions.sh --dry-run any:r /data/storage/sn_assets
 #
 #   # Lock a released dataset so teammates can only download it
-#   ./setup_remote_permissions.sh rdo /data/storage/datasets/v1.0
+#   ./setup_remote_permissions.sh any:r /data/storage/datasets/v1.0
 #
 #   # Open a staging area so teammates can upload into it
-#   ./setup_remote_permissions.sh pub /data/storage/datasets/staging
+#   ./setup_remote_permissions.sh grp:w /data/storage/datasets/staging
 #
 #   # Hide a work-in-progress directory from teammates
 #   ./setup_remote_permissions.sh pvt /data/storage/wip_secret
 #
 #   # Apply to multiple paths at once
-#   ./setup_remote_permissions.sh rdo /data/storage/v1.0 /data/storage/v1.1
+#   ./setup_remote_permissions.sh any:r /data/storage/v1.0 /data/storage/v1.1
 #
 # Run remotely from local machine:
-#   ssh user@host "bash /path/to/scripts/setup_remote_permissions.sh rdo /remote/path"
+#   ssh user@host "bash /path/to/scripts/setup_remote_permissions.sh any:r /remote/path"
 #
 
 set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
-VERSION="0.2.0"
+VERSION="0.2.4"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/setup_remote_permissions.sh"
 
 # Edit this line to persist a site-specific default, or pass --group.
-GROUP="${GROUP:-$(id -gn)}"
+GROUP="${GROUP:-}"
 
 # ─────────────────────────── arg parsing ────────────────────────────────── #
 
@@ -139,10 +141,14 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=1; shift ;;
         -v|--verbose)     VERBOSE=1; shift ;;
         --help|-h)        usage ;;
-        pvt|rdo|pub)
+        pvt|grp:r|grp:w|any:r|any:w)
             [[ -n "$MODE" ]] && { echo "ERROR: mode specified twice ('$MODE' and '$1')"; exit 1; }
             MODE="$1"
             shift
+            ;;
+        rdo|pub)
+            echo "ERROR: unknown mode: $1" >&2
+            usage
             ;;
         -*)
             echo "ERROR: unknown option: $1" >&2; usage ;;
@@ -158,9 +164,8 @@ if [[ $UPDATE -eq 1 ]]; then
     do_self_update
 fi
 
-[[ -z "$MODE"            ]] && { echo "ERROR: mode is required (pvt|rdo|pub)"; echo; usage; }
+[[ -z "$MODE"            ]] && { echo "ERROR: mode is required (pvt|grp:r|grp:w|any:r|any:w)"; echo; usage; }
 [[ ${#TARGETS[@]} -eq 0 ]] && { echo "ERROR: at least one path is required"; echo; usage; }
-[[ -z "$GROUP"           ]] && { echo "ERROR: group must not be empty"; echo; usage; }
 
 # ─────────────────────────── helpers ────────────────────────────────────── #
 
@@ -177,19 +182,57 @@ log_ok()    { echo -e "${GREEN}  ${*}${RESET}"; }
 log_warn()  { echo -e "${YELLOW}  WARN: ${*}${RESET}" >&2; }
 log_error() { echo -e "${RED}  ERROR: ${*}${RESET}" >&2; }
 
-find_mode_mismatches() {
+find_permission_mismatches() {
     local target="$1"
     local type="$2"
     local wanted_mode="$3"
-    find -L "$target" -type "$type" -exec sh -c '
+    find -L "$target" -type "$type" -exec bash -c '
         wanted_mode="$0"
+        entry_type="$1"
+        shift
         for path do
             mode=$(stat -c "%a" "$path") || exit 1
-            if [ "$mode" != "$wanted_mode" ]; then
+            mode=$((8#$mode & 07777))
+            bits=$((mode & 0777))
+            special=$((mode & 07000))
+            ok=1
+            case "$wanted_mode:$entry_type" in
+                pvt:d)
+                    (( bits == 0700 && (special & 02000) == 0 )) || ok=0
+                    ;;
+                pvt:f)
+                    (( (bits & 0600) == 0600 && (bits & 0077) == 0 && special == 0 )) || ok=0
+                    ;;
+                grp:r:d)
+                    (( bits == 0750 && (special & 02000) != 0 )) || ok=0
+                    ;;
+                grp:r:f)
+                    (( (bits & 0600) == 0600 && (bits & 0040) != 0 && (bits & 0020) == 0 && (bits & 0007) == 0 && special == 0 )) || ok=0
+                    ;;
+                grp:w:d)
+                    (( bits == 0770 && (special & 02000) != 0 )) || ok=0
+                    ;;
+                grp:w:f)
+                    (( (bits & 0600) == 0600 && (bits & 0060) == 0060 && (bits & 0007) == 0 && special == 0 )) || ok=0
+                    ;;
+                any:r:d)
+                    (( bits == 0755 && (special & 02000) != 0 )) || ok=0
+                    ;;
+                any:r:f)
+                    (( (bits & 0600) == 0600 && (bits & 0044) == 0044 && (bits & 0022) == 0 && special == 0 )) || ok=0
+                    ;;
+                any:w:d)
+                    (( bits == 0777 && (special & 02000) != 0 )) || ok=0
+                    ;;
+                any:w:f)
+                    (( (bits & 0600) == 0600 && (bits & 0066) == 0066 && special == 0 )) || ok=0
+                    ;;
+            esac
+            if (( ok == 0 )); then
                 printf "%s\n" "$path"
             fi
         done
-    ' "$wanted_mode" {} +
+    ' "$wanted_mode" "$type" {} +
 }
 
 # find predicates: return entries whose permissions DO NOT yet match the target
@@ -198,13 +241,19 @@ find_mismatched_dirs() {
     local target="$1"
     case "$MODE" in
         pvt)
-            find_mode_mismatches "$target" d 700
+            find_permission_mismatches "$target" d pvt
             ;;
-        rdo)
-            find_mode_mismatches "$target" d 2755
+        grp:r)
+            find_permission_mismatches "$target" d grp:r
             ;;
-        pub)
-            find_mode_mismatches "$target" d 2775
+        grp:w)
+            find_permission_mismatches "$target" d grp:w
+            ;;
+        any:r)
+            find_permission_mismatches "$target" d any:r
+            ;;
+        any:w)
+            find_permission_mismatches "$target" d any:w
             ;;
     esac
 }
@@ -213,13 +262,19 @@ find_mismatched_files() {
     local target="$1"
     case "$MODE" in
         pvt)
-            find_mode_mismatches "$target" f 600
+            find_permission_mismatches "$target" f pvt
             ;;
-        rdo)
-            find_mode_mismatches "$target" f 644
+        grp:r)
+            find_permission_mismatches "$target" f grp:r
             ;;
-        pub)
-            find_mode_mismatches "$target" f 664
+        grp:w)
+            find_permission_mismatches "$target" f grp:w
+            ;;
+        any:r)
+            find_permission_mismatches "$target" f any:r
+            ;;
+        any:w)
+            find_permission_mismatches "$target" f any:w
             ;;
     esac
 }
@@ -271,23 +326,32 @@ fix_target() {
 
     case "$MODE" in
         pvt)
-            find -L "$target" -type d -exec chmod u=rwx,go-rwx,g-s {} +
-            find -L "$target" -type f -exec chmod u=rw,go-rwx      {} +
+            find -L "$target" -type d -exec chmod u+rwx,go-rwx,g-s {} + || return 1
+            find -L "$target" -type f -exec chmod u+rw,go-rwx      {} + || return 1
             ;;
-        rdo)
-            find -L "$target" -type d -exec chmod u=rwx,go=rx,g+s {} +
-            find -L "$target" -type f -exec chmod u=rw,go=r       {} +
+        grp:r)
+            if [[ -n "$GROUP" ]]; then
+                find -L "$target" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+            fi
+            find -L "$target" -type d -exec chmod u+rwx,g+rx,g-w,o-rwx,g+s {} + || return 1
+            find -L "$target" -type f -exec chmod u+rw,g+r,g-w,o-rwx       {} + || return 1
             ;;
-        pub)
-            find -L "$target" -type d -exec chmod ug=rwx,o=rx,g+s {} +
-            find -L "$target" -type f -exec chmod ug=rw,o=r       {} +
+        grp:w)
+            if [[ -n "$GROUP" ]]; then
+                find -L "$target" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+            fi
+            find -L "$target" -type d -exec chmod u+rwx,g+rwx,o-rwx,g+s {} + || return 1
+            find -L "$target" -type f -exec chmod u+rw,g+rw,o-rwx       {} + || return 1
+            ;;
+        any:r)
+            find -L "$target" -type d -exec chmod u+rwx,go+rx,go-w,g+s {} + || return 1
+            find -L "$target" -type f -exec chmod u+rw,go+r,go-w       {} + || return 1
+            ;;
+        any:w)
+            find -L "$target" -type d -exec chmod u+rwx,go+rwx,g+s {} + || return 1
+            find -L "$target" -type f -exec chmod u+rw,go+rw       {} + || return 1
             ;;
     esac
-
-    # chgrp: best-effort (may not own all files when syncing others' uploads)
-    if ! chgrp -R "$GROUP" "$target" 2>/dev/null; then
-        log_warn "chgrp failed on some entries (not owner) — group unchanged for those files"
-    fi
 
     if [[ $changed_dirs -eq 0 && $changed_files -eq 0 ]]; then
         log_ok "Already correct — no changes needed."
@@ -307,8 +371,12 @@ echo
 if [[ $DRY_RUN -eq 1 ]]; then
     echo -e "${YELLOW}${BOLD}[DRY-RUN]${RESET} No files will be modified."
 else
-    echo -e "Applying mode: ${BOLD}$MODE${RESET}  |  group: ${BOLD}$GROUP${RESET}"
-    echo    "Add a teammate:  sudo usermod -aG $GROUP <username>"
+    GROUP_DISPLAY="$GROUP"
+    [[ -z "$GROUP_DISPLAY" ]] && GROUP_DISPLAY="not change group"
+    echo -e "Applying mode: ${BOLD}$MODE${RESET}  |  group: ${BOLD}$GROUP_DISPLAY${RESET}"
+    if [[ -n "$GROUP" ]]; then
+        echo    "Add a teammate:  sudo usermod -aG $GROUP <username>"
+    fi
 fi
 echo "────────────────────────────────────────────"
 echo

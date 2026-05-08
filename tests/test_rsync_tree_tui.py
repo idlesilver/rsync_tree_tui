@@ -229,12 +229,12 @@ class AutoUpdateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def remote_source(self, version: str | None) -> tui.RemoteUpdateSource:
-        source_version = version or "0.2.4"
+        source_version = version or "0.2.5"
         source = f'#!/usr/bin/env python3\n__version__ = "{source_version}"\n# rsync\n'
         return tui.RemoteUpdateSource(source=source, version=version)
 
     def run_prompt_with_input(self, answer: str) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.4"
+        self.config_data["auto_update"]["latest_version"] = "0.2.5"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -259,8 +259,8 @@ class AutoUpdateTests(unittest.TestCase):
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
     def test_cached_auto_update_skips_configured_version(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.4"
-        self.config_data["auto_update"]["skipped_version"] = "0.2.4"
+        self.config_data["auto_update"]["latest_version"] = "0.2.5"
+        self.config_data["auto_update"]["skipped_version"] = "0.2.5"
 
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
@@ -276,14 +276,14 @@ class AutoUpdateTests(unittest.TestCase):
             self.run_prompt_with_input("")
 
         auto_update = self.config_data["auto_update"]
-        self.assertEqual(auto_update["last_prompted_version"], "0.2.4")
+        self.assertEqual(auto_update["last_prompted_version"], "0.2.5")
         self.assertEqual(auto_update["last_prompted_at"], "2026-04-27T12:00:00+08:00")
         self.assertEqual(auto_update["skipped_version"], "")
 
     def test_cached_auto_update_skip_records_skipped_version(self) -> None:
         self.run_prompt_with_input("s")
 
-        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.4")
+        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.5")
 
     def test_cached_auto_update_disable_turns_off_checks(self) -> None:
         self.run_prompt_with_input("d")
@@ -291,21 +291,21 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertFalse(self.config_data["auto_update"]["enabled"])
 
     def test_cached_auto_update_update_downloads_payload_installs_and_exits(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.4"
+        self.config_data["auto_update"]["latest_version"] = "0.2.5"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
             mock.patch("builtins.input", return_value="u"),
-            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.4") as install,
+            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.5") as install,
         ):
             with self.assertRaises(SystemExit) as raised:
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
         self.assertEqual(raised.exception.code, 0)
-        install.assert_called_once_with("0.2.4")
+        install.assert_called_once_with("0.2.5")
 
     def test_cached_auto_update_payload_failure_exits_without_replacing(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.4"
+        self.config_data["auto_update"]["latest_version"] = "0.2.5"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -323,12 +323,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("rsync_tree_tui.current_local_iso8601", return_value="2026-04-27T12:00:00+08:00"),
-            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.4"),
+            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.5"),
         ):
             tui.background_refresh_latest_version(self.config_path, self.config_data)
 
         data = tui.load_json_config(self.config_path)
-        self.assertEqual(data["auto_update"]["latest_version"], "0.2.4")
+        self.assertEqual(data["auto_update"]["latest_version"], "0.2.5")
         self.assertEqual(data["auto_update"]["latest_checked_at"], "2026-04-27T12:00:00+08:00")
 
     def test_background_check_treats_version_failure_as_no_update(self) -> None:
@@ -368,12 +368,12 @@ class AutoUpdateTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b"0.2.4\n"
+                return b"0.2.5\n"
 
         with mock.patch("rsync_tree_tui.urllib.request.urlopen", return_value=Response()) as urlopen:
             version = tui.download_remote_version()
 
-        self.assertEqual(version, "0.2.4")
+        self.assertEqual(version, "0.2.5")
         urlopen.assert_called_once_with(
             tui.GITHUB_VERSION_URL,
             timeout=tui.AUTO_UPDATE_VERSION_TIMEOUT,
@@ -420,12 +420,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch(
                 "rsync_tree_tui.download_remote_update_source",
-                return_value=self.remote_source("0.2.5"),
+                return_value=self.remote_source("0.2.6"),
             ),
             mock.patch("rsync_tree_tui.install_update_source") as install,
             self.assertRaises(tui.UpdateError),
         ):
-            tui.install_remote_update("0.2.4")
+            tui.install_remote_update("0.2.5")
 
         install.assert_not_called()
 
@@ -581,17 +581,17 @@ class RenderTests(unittest.TestCase):
 
         self.assertIn("<error>", cell)
 
-    def test_remote_file_permission_badge_uses_file_rules(self) -> None:
+    def test_remote_file_permission_badge_uses_two_dimensional_rules(self) -> None:
         entry = tui.EntryMeta(
             rel_path="asset.bin",
             entry_type=tui.EntryType.FILE,
             size=1,
             mtime_s=1,
-            perms=0o664,
+            perms=0o660,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[pub]")
-        self.assertEqual(tui.badge_color_pair(entry), 7)
+        self.assertEqual(tui.remote_permission_badge(entry), "[grp:w]")
+        self.assertEqual(tui.badge_color_pair(entry), 5)
 
     def test_remote_directory_permission_badge_ignores_setgid(self) -> None:
         entry = tui.EntryMeta(
@@ -602,8 +602,8 @@ class RenderTests(unittest.TestCase):
             perms=0o2755,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[rdo]")
-        self.assertEqual(tui.badge_color_pair(entry), 8)
+        self.assertEqual(tui.remote_permission_badge(entry), "[any:r]")
+        self.assertEqual(tui.badge_color_pair(entry), 4)
 
     def test_remote_nonstandard_permission_uses_numeric_badge(self) -> None:
         entry = tui.EntryMeta(
@@ -614,7 +614,19 @@ class RenderTests(unittest.TestCase):
             perms=0o640,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[640]")
+        self.assertEqual(tui.remote_permission_badge(entry), "[grp:r]")
+        self.assertEqual(tui.badge_color_pair(entry), 5)
+
+    def test_remote_nonstandard_permission_uses_centered_numeric_badge(self) -> None:
+        entry = tui.EntryMeta(
+            rel_path="run.sh",
+            entry_type=tui.EntryType.FILE,
+            size=1,
+            mtime_s=1,
+            perms=0o755,
+        )
+
+        self.assertEqual(tui.remote_permission_badge(entry), "[ 755 ]")
         self.assertEqual(tui.badge_color_pair(entry), 9)
 
     def test_remote_pvt_badge_uses_private_color_pair(self) -> None:
@@ -626,8 +638,24 @@ class RenderTests(unittest.TestCase):
             perms=0o700,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[pvt]")
+        self.assertEqual(tui.remote_permission_badge(entry), "[pvt:-]")
         self.assertEqual(tui.badge_color_pair(entry), 6)
+
+    def test_permission_label_views_use_fixed_brackets(self) -> None:
+        entry = tui.EntryMeta(
+            rel_path="dataset",
+            entry_type=tui.EntryType.DIRECTORY,
+            size=0,
+            mtime_s=1,
+            perms=0o2755,
+            owner="alice",
+            group="asset_team",
+        )
+
+        self.assertEqual(tui.remote_permission_label(entry, "badge"), "[any:r]")
+        self.assertEqual(tui.remote_permission_label(entry, "owner"), "[alice]")
+        self.assertEqual(tui.remote_permission_label(entry, "group"), "[asset]")
+        self.assertEqual(tui.remote_permission_label(entry, "mode"), "[2755 ]")
 
     def test_render_draws_remote_badge_in_middle_column_with_badge_color(self) -> None:
         app = tui.SyncApp.__new__(tui.SyncApp)
@@ -641,7 +669,7 @@ class RenderTests(unittest.TestCase):
                 entry_type=tui.EntryType.FILE,
                 size=1,
                 mtime_s=1,
-                perms=0o664,
+                perms=0o660,
             ),
         )
         root.children = {"asset.bin": remote_file}
@@ -668,7 +696,13 @@ class RenderTests(unittest.TestCase):
         calls = app.stdscr.addnstr.call_args_list
         self.assertTrue(
             any(
-                call.args[2] == " [pub] " and call.args[4] == 700
+                call.args[2] == "grp" and call.args[4] == 500
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            any(
+                call.args[2] == "w" and call.args[4] == 100
                 for call in calls
             )
         )
@@ -1046,8 +1080,8 @@ class MouseTests(unittest.TestCase):
         self.assertIn(ord("?"), hit_keys)
         self.assertIn(ord("f"), hit_keys)
         self.assertIn(ord("p"), hit_keys)
+        self.assertIn(ord("P"), hit_keys)
         self.assertNotIn(ord("F"), hit_keys)
-        self.assertNotIn(ord("P"), hit_keys)
         self.assertNotIn(ord("q"), hit_keys)
 
     def test_mouse_double_click_footer_refresh_triggers_refresh(self) -> None:
@@ -1542,13 +1576,14 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path", return_value=None),
-            mock.patch.object(app, "_choose_permission_mode", return_value="rdo"),
+            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:w", "shared")),
         ):
             app.start_action("permission")
 
         self.assertEqual(app.pending_action, "permission")
         self.assertIsNotNone(app.pending_permission)
-        self.assertEqual(app.pending_permission.mode, "rdo")
+        self.assertEqual(app.pending_permission.mode, "grp:w")
+        self.assertEqual(app.pending_permission.permission_group, "shared")
         self.assertEqual(app.pending_permission.rel_paths, ["remote.txt"])
         self.assertIn("Press y to confirm", app.message)
 
@@ -1563,7 +1598,7 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path", side_effect=check_status),
-            mock.patch.object(app, "_choose_permission_mode", return_value="rdo"),
+            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:r", "")),
         ):
             app.start_action("permission")
 
@@ -1596,7 +1631,7 @@ class PermissionActionTests(unittest.TestCase):
     def test_permission_confirmation_executes_remote_command_and_refreshes(self) -> None:
         app = self.make_app()
         app.pending_action = "permission"
-        app.pending_permission = tui.PermissionRequest("pub", ["remote.txt"], "shared")
+        app.pending_permission = tui.PermissionRequest("grp:w", ["remote.txt"], "shared")
         process = mock.Mock()
         process.communicate.return_value = ("", "")
         process.returncode = 0
@@ -1606,15 +1641,15 @@ class PermissionActionTests(unittest.TestCase):
 
         command = popen.call_args.args[0]
         self.assertEqual(command[:2], ["ssh", "host"])
-        self.assertIn("chgrp -R shared remote.txt", command[2])
-        self.assertIn("chmod ug=rwx,o=rx,g+s", command[2])
-        self.assertIn("chmod ug=rw,o=r", command[2])
+        self.assertIn("find -L remote.txt ! -group shared -exec chgrp shared {} +", command[2])
+        self.assertIn("chmod u+rwx,g+rwx,o-rwx,g+s", command[2])
+        self.assertIn("chmod u+rw,g+rw,o-rwx", command[2])
         app.refresh_manifests.assert_called_once_with(initial_load=False)
 
     def test_permission_execution_ctrl_c_terminates_ssh_and_requests_refresh(self) -> None:
         app = self.make_app()
         app.pending_action = "permission"
-        app.pending_permission = tui.PermissionRequest("pub", ["remote.txt"], "shared")
+        app.pending_permission = tui.PermissionRequest("any:w", ["remote.txt"], "")
         app._interrupt_requested = True
         process = mock.Mock()
         process.communicate.side_effect = [
@@ -1668,7 +1703,7 @@ class PermissionActionTests(unittest.TestCase):
         app._interrupt_requested = True
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [ord("1")]
+        app.stdscr.getch.side_effect = [ord("s"), ord("w"), ord("y")]
         win = mock.Mock()
 
         with (
@@ -1677,14 +1712,14 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, "rdo")
+        self.assertEqual(mode, ("grp:w", "shared"))
         self.assertFalse(app._interrupt_requested)
 
     def test_permission_mode_popup_colors_configured_group_value_green(self) -> None:
         app = self.make_app()
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [27]
+        app.stdscr.getch.side_effect = [ord("s"), 27]
         win = mock.Mock()
 
         with (
@@ -1695,7 +1730,7 @@ class PermissionActionTests(unittest.TestCase):
 
         calls = win.addnstr.call_args_list
         self.assertTrue(
-            any(call.args[2].startswith("shared (cli)") and call.args[4] == 500 for call in calls)
+            any(call.args[2].startswith("shared") and call.args[4] == 500 for call in calls)
         )
 
     def test_permission_mode_popup_colors_missing_group_value_yellow(self) -> None:
@@ -1704,7 +1739,7 @@ class PermissionActionTests(unittest.TestCase):
         app.permission_group_source = "none"
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [27]
+        app.stdscr.getch.side_effect = [ord("s"), 27]
         win = mock.Mock()
 
         with (
@@ -1715,56 +1750,82 @@ class PermissionActionTests(unittest.TestCase):
 
         calls = win.addnstr.call_args_list
         self.assertTrue(
-            any(call.args[2].startswith("<none>") and call.args[4] == 300 for call in calls)
+            any(call.args[2].startswith("not change group") and call.args[4] == 300 for call in calls)
         )
 
-    def test_diff_shortcuts_use_f_and_permission_uses_p(self) -> None:
+    def test_permission_mode_popup_returns_any_readonly_without_group(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("s"), ord("s"), ord("y")]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("any:r", ""))
+
+    def test_diff_shortcuts_use_f_and_permission_uses_p_and_perm_view_uses_shift_p(self) -> None:
         app = self.make_app()
         app._try_preview_diff = mock.Mock()
         app.start_action = mock.Mock()
+        app.permission_view = "badge"
+        app.message = ""
 
         app.handle_key(ord("f"))
         app.handle_key(ord("F"))
         app.handle_key(ord("p"))
+        app.handle_key(ord("P"))
 
         app._try_preview_diff.assert_has_calls(
             [mock.call(), mock.call(external=True)]
         )
         app.start_action.assert_called_once_with("permission")
+        self.assertEqual(app.permission_view, "owner")
+        self.assertEqual(app.message, "PERM column: owner")
 
 
 class RemotePermissionCommandTests(unittest.TestCase):
-    def test_permission_command_with_group_chgrp_and_uses_shared_rules(self) -> None:
+    def test_permission_command_with_group_uses_two_dimensional_rules(self) -> None:
         command = tui.build_remote_permission_command(
             "/root path",
             ["dir one"],
-            "rdo",
-            "shared team",
+            "grp:w",
+            "asset team",
         )
 
         self.assertIn("cd '/root path'", command)
         self.assertIn("trap 'exit 130' INT TERM HUP", command)
-        self.assertIn("chgrp -R 'shared team' 'dir one'", command)
-        self.assertIn("chmod u=rwx,go=rx,g+s", command)
-        self.assertIn("chmod u=rw,go=r", command)
+        self.assertIn("find -L 'dir one' ! -group 'asset team' -exec chgrp 'asset team' {} +", command)
+        self.assertIn("chmod u+rwx,g+rwx,o-rwx,g+s", command)
+        self.assertIn("chmod u+rw,g+rw,o-rwx", command)
 
-    def test_permission_command_without_group_uses_safe_public_fallback(self) -> None:
+    def test_permission_command_any_scope_does_not_chgrp(self) -> None:
         command = tui.build_remote_permission_command(
             "/remote",
             ["staging"],
-            "pub",
-            "",
+            "any:r",
+            "asset_team",
         )
 
         self.assertNotIn("chgrp", command)
-        self.assertIn("chmod ug=rwx,o=rx", command)
-        self.assertIn("chmod ug=rw,o=r", command)
+        self.assertIn("chmod u+rwx,go+rx,go-w,g+s", command)
+        self.assertIn("chmod u+rw,go+r,go-w", command)
+
+    def test_permission_command_rejects_old_modes(self) -> None:
+        with self.assertRaises(ValueError):
+            tui.build_remote_permission_command("/remote", ["staging"], "pub", "")
 
 
 class RemotePermissionsScriptTests(unittest.TestCase):
-    def test_public_mode_allows_group_write_and_other_read_only(self) -> None:
+    def test_grp_w_mode_allows_group_write_and_sets_directory_inheritance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "public"
+            target = Path(tmp) / "group"
             child_file = target / "data.txt"
             target.mkdir()
             child_file.write_text("shared\n")
@@ -1777,7 +1838,7 @@ class RemotePermissionsScriptTests(unittest.TestCase):
                     "setup_remote_permissions.sh",
                     "--group",
                     target.group(),
-                    "pub",
+                    "grp:w",
                     str(target),
                 ],
                 check=True,
@@ -1788,13 +1849,13 @@ class RemotePermissionsScriptTests(unittest.TestCase):
 
             dir_mode = target.stat().st_mode
             file_mode = child_file.stat().st_mode
-            self.assertEqual(dir_mode & 0o777, 0o775)
+            self.assertEqual(dir_mode & 0o777, 0o770)
             self.assertEqual(dir_mode & 0o2000, 0o2000)
-            self.assertEqual(file_mode & 0o777, 0o664)
+            self.assertEqual(file_mode & 0o777, 0o660)
 
-    def test_rdo_mode_sets_exact_read_only_permissions(self) -> None:
+    def test_any_r_mode_allows_everyone_to_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "rdo"
+            target = Path(tmp) / "any"
             child_file = target / "data.txt"
             target.mkdir()
             child_file.write_text("release\n")
@@ -1807,7 +1868,7 @@ class RemotePermissionsScriptTests(unittest.TestCase):
                     "setup_remote_permissions.sh",
                     "--group",
                     target.group(),
-                    "rdo",
+                    "any:r",
                     str(target),
                 ],
                 check=True,
@@ -1821,6 +1882,31 @@ class RemotePermissionsScriptTests(unittest.TestCase):
             self.assertEqual(dir_mode & 0o777, 0o755)
             self.assertEqual(dir_mode & 0o2000, 0o2000)
             self.assertEqual(file_mode & 0o777, 0o644)
+
+    def test_dry_run_respects_preserved_file_execute_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "release"
+            executable = target / "run.sh"
+            target.mkdir()
+            executable.write_text("#!/usr/bin/env bash\n")
+            executable.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "setup_remote_permissions.sh",
+                    "--dry-run",
+                    "-v",
+                    "any:r",
+                    str(target),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        self.assertNotIn("run.sh", result.stdout)
 
     def test_pvt_mode_sets_exact_private_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1853,6 +1939,18 @@ class RemotePermissionsScriptTests(unittest.TestCase):
             self.assertEqual(child_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual(child_dir.stat().st_mode & 0o2000, 0)
             self.assertEqual(child_file.stat().st_mode & 0o777, 0o600)
+
+    def test_old_script_modes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                ["bash", "setup_remote_permissions.sh", "pub", tmp],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown mode", result.stderr + result.stdout)
 
 
 if __name__ == "__main__":

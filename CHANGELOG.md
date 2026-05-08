@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-05-08
+
+### Added
+
+- 权限功能迁移为二维模型：`pvt`、`grp:r`、`grp:w`、`any:r`、`any:w`，并在 permission 弹窗中用 `s/w/g` 分别调整 scope、write 和 selected group。
+- `P` 快捷键循环切换 PERM 列显示：badge、owner、group、mode。
+
+### Changed
+
+- PERM badge 固定为 `[_____]` 宽度，数字 mode、owner、group 视图使用同一列宽；旧 `[rdo]` / `[pub]` 不再作为标准 badge 输出。
+- 远程权限命令使用 symbolic chmod 保留文件执行位语义，目录默认设置 `g+s`，`grp:*` 仅对 group 不一致的条目执行 chgrp。
+- `setup_remote_permissions.sh` 迁移到新权限模式，旧 `rdo` / `pub` 直接报错。
+
 ## [0.2.3] - 2026-05-08
 
 ### Changed

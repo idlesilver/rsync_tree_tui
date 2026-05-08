@@ -31,7 +31,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -469,6 +469,10 @@ class PermissionRequest:
     permission_group: str
 
 
+PERMISSION_VIEWS = ("badge", "owner", "group", "mode")
+PERMISSION_SCOPE_ORDER = ("pvt", "grp", "any")
+
+
 class PermissionActionInterrupted(Exception):
     pass
 
@@ -549,7 +553,7 @@ def parse_args() -> argparse.Namespace:
         "--permission-group",
         default=None,
         help=(
-            "Shared remote group for permission changes "
+            "Optional selected group for grp:* permission changes "
             f"(default: ${PERMISSION_GROUP_ENV} / .env / known config / global config)."
         ),
     )
@@ -1002,7 +1006,7 @@ def list_remote_tree_entries(
     return parse_manifest_output(output)
 
 
-def build_remote_owner_preflight_command(
+def build_remote_permission_preflight_command(
     remote_root: str,
     rel_path: str,
     owner: str,
@@ -1015,19 +1019,25 @@ def build_remote_owner_preflight_command(
     )
 
 
-def permission_chmod_modes(mode: str, *, has_group: bool) -> tuple[str, str]:
-    if mode == "rdo":
-        return (
-            "u=rwx,go=rx,g+s" if has_group else "u=rwx,go=rx",
-            "u=rw,go=r",
-        )
-    if mode == "pub":
-        return (
-            "ug=rwx,o=rx,g+s" if has_group else "ug=rwx,o=rx",
-            "ug=rw,o=r",
-        )
+def build_remote_owner_preflight_command(
+    remote_root: str,
+    rel_path: str,
+    owner: str,
+) -> str:
+    return build_remote_permission_preflight_command(remote_root, rel_path, owner)
+
+
+def permission_chmod_modes(mode: str) -> tuple[str, str]:
     if mode == "pvt":
-        return ("u=rwx,go-rwx,g-s", "u=rw,go-rwx")
+        return ("u+rwx,go-rwx,g-s", "u+rw,go-rwx")
+    if mode == "grp:r":
+        return ("u+rwx,g+rx,g-w,o-rwx,g+s", "u+rw,g+r,g-w,o-rwx")
+    if mode == "grp:w":
+        return ("u+rwx,g+rwx,o-rwx,g+s", "u+rw,g+rw,o-rwx")
+    if mode == "any:r":
+        return ("u+rwx,go+rx,go-w,g+s", "u+rw,go+r,go-w")
+    if mode == "any:w":
+        return ("u+rwx,go+rwx,g+s", "u+rw,go+rw")
     raise ValueError(f"Invalid permission mode: {mode}")
 
 
@@ -1037,13 +1047,15 @@ def build_remote_permission_command(
     mode: str,
     permission_group: str = "",
 ) -> str:
-    dir_mode, file_mode = permission_chmod_modes(mode, has_group=bool(permission_group))
+    dir_mode, file_mode = permission_chmod_modes(mode)
     commands = ["set -e", "trap 'exit 130' INT TERM HUP", f"cd {shlex.quote(remote_root)}"]
     for rel_path in rel_paths:
         quoted_path = shlex.quote(rel_path)
-        if permission_group:
+        if mode.startswith("grp:") and permission_group:
+            quoted_group = shlex.quote(permission_group)
             commands.append(
-                f"chgrp -R {shlex.quote(permission_group)} {quoted_path} 2>/dev/null || true"
+                f"find -L {quoted_path} ! -group {quoted_group} "
+                f"-exec chgrp {quoted_group} {{}} +"
             )
         commands.append(
             f"find -L {quoted_path} -type d -exec chmod {shlex.quote(dir_mode)} {{}} +"
@@ -1052,6 +1064,33 @@ def build_remote_permission_command(
             f"find -L {quoted_path} -type f -exec chmod {shlex.quote(file_mode)} {{}} +"
         )
     return "; ".join(commands)
+
+
+def permission_mode_from_parts(scope: str, writable: bool) -> str:
+    if scope == "pvt":
+        return "pvt"
+    if scope in {"grp", "any"}:
+        return f"{scope}:{'w' if writable else 'r'}"
+    raise ValueError(f"Invalid permission scope: {scope}")
+
+
+def permission_result_lines(mode: str, permission_group: str = "") -> list[str]:
+    dir_mode, file_mode = permission_chmod_modes(mode)
+    lines = [f"result: {permission_mode_label(mode)}"]
+    if mode.startswith("grp:") and permission_group:
+        lines.append(f"  chgrp: {permission_group}")
+    lines.append(f"  dirs:  {dir_mode}")
+    lines.append(f"  files: {file_mode}")
+    return lines
+
+
+def permission_mode_label(mode: str) -> str:
+    if mode == "pvt":
+        return "[pvt:-]"
+    if mode in {"grp:r", "grp:w", "any:r", "any:w"}:
+        scope, write = mode.split(":", 1)
+        return f"[{scope}:{write}]"
+    raise ValueError(f"Invalid permission mode: {mode}")
 
 
 def join_rel_path(parent_rel_path: str, child_name: str) -> str:
@@ -1373,37 +1412,115 @@ def path_suffix_for_side(node: TreeNode, side: str) -> str:
     return ""
 
 
+def _fixed_permission_label(value: str) -> str:
+    text = value[:5]
+    pad = 5 - len(text)
+    left = pad // 2
+    right = pad - left
+    if len(text) == 4:
+        left = 0
+        right = 1
+    inner = (" " * left) + text + (" " * right)
+    return f"[{inner}]"
+
+
+def _mode_label(perms: int) -> str:
+    mode = perms & 0o7777
+    text = f"{mode:o}" if mode > 0o777 else f"{mode & 0o777:03o}"
+    return _fixed_permission_label(text)
+
+
 def remote_permission_badge(entry: EntryMeta) -> str:
     """Return a short access badge for remote files and directories."""
     mode = entry.perms & 0o777
+    special = entry.perms & 0o7000
+    if entry.entry_type == EntryType.DIRECTORY and special not in (0, 0o2000):
+        return _mode_label(entry.perms)
+
     if entry.entry_type == EntryType.DIRECTORY:
         if mode == 0o700:
-            return "[pvt]"
+            return "[pvt:-]"
+        if mode == 0o750:
+            return "[grp:r]"
+        if mode == 0o770:
+            return "[grp:w]"
         if mode == 0o755:
-            return "[rdo]"
-        if mode == 0o775:
-            return "[pub]"
+            return "[any:r]"
+        if mode == 0o777:
+            return "[any:w]"
     else:
+        if special:
+            return _mode_label(entry.perms)
         if mode == 0o600:
-            return "[pvt]"
+            return "[pvt:-]"
+        if mode == 0o640:
+            return "[grp:r]"
+        if mode == 0o660:
+            return "[grp:w]"
         if mode == 0o644:
-            return "[rdo]"
-        if mode == 0o664:
-            return "[pub]"
-    return f"[{mode:03o}]"
+            return "[any:r]"
+        if mode == 0o666:
+            return "[any:w]"
+    return _mode_label(entry.perms)
+
+
+def remote_permission_label(entry: EntryMeta | None, view: str) -> str:
+    if entry is None:
+        return "[     ]"
+    if view == "badge":
+        return remote_permission_badge(entry)
+    if view == "owner":
+        return _fixed_permission_label(entry.owner) if entry.owner else "[     ]"
+    if view == "group":
+        return _fixed_permission_label(entry.group) if entry.group else "[     ]"
+    if view == "mode":
+        return _mode_label(entry.perms)
+    raise ValueError(f"Invalid permission view: {view}")
 
 
 def badge_color_pair(entry: EntryMeta | None) -> int:
     if entry is None:
         return 0
     badge = remote_permission_badge(entry)
-    if badge == "[pvt]":
+    if badge == "[pvt:-]":
         return 6
-    if badge == "[pub]":
-        return 7
-    if badge == "[rdo]":
-        return 8
+    if badge.startswith("[grp:"):
+        return 5
+    if badge.startswith("[any:"):
+        return 4
     return 9
+
+
+def permission_view_color_pair(view: str, entry: EntryMeta | None) -> int:
+    if entry is None:
+        return 0
+    if view == "badge":
+        return badge_color_pair(entry)
+    if view == "owner":
+        return 4
+    if view == "group":
+        return 5
+    if view == "mode":
+        return 9
+    return 0
+
+
+def permission_badge_color_segments(label: str) -> list[tuple[str, int, bool]]:
+    if label == "[pvt:-]":
+        return [(label, 6, True)]
+    if label in {"[grp:r]", "[grp:w]", "[any:r]", "[any:w]"}:
+        scope = label[1:4]
+        write = label[5]
+        scope_pair = 5 if scope == "grp" else 4
+        write_pair = 8 if write == "r" else 1
+        return [
+            ("[", 0, False),
+            (scope, scope_pair, False),
+            (":", 0, False),
+            (write, write_pair, False),
+            ("]", 0, False),
+        ]
+    return [(label, 9, False)]
 
 
 _TREE_MID   = "├─ "
@@ -1619,6 +1736,7 @@ class SyncApp:
         self.diff_viewers = config.diff_viewers
         self.permission_group = config.permission_group
         self.permission_group_source = config.permission_group_source
+        self.permission_view = "badge"
         self._interrupt_requested: bool = False
 
         self.refresh_manifests(initial_load=True)
@@ -1713,7 +1831,7 @@ class SyncApp:
         if not self.remote_user:
             return "(remote user unknown)"
         for rel_path in rel_paths:
-            remote_command = build_remote_owner_preflight_command(
+            remote_command = build_remote_permission_preflight_command(
                 self.remote_root,
                 rel_path,
                 self.remote_user,
@@ -2054,9 +2172,9 @@ class SyncApp:
         curses.init_pair(3, curses.COLOR_YELLOW, -1)  # help text / local-only
         curses.init_pair(4, curses.COLOR_CYAN, -1)  # remote-only
         curses.init_pair(5, curses.COLOR_GREEN,  -1)   # both exist, confirmed same
-        curses.init_pair(6, curses.COLOR_WHITE, -1)  # [pvt] dimmed gray
-        curses.init_pair(7, curses.COLOR_GREEN, -1)  # [pub]
-        curses.init_pair(8, curses.COLOR_YELLOW, -1)  # [rdo] (brown-ish)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)  # [pvt:-] dimmed gray
+        curses.init_pair(7, curses.COLOR_GREEN, -1)  # reserved permission green
+        curses.init_pair(8, curses.COLOR_YELLOW, -1)  # readonly / warning
         curses.init_pair(9, curses.COLOR_MAGENTA, -1)  # numeric permission
 
         try:
@@ -2245,20 +2363,41 @@ class SyncApp:
 
             badge_text = ""
             badge_attr = row_attr
+            badge_segments: list[tuple[str, int, bool]] | None = None
             if node.right_entry is not None:
-                badge_text = remote_permission_badge(node.right_entry)
-                badge_attr = curses.color_pair(badge_color_pair(node.right_entry))
-                if badge_text == "[pvt]":
-                    badge_attr |= curses.A_DIM
-                if is_cursor_row:
-                    badge_attr |= curses.A_REVERSE
-            stdscr.addnstr(
-                screen_row,
-                selection_width + panel_width,
-                badge_text.center(badge_width),
-                badge_width,
-                badge_attr,
-            )
+                view = getattr(self, "permission_view", "badge")
+                badge_text = remote_permission_label(node.right_entry, view)
+                if view == "badge":
+                    badge_segments = permission_badge_color_segments(badge_text)
+                else:
+                    badge_attr = curses.color_pair(permission_view_color_pair(view, node.right_entry))
+                    if is_cursor_row:
+                        badge_attr |= curses.A_REVERSE
+            badge_x = selection_width + panel_width
+            if badge_segments is not None:
+                segment_x = badge_x
+                for segment_text, pair, dim in badge_segments:
+                    segment_attr = curses.color_pair(pair) if pair else row_attr
+                    if dim:
+                        segment_attr |= curses.A_DIM
+                    if is_cursor_row:
+                        segment_attr |= curses.A_REVERSE
+                    stdscr.addnstr(
+                        screen_row,
+                        segment_x,
+                        segment_text,
+                        max(badge_width - (segment_x - badge_x), 0),
+                        segment_attr,
+                    )
+                    segment_x += len(segment_text)
+            else:
+                stdscr.addnstr(
+                    screen_row,
+                    badge_x,
+                    badge_text,
+                    badge_width,
+                    badge_attr,
+                )
 
             right_attr = row_attr | (curses.A_BOLD if right_exists else 0)
             stdscr.addnstr(
@@ -2279,7 +2418,7 @@ class SyncApp:
             ("d", "Download", ord("d")),
             ("u", "Upload", ord("u")),
             ("f/F", "Diff", ord("f")),
-            ("p", "Permission", ord("p")),
+            ("p/P", "Permission", ord("p")),
             ("c", "Check", ord("c")),
             ("x", "Clear", ord("x")),
             ("r", "Refresh", ord("r")),
@@ -2302,14 +2441,22 @@ class SyncApp:
             x = self._add_footer_text(y, x, f" {label}", max_x, curses.A_NORMAL)
             key_end = x
             if trigger_key is not None and key_end > key_start:
-                self.footer_shortcut_hits.append(
-                    FooterShortcutHit(
-                        y=y,
-                        start_x=key_start,
-                        end_x=key_end,
-                        key=trigger_key,
+                if key_text == "p/P":
+                    self.footer_shortcut_hits.extend(
+                        [
+                            FooterShortcutHit(y=y, start_x=key_start, end_x=key_start + 1, key=ord("p")),
+                            FooterShortcutHit(y=y, start_x=key_start + 2, end_x=key_start + 3, key=ord("P")),
+                        ]
                     )
-                )
+                else:
+                    self.footer_shortcut_hits.append(
+                        FooterShortcutHit(
+                            y=y,
+                            start_x=key_start,
+                            end_x=key_end,
+                            key=trigger_key,
+                        )
+                    )
             if x >= max_x:
                 break
             x = self._add_footer_text(y, x, "  ", max_x, curses.A_NORMAL)
@@ -2697,16 +2844,17 @@ class SyncApp:
                         ],
                     )
                 return
-            mode = self._choose_permission_mode(len(selected_paths))
-            if mode is None:
+            choice = self._choose_permission_mode(len(selected_paths))
+            if choice is None:
                 self.message = "Cancelled permission mode selection."
                 self.pending_action = None
                 self.pending_permission = None
                 return
+            mode, permission_group = choice
             self.pending_permission = PermissionRequest(
                 mode=mode,
                 rel_paths=selected_paths,
-                permission_group=self.permission_group,
+                permission_group=permission_group,
             )
             self.pending_action = "permission"
             self.message = (
@@ -2723,7 +2871,7 @@ class SyncApp:
                 p for p in selected_paths if self._remote_path_writable(p)
             ]
             if not selected_paths:
-                self.message = "No writable remote paths in selection. Check [pub] dirs."
+                self.message = "No writable remote paths in selection. Check [grp:w]/[any:w] dirs."
                 self.pending_action = None
                 return
 
@@ -3174,35 +3322,36 @@ class SyncApp:
             elif key == getattr(curses, "KEY_END", -1):
                 hscroll = max(0, max_line_len - content_w)
 
-    def _choose_permission_mode(self, target_count: int) -> str | None:
-        group_label = "Group:   "
-        group_value = self._permission_group_display()
-        lines = [
-            "Select remote permission mode",
-            "",
-            f"Targets: {target_count} selected remote entries",
-            f"{group_label}{group_value}",
-            "",
-            "1 / r    read-only (rdo)",
-            "2 / v    private  (pvt)",
-            "3 / u    public   (pub)",
-            "",
-            "Esc      cancel",
-        ]
-        key_to_mode = {
-            ord("1"): "rdo",
-            ord("r"): "rdo",
-            ord("R"): "rdo",
-            ord("2"): "pvt",
-            ord("v"): "pvt",
-            ord("V"): "pvt",
-            ord("3"): "pub",
-            ord("u"): "pub",
-            ord("U"): "pub",
-        }
+    def _choose_permission_mode(self, target_count: int) -> tuple[str, str] | None:
+        scope_index = 0
+        writable = False
+        use_selected_group = bool(self.permission_group)
         while True:
             if getattr(self, "_interrupt_requested", False):
                 self._interrupt_requested = False
+            scope = PERMISSION_SCOPE_ORDER[scope_index]
+            mode = permission_mode_from_parts(scope, writable)
+            effective_group = self.permission_group if scope == "grp" and use_selected_group else ""
+            group_value = (
+                self.permission_group
+                if self.permission_group and use_selected_group
+                else "not change group"
+            )
+            write_value = "writable" if writable else "readonly"
+            lines = [
+                "Remote permission",
+                "",
+                f"Targets: {target_count} selected remote entries",
+                "",
+                f"[s] scope:  {scope}",
+                f"[w] write:  {write_value}",
+                f"[g] group:  {group_value}",
+                "",
+                *permission_result_lines(mode, effective_group),
+                "",
+                "y: continue",
+                "Esc: cancel",
+            ]
             self.render()
             height, width = self.stdscr.getmaxyx()
             content_w = min(max((self._text_cell_width(line) for line in lines), default=0), 56)
@@ -3217,22 +3366,39 @@ class SyncApp:
             title_x = max((box_w - self._text_cell_width(title)) // 2, 1)
             self._popup_add_cells(win, 0, title_x, title, box_w - title_x - 1, curses.A_BOLD)
             for row, line in enumerate(lines[: max(box_h - 2, 0)]):
-                if line.startswith(group_label):
-                    self._popup_add_cells(win, row + 1, 2, group_label, box_w - 4)
+                if line.startswith("[w] write:") and scope == "pvt":
+                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4, curses.A_DIM)
+                elif line.startswith("[g] group:"):
+                    prefix = "[g] group:  "
+                    if scope == "grp":
+                        attr = self._permission_group_display_attr() if use_selected_group else curses.color_pair(3)
+                    else:
+                        attr = curses.A_DIM
+                    self._popup_add_cells(win, row + 1, 2, prefix, box_w - 4)
                     self._popup_add_cells(
                         win,
                         row + 1,
-                        2 + len(group_label),
+                        2 + len(prefix),
                         group_value,
-                        box_w - 4 - len(group_label),
-                        self._permission_group_display_attr(),
+                        box_w - 4 - len(prefix),
+                        attr,
                     )
                 else:
                     self._popup_add_cells(win, row + 1, 2, line, box_w - 4)
             win.refresh()
             key = self.stdscr.getch()
-            if key in key_to_mode:
-                return key_to_mode[key]
+            if key in (ord("s"), ord("S")):
+                scope_index = (scope_index + 1) % len(PERMISSION_SCOPE_ORDER)
+                continue
+            if key in (ord("w"), ord("W")):
+                writable = not writable
+                continue
+            if key in (ord("g"), ord("G")):
+                if self.permission_group:
+                    use_selected_group = not use_selected_group
+                continue
+            if key == ord("y"):
+                return mode, effective_group
             if key == 27:
                 return None
 
@@ -3251,7 +3417,8 @@ class SyncApp:
             "u                  Upload selected    (local → remote)",
             "f                  Preview diff in built-in popup (red entries only)",
             "F                  Preview diff with external viewer (vim -d by default)",
-            "p                  Change remote permissions for selected entries",
+            "p                  Configure remote permissions for selected entries",
+            "P                  Cycle PERM column: badge / owner / group / mode",
             "c                  Configure and check selected entries",
             "x                  Clear all selections (with confirmation)",
             "r                  Refresh manifests",
@@ -3269,18 +3436,23 @@ class SyncApp:
             f"  Shows up to {self.pagination_size} items per directory",
             "  '... N more' can be expanded with Right/Enter or click",
             "",
-            "PERM badge (middle column)",
-            "  [pub]            Public: dirs 775, files 664",
-            "  [rdo]            Read-only: dirs 755, files 644",
-            "  [pvt]            Private: dirs 700, files 600",
-            "  [640]            Non-standard numeric mode",
+            "PERM column (middle column)",
+            "  [pvt:-]          Owner only",
+            "  [grp:r]          Owner + group read",
+            "  [grp:w]          Owner + group write",
+            "  [any:r]          Owner + group + other read",
+            "  [any:w]          Owner + group + other write",
+            "  [ 755 ]          Non-standard numeric mode",
             "",
             "Diff preview",
             "  f uses built-in popup with Left/Right horizontal pan",
             "  F uses vim -d by default, or configured diff viewer",
             "",
             "Remote permissions",
-            "  p offers pvt/rdo/pub after owner preflight",
+            "  p opens a two-dimensional permission editor",
+            "  scope: pvt / grp / any",
+            "  write: readonly / writable (ignored for pvt)",
+            "  group: selected group / not change group (grp only)",
             "",
             "Check",
             "  c opens a confirmation line with m/depth/y/n/? controls",
@@ -3560,6 +3732,15 @@ class SyncApp:
             return
         if key == ord("p"):
             self.start_action("permission")
+            return
+        if key == ord("P"):
+            current = getattr(self, "permission_view", "badge")
+            try:
+                current_index = PERMISSION_VIEWS.index(current)
+            except ValueError:
+                current_index = 0
+            self.permission_view = PERMISSION_VIEWS[(current_index + 1) % len(PERMISSION_VIEWS)]
+            self.message = f"PERM column: {self.permission_view}"
             return
         if key == ord("x"):
             self.start_action("clear")
