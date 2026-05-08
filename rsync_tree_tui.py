@@ -31,7 +31,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -2483,26 +2483,32 @@ class SyncApp:
         stdscr.refresh()
 
     def _render_footer_shortcuts(self, y: int, width: int) -> None:
-        shortcuts = [
-            ("Up/Down", "Move", None),
-            ("Left/Right", "Fold", None),
-            ("Space", "Toggle", ord(" ")),
-            ("d", "Download", ord("d")),
-            ("u", "Upload", ord("u")),
-            ("f/F", "Diff", ord("f")),
-            ("p/P", "Permission", ord("p")),
-            ("c", "Check", ord("c")),
-            ("x", "Clear", ord("x")),
-            ("r", "Refresh", ord("r")),
-            ("?", "Help", ord("?")),
-            ("q", "Quit", None),
+        nav_shortcuts = [
+            ("Up/Down", "move", None),
+            ("Left/Right", "fold", None),
+            ("Space", "toggle", ord(" ")),
+        ]
+        action_shortcuts = [
+            ("d", "download", ord("d")),
+            ("u", "upload", ord("u")),
+            ("f/F", "diff", ord("f")),
+            ("p/P", "permission", ord("p")),
+            ("c", "check", ord("c")),
+            ("x", "clear", ord("x")),
+            ("r", "refresh", ord("r")),
+            ("?", "helper", ord("?")),
+            ("q", "quit", None),
         ]
         self.footer_shortcut_hits = []
         if y < 0 or width <= 1:
             return
 
-        x = 0
         max_x = width - 1
+        shortcuts = self._fit_footer_shortcuts(nav_shortcuts + action_shortcuts, max_x)
+        if len(shortcuts) < 3:
+            shortcuts = self._fit_footer_shortcuts(action_shortcuts, max_x)
+
+        x = 0
         for key_text, label, trigger_key in shortcuts:
             if x >= max_x:
                 break
@@ -2510,7 +2516,7 @@ class SyncApp:
             x = self._add_footer_text(y, x, key_text, max_x, curses.color_pair(3))
             if x >= max_x:
                 break
-            x = self._add_footer_text(y, x, f" {label}", max_x, curses.A_NORMAL)
+            x = self._add_footer_text(y, x, f"={label}", max_x, curses.A_NORMAL)
             key_end = x
             if trigger_key is not None and key_end > key_start:
                 if key_text == "p/P":
@@ -2531,7 +2537,37 @@ class SyncApp:
                     )
             if x >= max_x:
                 break
-            x = self._add_footer_text(y, x, "  ", max_x, curses.A_NORMAL)
+            x = self._add_footer_text(y, x, " ", max_x, curses.A_NORMAL)
+
+    def _fit_footer_shortcuts(
+        self,
+        shortcuts: list[tuple[str, str, int | None]],
+        max_width: int,
+    ) -> list[tuple[str, str, int | None]]:
+        fitted = list(shortcuts)
+        while fitted and self._footer_shortcuts_width(fitted) > max_width:
+            removable_index = 0
+            if fitted[0][0] == "?":
+                removable_index = 1
+            if removable_index >= len(fitted):
+                break
+            fitted.pop(removable_index)
+        if not any(key_text == "?" for key_text, _label, _trigger in fitted):
+            helper = next((item for item in shortcuts if item[0] == "?"), None)
+            if helper is not None:
+                fitted.append(helper)
+                while len(fitted) > 1 and self._footer_shortcuts_width(fitted) > max_width:
+                    removable_index = 0 if fitted[0][0] != "?" else 1
+                    if removable_index >= len(fitted):
+                        break
+                    fitted.pop(removable_index)
+        return fitted
+
+    def _footer_shortcuts_width(self, shortcuts: list[tuple[str, str, int | None]]) -> int:
+        return sum(len(key_text) + 1 + len(label) for key_text, label, _trigger in shortcuts) + max(
+            len(shortcuts) - 1,
+            0,
+        )
 
     def _add_footer_text(self, y: int, x: int, text: str, max_x: int, attr: int) -> int:
         remaining = max_x - x
@@ -2664,10 +2700,10 @@ class SyncApp:
                 return
 
         if mouse_has_button(bstate, "BUTTON4_PRESSED"):
-            self.move_cursor_by(-3)
+            self.move_cursor_by(-1)
             return
         if mouse_has_button(bstate, "BUTTON5_PRESSED"):
-            self.move_cursor_by(3)
+            self.move_cursor_by(1)
             return
 
         if not mouse_is_primary_click(bstate):

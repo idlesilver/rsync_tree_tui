@@ -48,7 +48,7 @@ set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
-VERSION="0.2.5"
+VERSION="0.2.6"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/setup_remote_permissions.sh"
 
 # Edit this line to persist a site-specific default, or pass --group.
