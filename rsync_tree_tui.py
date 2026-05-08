@@ -31,7 +31,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -1046,23 +1046,70 @@ def build_remote_permission_command(
     rel_paths: list[str],
     mode: str,
     permission_group: str = "",
+    *,
+    owner: str = "",
 ) -> str:
     dir_mode, file_mode = permission_chmod_modes(mode)
-    commands = ["set -e", "trap 'exit 130' INT TERM HUP", f"cd {shlex.quote(remote_root)}"]
-    for rel_path in rel_paths:
-        quoted_path = shlex.quote(rel_path)
-        if mode.startswith("grp:") and permission_group:
-            quoted_group = shlex.quote(permission_group)
-            commands.append(
-                f"find -L {quoted_path} ! -group {quoted_group} "
-                f"-exec chgrp {quoted_group} {{}} +"
-            )
+    if not rel_paths:
+        raise ValueError("No permission paths provided")
+
+    quoted_paths = " ".join(shlex.quote(rel_path) for rel_path in rel_paths)
+    quoted_owner = shlex.quote(owner) if owner else "$(id -un)"
+    commands = [
+        "failed=0",
+        f"owner={quoted_owner}",
+        "owner_tmp=$(mktemp)",
+        "owner_err=$(mktemp)",
+        "cleanup() { rm -f \"$owner_tmp\" \"$owner_err\"; }",
+        "trap 'cleanup; exit 130' INT TERM HUP",
+        "trap cleanup EXIT",
+        f"cd {shlex.quote(remote_root)} || exit 1",
+        "echo '[1/3] Collecting skipped non-owned owners...'",
+        (
+            f"find -L {quoted_paths} ! -user {shlex.quote(owner) if owner else '\"$owner\"'} "
+            "-printf '%u\\n' > \"$owner_tmp\" 2> \"$owner_err\" || true"
+        ),
+        "echo 'Skipped non-owned owners:'",
+        (
+            "if [ -s \"$owner_tmp\" ]; then "
+            "sort \"$owner_tmp\" | uniq -c | sort -rn | "
+            "while read -r count owner_name; do printf '  %-20s %s\\n' \"$owner_name\" \"$count\"; done; "
+            "else echo '  (none)'; fi"
+        ),
+        (
+            "if [ -s \"$owner_err\" ]; then "
+            "echo 'Warnings:'; sed 's/^/  /' \"$owner_err\"; fi"
+        ),
+        "echo '[2/3] Applying selected group to owned entries...'",
+    ]
+    owner_filter = f"-user {shlex.quote(owner)}" if owner else '-user "$owner"'
+    if mode.startswith("grp:") and permission_group:
+        quoted_group = shlex.quote(permission_group)
         commands.append(
-            f"find -L {quoted_path} -type d -exec chmod {shlex.quote(dir_mode)} {{}} +"
+            f"find -L {quoted_paths} {owner_filter} ! -group {quoted_group} "
+            f"-exec chgrp {quoted_group} {{}} + || failed=1"
         )
-        commands.append(
-            f"find -L {quoted_path} -type f -exec chmod {shlex.quote(file_mode)} {{}} +"
-        )
+    elif mode.startswith("grp:"):
+        commands.append("echo 'No selected group; skipping chgrp.'")
+    else:
+        commands.append(f"echo 'Mode {mode} does not use selected group; skipping chgrp.'")
+    commands.extend(
+        [
+            "echo '[3/3] Applying chmod to owned directories/files...'",
+            (
+                f"find -L {quoted_paths} {owner_filter} -type d "
+                f"-exec chmod {shlex.quote(dir_mode)} {{}} + || failed=1"
+            ),
+            (
+                f"find -L {quoted_paths} {owner_filter} -type f "
+                f"-exec chmod {shlex.quote(file_mode)} {{}} + || failed=1"
+            ),
+            "echo 'Summary:'",
+            "if [ \"$failed\" -eq 0 ]; then echo '  status: success'; else echo '  status: partial failed'; fi",
+            f"echo '  mode: {mode}'",
+            "exit \"$failed\"",
+        ]
+    )
     return "; ".join(commands)
 
 
@@ -1091,6 +1138,31 @@ def permission_mode_label(mode: str) -> str:
         scope, write = mode.split(":", 1)
         return f"[{scope}:{write}]"
     raise ValueError(f"Invalid permission mode: {mode}")
+
+
+def parse_skipped_owner_line(line: str) -> tuple[str, int] | None:
+    stripped = line.strip()
+    if not stripped or stripped == "(none)":
+        return None
+    owner, sep, count_text = stripped.rpartition(" ")
+    owner = owner.strip()
+    if not sep or not owner:
+        return None
+    try:
+        count = int(count_text)
+    except ValueError:
+        return None
+    return owner, count
+
+
+def format_skipped_owner_summary(owner_counts: dict[str, int]) -> str:
+    if not owner_counts:
+        return ""
+    parts = [
+        f"{owner}={count}"
+        for owner, count in sorted(owner_counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    return "Skipped non-owned: " + ", ".join(parts) + "."
 
 
 def join_rel_path(parent_rel_path: str, child_name: str) -> str:
@@ -2817,33 +2889,6 @@ class SyncApp:
                 self.pending_action = None
                 self.pending_permission = None
                 return
-            self.message = (
-                f"Checking ownership for {len(selected_paths)} selected remote entries..."
-            )
-            if hasattr(self, "stdscr"):
-                self.render()
-            try:
-                first_non_owner = self._first_remote_non_owner_path(selected_paths)
-            except PermissionActionInterrupted:
-                self.message = "Permission action interrupted. Press r to refresh."
-                self.pending_action = None
-                self.pending_permission = None
-                return
-            if first_non_owner is not None:
-                self.message = f"Cannot change permission: not owner of {first_non_owner}."
-                self.pending_action = None
-                self.pending_permission = None
-                if hasattr(self, "stdscr"):
-                    self._show_popup(
-                        "Permission Denied",
-                        [
-                            "Permission change requires the SSH user to own",
-                            "every selected remote path and its descendants.",
-                            "",
-                            f"First blocked path: {first_non_owner}",
-                        ],
-                    )
-                return
             choice = self._choose_permission_mode(len(selected_paths))
             if choice is None:
                 self.message = "Cancelled permission mode selection."
@@ -2950,25 +2995,71 @@ class SyncApp:
             request.rel_paths,
             request.mode,
             request.permission_group,
+            owner=self.remote_user,
         )
-        result, interrupted = self._run_interruptible_subprocess(
-            ["ssh", *self._ssh_opts(), self.remote_target, remote_command],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if interrupted:
-            self.message = "Permission action interrupted. Press r to refresh."
-            return
-        if result.returncode != 0:
-            err = result.stderr.strip() or result.stdout.strip() or "remote command failed"
-            self.message = f"Permission change failed: {err.splitlines()[0]}"
-            return
+        command = ["ssh", *self._ssh_opts(), self.remote_target, remote_command]
+        self.suspend_tui()
+        returncode = 1
+        skipped_owner_counts: dict[str, int] = {}
+        try:
+            group_display = request.permission_group or "not change group"
+            print(f"Running permission: {request.mode}")
+            print(f"Remote: {self.remote_spec}")
+            print(f"Targets: {len(request.rel_paths)} selected paths")
+            print(f"Group: {group_display}")
+            print()
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            in_skipped_owner_section = False
+            if process.stdout is not None:
+                for output_line in process.stdout:
+                    print(output_line, end="")
+                    line_text = output_line.rstrip("\n")
+                    if line_text == "Skipped non-owned owners:":
+                        in_skipped_owner_section = True
+                        continue
+                    if in_skipped_owner_section:
+                        if not output_line.startswith("  "):
+                            in_skipped_owner_section = False
+                            continue
+                        parsed_owner = parse_skipped_owner_line(output_line)
+                        if parsed_owner is not None:
+                            owner_name, owner_count = parsed_owner
+                            skipped_owner_counts[owner_name] = (
+                                skipped_owner_counts.get(owner_name, 0) + owner_count
+                            )
+            returncode = process.wait()
+            if returncode == 0:
+                input("Permission completed. Press Enter to return to the TUI...")
+            elif returncode in (130, -signal.SIGINT):
+                input("Permission interrupted. Press Enter to return to the TUI...")
+            else:
+                input("Permission completed with warnings. Press Enter to return to the TUI...")
+        finally:
+            self.resume_tui()
 
-        self.refresh_manifests(initial_load=False)
-        self.message = (
-            f"Applied permission {request.mode} to {len(request.rel_paths)} remote entries."
-        )
+        skipped_summary = format_skipped_owner_summary(skipped_owner_counts)
+        if returncode == 0:
+            self.refresh_manifests(initial_load=False)
+            self.message = "Permission completed and refreshed."
+            if skipped_summary:
+                self.message = f"{self.message} {skipped_summary}"
+        elif returncode in (130, -signal.SIGINT):
+            self._interrupt_requested = False
+            self.message = "Permission interrupted. Press r to refresh."
+            if skipped_summary:
+                self.message = f"Permission interrupted. {skipped_summary} Press r to refresh."
+        else:
+            self.message = "Permission completed with warnings. Press r to refresh."
+            if skipped_summary:
+                self.message = (
+                    f"Permission completed with warnings. {skipped_summary} Press r to refresh."
+                )
 
     def _run_interruptible_subprocess(
         self,

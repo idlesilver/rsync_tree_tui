@@ -61,7 +61,7 @@ Badge 只按新模型精确匹配；不再输出旧 `[rdo]` / `[pub]`。
 
 ## 修改规则
 
-TUI 中按 `p` 或运行 `setup_remote_permissions.sh` 修改权限时，先做 permission preflight：当前实现要求选中远端路径及其递归内容都属于当前 SSH 用户，否则拒绝执行。
+TUI 中按 `p` 或运行 `setup_remote_permissions.sh` 修改权限时，只修改 owner 是当前 SSH 用户（脚本中为 `--owner` / `OWNER`）的远端条目。非 owner 条目不会被修改，会在前台日志中按 owner=count 汇总。
 
 目录默认设置 `g+s` 继承 group，`pvt` 明确移除 `g+s`。文件使用 symbolic chmod，避免无意义地新增执行权限。
 
@@ -73,13 +73,15 @@ TUI 中按 `p` 或运行 `setup_remote_permissions.sh` 修改权限时，先做 
 | `any:r` | `u+rwx,go+rx,go-w,g+s` | `u+rw,go+r,go-w` |
 | `any:w` | `u+rwx,go+rwx,g+s` | `u+rw,go+rw` |
 
-`selected group` 只对 `grp:*` 生效：
+`selected group` 只对 `grp:*` 生效，并且只作用于 owner 匹配的条目：
 
 ```text
-find -L <path> ! -group <group> -exec chgrp <group> {} +
+find -L <path> -user <owner> ! -group <group> -exec chgrp <group> {} +
 ```
 
-如果 group 已经正确，不重复 chgrp。任何 `chgrp` 或 `chmod` 失败都会使本次 permission 操作失败；中断或失败后应按 `r` 刷新，查看远端真实状态。
+如果 group 已经正确，不重复 chgrp。执行使用 bulk `find -exec ... {} +`，会遍历所有可进入目录，对 owner 匹配的文件和目录执行操作。统计阶段会显示 visible non-owned 条目的 owner；如果遇到不可进入的 non-owned 私有目录，只能统计到该目录本身的 owner，无法看到其子树。
+
+执行阶段的 `find` / `chgrp` / `chmod` 失败会使本次 permission 显示为 completed with warnings；Ctrl+C 显示 interrupted。成功后 TUI 自动 refresh；warning 或中断后应按 `r` 刷新，查看远端真实状态。
 
 ## 弹窗交互
 
@@ -106,3 +108,10 @@ any:w
 ```
 
 旧 `rdo` / `pub` 不兼容，直接报错。
+
+脚本默认 `OWNER="$(id -un)"`，也可以传入：
+
+```text
+--owner USER
+OWNER=USER
+```

@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-05-08
+
+### Changed
+
+- permission 执行改为前台日志界面，实时显示阶段进度、skipped non-owned owners、warnings 和 summary。
+- permission 不再做 owner-only preflight；执行阶段只修改当前 SSH 用户 owner 的条目，非 owner 条目按 owner=count 统计并跳过。
+- permission 返回 TUI 后会在状态栏继续显示 skipped non-owned owner=count 汇总。
+- `setup_remote_permissions.sh` 增加 `--owner` / `OWNER`，并同步只处理指定 owner 的条目。
+
 ## [0.2.4] - 2026-05-08
 
 ### Added

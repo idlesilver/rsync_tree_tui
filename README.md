@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.2.4`
+当前版本：`v0.2.5`
 
 ## 运行
 
@@ -102,9 +102,9 @@ RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
 
 ## 远程权限辅助脚本
 
-TUI 中按 `p` 可以直接对选中的远端文件或目录递归应用权限模式。执行前会检查选中路径及其递归内容是否都属于当前 SSH 用户；发现非 owner 路径会拒绝执行。选择模式后仍需按 `y` 二次确认。`setup_remote_permissions.sh` 提供同样的权限规则，可作为独立远程端工具使用。
+TUI 中按 `p` 可以直接对选中的远端文件或目录递归应用权限模式。权限执行只修改 owner 是当前 SSH 用户的远端条目；非 owner 条目会跳过，并在前台日志中按 owner=count 汇总，便于通知同事。选择模式后仍需按 `y` 二次确认。`setup_remote_permissions.sh` 提供同样的权限规则，可作为独立远程端工具使用。
 
-权限 owner 检查和远程权限修改过程中可以用 Ctrl+C 中断；中断后应按 `r` 刷新，重新读取远端真实权限状态。权限模式弹窗使用 Esc 取消。
+远程权限修改会像 upload/download 一样临时进入前台日志界面，实时显示阶段进度、skipped owners、warnings 和 summary；结束后按 Enter 回到 TUI。执行过程中可以用 Ctrl+C 中断；中断或 warning 后应按 `r` 刷新，重新读取远端真实权限状态。权限模式弹窗使用 Esc 取消。
 
 权限模型分为 scope 和 write 两个维度：
 
@@ -126,7 +126,7 @@ TUI 在 LOCAL 和 REMOTE 中间使用独立 `PERM` 列显示远端权限。按 `
 scp setup_remote_permissions.sh user@host:/tmp/setup_remote_permissions.sh
 
 ssh user@host 'bash /tmp/setup_remote_permissions.sh --dry-run --group asset_team grp:w /remote/storage/staging'
-ssh user@host 'bash /tmp/setup_remote_permissions.sh --group asset_team grp:w /remote/storage/staging'
+ssh user@host 'bash /tmp/setup_remote_permissions.sh --group asset_team --owner chenhaozhe grp:w /remote/storage/staging'
 ```
 
 常用模式：
@@ -142,7 +142,7 @@ bash /tmp/setup_remote_permissions.sh --group asset_team grp:w /remote/storage/d
 bash /tmp/setup_remote_permissions.sh pvt /remote/storage/wip_secret
 ```
 
-脚本默认不修改 group；可以通过环境变量 `GROUP` 或 `--group` 指定 selected group。需要持久化站点默认值时，直接编辑脚本开头的 `GROUP="${GROUP:-}"`。
+脚本默认不修改 group，且只处理运行用户 owner 的条目；可以通过环境变量 `GROUP` / `OWNER` 或 `--group` / `--owner` 覆盖。需要持久化站点默认值时，直接编辑脚本开头的 `GROUP="${GROUP:-}"` 或 `OWNER="${OWNER:-$(id -un)}"`。
 
 `pvt` 会让目标目录在父目录中仍可被看到，并显示为 `[pvt:-]`；目标目录和所有子项会移除 group/others 权限，因此其他人看不到内部文件。
 
@@ -239,6 +239,7 @@ q                  退出
 当前发布 tag：
 
 ```text
+v0.2.5
 v0.2.4
 v0.2.3
 v0.2.2

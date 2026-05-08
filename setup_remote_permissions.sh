@@ -18,6 +18,7 @@
 #
 # Options:
 #   --group G   Selected group name for grp:* modes.
+#   --owner U   Only process entries owned by U (default: $OWNER or current user).
 #   --dry-run   Show how many entries would change, without modifying anything.
 #   -v          Verbose: list every entry whose permissions will be/were changed.
 #   --update    Download latest version from GitHub and replace local file.
@@ -47,11 +48,12 @@ set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
-VERSION="0.2.4"
+VERSION="0.2.5"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/setup_remote_permissions.sh"
 
 # Edit this line to persist a site-specific default, or pass --group.
 GROUP="${GROUP:-}"
+OWNER="${OWNER:-$(id -un)}"
 
 # ─────────────────────────── arg parsing ────────────────────────────────── #
 
@@ -138,6 +140,15 @@ while [[ $# -gt 0 ]]; do
             GROUP="${1#*=}"
             shift
             ;;
+        --owner)
+            [[ $# -lt 2 ]] && { echo "ERROR: --owner requires a value" >&2; usage; }
+            OWNER="$2"
+            shift 2
+            ;;
+        --owner=*)
+            OWNER="${1#*=}"
+            shift
+            ;;
         --dry-run)        DRY_RUN=1; shift ;;
         -v|--verbose)     VERBOSE=1; shift ;;
         --help|-h)        usage ;;
@@ -166,6 +177,7 @@ fi
 
 [[ -z "$MODE"            ]] && { echo "ERROR: mode is required (pvt|grp:r|grp:w|any:r|any:w)"; echo; usage; }
 [[ ${#TARGETS[@]} -eq 0 ]] && { echo "ERROR: at least one path is required"; echo; usage; }
+[[ -z "$OWNER"           ]] && { echo "ERROR: owner must not be empty"; echo; usage; }
 
 # ─────────────────────────── helpers ────────────────────────────────────── #
 
@@ -186,7 +198,7 @@ find_permission_mismatches() {
     local target="$1"
     local type="$2"
     local wanted_mode="$3"
-    find -L "$target" -type "$type" -exec bash -c '
+    find -L "$target" -user "$OWNER" -type "$type" -exec bash -c '
         wanted_mode="$0"
         entry_type="$1"
         shift
@@ -233,6 +245,28 @@ find_permission_mismatches() {
             fi
         done
     ' "$wanted_mode" "$type" {} +
+}
+
+show_skipped_owners() {
+    local target="$1"
+    local owner_tmp owner_err
+    owner_tmp="$(mktemp)"
+    owner_err="$(mktemp)"
+    find -L "$target" ! -user "$OWNER" -printf '%u\n' >"$owner_tmp" 2>"$owner_err" || true
+    echo "Skipped non-owned owners:"
+    if [[ -s "$owner_tmp" ]]; then
+        sort "$owner_tmp" | uniq -c | sort -rn |
+            while read -r count owner_name; do
+                printf "  %-20s %s\n" "$owner_name" "$count"
+            done
+    else
+        echo "  (none)"
+    fi
+    if [[ -s "$owner_err" ]]; then
+        echo "Warnings:"
+        sed 's/^/  /' "$owner_err"
+    fi
+    rm -f "$owner_tmp" "$owner_err"
 }
 
 # find predicates: return entries whose permissions DO NOT yet match the target
@@ -290,6 +324,8 @@ fix_target() {
     fi
 
     echo -e "${BOLD}[$MODE] $target${RESET}"
+    echo "[1/3] Collecting skipped non-owned owners..."
+    show_skipped_owners "$target"
 
     # ── dry-run: count and optionally list ─────────────────────────────── #
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -324,32 +360,45 @@ fix_target() {
     changed_dirs=$(echo -n  "$dir_list"  | grep -c . || true)
     changed_files=$(echo -n "$file_list" | grep -c . || true)
 
+    echo "[2/3] Applying selected group to owned entries..."
     case "$MODE" in
         pvt)
-            find -L "$target" -type d -exec chmod u+rwx,go-rwx,g-s {} + || return 1
-            find -L "$target" -type f -exec chmod u+rw,go-rwx      {} + || return 1
+            echo "Mode pvt does not use selected group; skipping chgrp."
+            echo "[3/3] Applying chmod to owned directories/files..."
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,go-rwx,g-s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,go-rwx      {} + || return 1
             ;;
         grp:r)
             if [[ -n "$GROUP" ]]; then
-                find -L "$target" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+                find -L "$target" -user "$OWNER" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+            else
+                echo "No selected group; skipping chgrp."
             fi
-            find -L "$target" -type d -exec chmod u+rwx,g+rx,g-w,o-rwx,g+s {} + || return 1
-            find -L "$target" -type f -exec chmod u+rw,g+r,g-w,o-rwx       {} + || return 1
+            echo "[3/3] Applying chmod to owned directories/files..."
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,g+rx,g-w,o-rwx,g+s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,g+r,g-w,o-rwx       {} + || return 1
             ;;
         grp:w)
             if [[ -n "$GROUP" ]]; then
-                find -L "$target" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+                find -L "$target" -user "$OWNER" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+            else
+                echo "No selected group; skipping chgrp."
             fi
-            find -L "$target" -type d -exec chmod u+rwx,g+rwx,o-rwx,g+s {} + || return 1
-            find -L "$target" -type f -exec chmod u+rw,g+rw,o-rwx       {} + || return 1
+            echo "[3/3] Applying chmod to owned directories/files..."
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,g+rwx,o-rwx,g+s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,g+rw,o-rwx       {} + || return 1
             ;;
         any:r)
-            find -L "$target" -type d -exec chmod u+rwx,go+rx,go-w,g+s {} + || return 1
-            find -L "$target" -type f -exec chmod u+rw,go+r,go-w       {} + || return 1
+            echo "Mode any:r does not use selected group; skipping chgrp."
+            echo "[3/3] Applying chmod to owned directories/files..."
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,go+rx,go-w,g+s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,go+r,go-w       {} + || return 1
             ;;
         any:w)
-            find -L "$target" -type d -exec chmod u+rwx,go+rwx,g+s {} + || return 1
-            find -L "$target" -type f -exec chmod u+rw,go+rw       {} + || return 1
+            echo "Mode any:w does not use selected group; skipping chgrp."
+            echo "[3/3] Applying chmod to owned directories/files..."
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,go+rwx,g+s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,go+rw       {} + || return 1
             ;;
     esac
 
@@ -373,7 +422,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
 else
     GROUP_DISPLAY="$GROUP"
     [[ -z "$GROUP_DISPLAY" ]] && GROUP_DISPLAY="not change group"
-    echo -e "Applying mode: ${BOLD}$MODE${RESET}  |  group: ${BOLD}$GROUP_DISPLAY${RESET}"
+    echo -e "Applying mode: ${BOLD}$MODE${RESET}  |  group: ${BOLD}$GROUP_DISPLAY${RESET}  |  owner: ${BOLD}$OWNER${RESET}"
     if [[ -n "$GROUP" ]]; then
         echo    "Add a teammate:  sudo usermod -aG $GROUP <username>"
     fi
