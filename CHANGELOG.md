@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-05-08
+
 ### Added
 
 - `c` check 进入配置确认态，支持 `m` 临时切换 ignore metadata、输入 stop depth、Backspace 修改 depth，并提供 check 专用 `?` help。

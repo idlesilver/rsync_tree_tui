@@ -229,12 +229,12 @@ class AutoUpdateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def remote_source(self, version: str | None) -> tui.RemoteUpdateSource:
-        source_version = version or "0.2.2"
+        source_version = version or "0.2.3"
         source = f'#!/usr/bin/env python3\n__version__ = "{source_version}"\n# rsync\n'
         return tui.RemoteUpdateSource(source=source, version=version)
 
     def run_prompt_with_input(self, answer: str) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        self.config_data["auto_update"]["latest_version"] = "0.2.3"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -259,8 +259,8 @@ class AutoUpdateTests(unittest.TestCase):
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
     def test_cached_auto_update_skips_configured_version(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.2"
-        self.config_data["auto_update"]["skipped_version"] = "0.2.2"
+        self.config_data["auto_update"]["latest_version"] = "0.2.3"
+        self.config_data["auto_update"]["skipped_version"] = "0.2.3"
 
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
@@ -276,14 +276,14 @@ class AutoUpdateTests(unittest.TestCase):
             self.run_prompt_with_input("")
 
         auto_update = self.config_data["auto_update"]
-        self.assertEqual(auto_update["last_prompted_version"], "0.2.2")
+        self.assertEqual(auto_update["last_prompted_version"], "0.2.3")
         self.assertEqual(auto_update["last_prompted_at"], "2026-04-27T12:00:00+08:00")
         self.assertEqual(auto_update["skipped_version"], "")
 
     def test_cached_auto_update_skip_records_skipped_version(self) -> None:
         self.run_prompt_with_input("s")
 
-        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.2")
+        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.3")
 
     def test_cached_auto_update_disable_turns_off_checks(self) -> None:
         self.run_prompt_with_input("d")
@@ -291,21 +291,21 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertFalse(self.config_data["auto_update"]["enabled"])
 
     def test_cached_auto_update_update_downloads_payload_installs_and_exits(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        self.config_data["auto_update"]["latest_version"] = "0.2.3"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
             mock.patch("builtins.input", return_value="u"),
-            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.2") as install,
+            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.3") as install,
         ):
             with self.assertRaises(SystemExit) as raised:
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
         self.assertEqual(raised.exception.code, 0)
-        install.assert_called_once_with("0.2.2")
+        install.assert_called_once_with("0.2.3")
 
     def test_cached_auto_update_payload_failure_exits_without_replacing(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.2"
+        self.config_data["auto_update"]["latest_version"] = "0.2.3"
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -323,12 +323,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("rsync_tree_tui.current_local_iso8601", return_value="2026-04-27T12:00:00+08:00"),
-            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.2"),
+            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.3"),
         ):
             tui.background_refresh_latest_version(self.config_path, self.config_data)
 
         data = tui.load_json_config(self.config_path)
-        self.assertEqual(data["auto_update"]["latest_version"], "0.2.2")
+        self.assertEqual(data["auto_update"]["latest_version"], "0.2.3")
         self.assertEqual(data["auto_update"]["latest_checked_at"], "2026-04-27T12:00:00+08:00")
 
     def test_background_check_treats_version_failure_as_no_update(self) -> None:
@@ -368,12 +368,12 @@ class AutoUpdateTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b"0.2.2\n"
+                return b"0.2.3\n"
 
         with mock.patch("rsync_tree_tui.urllib.request.urlopen", return_value=Response()) as urlopen:
             version = tui.download_remote_version()
 
-        self.assertEqual(version, "0.2.2")
+        self.assertEqual(version, "0.2.3")
         urlopen.assert_called_once_with(
             tui.GITHUB_VERSION_URL,
             timeout=tui.AUTO_UPDATE_VERSION_TIMEOUT,
@@ -420,12 +420,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch(
                 "rsync_tree_tui.download_remote_update_source",
-                return_value=self.remote_source("0.2.3"),
+                return_value=self.remote_source("0.2.4"),
             ),
             mock.patch("rsync_tree_tui.install_update_source") as install,
             self.assertRaises(tui.UpdateError),
         ):
-            tui.install_remote_update("0.2.2")
+            tui.install_remote_update("0.2.3")
 
         install.assert_not_called()
 
