@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- `c` check 进入配置确认态，支持 `m` 临时切换 ignore metadata、输入 stop depth、Backspace 修改 depth，并提供 check 专用 `?` help。
+- stop-depth check：按每个选中根计算相对层级，先加载到 `depth + 1`，再在发现 remote-only、类型冲突或内容不同后短路当前层级单元并继续下一个单元。
+
+### Changed
+
+- check 默认启用 ignore metadata：same-size/different-mtime 文件会用 checksum 消除 metadata-only 误报；关闭后保留旧式 mtime diff 判断。
+- check 不再深入 local-only 或 remote-only 目录；local-only 不触发 stop-depth 短路，remote-only 会触发短路。
+
+### Fixed
+
+- 修复 check 内容校验未将 same-content/different-mtime 文件标为相同的问题；这类文件此前可能仍保持红色，直到手动 diff 后才变绿。
+
 ## [0.2.1] - 2026-04-27
 
 ### Added

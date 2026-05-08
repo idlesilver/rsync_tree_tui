@@ -1601,6 +1601,8 @@ class SyncApp:
         self.message = "Loading manifests..."
         self.pending_action: str | None = None
         self.pending_permission: PermissionRequest | None = None
+        self.pending_check_ignore_metadata = True
+        self.pending_check_stop_depth_text = ""
         self.last_cursor_rel_path = ""
         self.initial_connection_ok = False
         self.list_layout: ListLayout | None = None
@@ -1771,7 +1773,7 @@ class SyncApp:
             result = subprocess.run(
                 [
                     "rsync",
-                    "-niv",               # dry-run, itemize-changes, verbose (shows all files)
+                    "-aniv",              # archive dry-run itemizes mtime-only checksum matches
                     "--checksum",         # compare by content checksum, not mtime
                     "--no-perms",
                     "--no-owner",
@@ -2105,9 +2107,13 @@ class SyncApp:
         status_text = self.message
         if self.pending_action is not None:
             if self.pending_action == "check":
+                ignore_metadata = getattr(self, "pending_check_ignore_metadata", True)
+                depth_text = getattr(self, "pending_check_stop_depth_text", "")
+                depth_display = depth_text if depth_text else "_"
                 status_text = (
-                    "Recursively check selected entries (may take a long time). "
-                    "Press y to confirm, n to cancel."
+                    "Check selected. "
+                    f"[m] ignore metadata: {'on' if ignore_metadata else 'off'}  "
+                    f"[depth: {depth_display}]  [y] run  [n] cancel  [?] help"
                 )
             elif self.pending_action == "clear":
                 status_text = "Clear ALL selections? Press y to confirm, n to cancel."
@@ -2470,6 +2476,8 @@ class SyncApp:
             return
         if not node_is_directory(node):
             return
+        if node.rel_path and (node.left_entry is None or node.right_entry is None):
+            return
         if not node.children_loaded:
             self.message = f"Checking {node.rel_path or '/'} ..."
             self.render()
@@ -2479,6 +2487,98 @@ class SyncApp:
                 return
             _load_subtree_node = child
             self._load_subtree(_load_subtree_node)
+
+    def _can_check_descend(self, node: TreeNode) -> bool:
+        if not node_is_directory(node):
+            return False
+        if node.rel_path and (node.left_entry is None or node.right_entry is None):
+            return False
+        if (
+            node.left_entry is not None
+            and node.right_entry is not None
+            and node.left_entry.entry_type != node.right_entry.entry_type
+        ):
+            return False
+        return True
+
+    def _load_check_children(self, node: TreeNode) -> None:
+        if self._interrupt_requested or not self._can_check_descend(node):
+            return
+        if not node.children_loaded:
+            self.message = f"Checking {node.rel_path or '/'} ..."
+            self.render()
+            self.load_children(node, limited=False)
+
+    def _load_check_tree_to_relative_depth(
+        self, node: TreeNode, current_depth: int, max_depth: int
+    ) -> None:
+        if self._interrupt_requested or current_depth >= max_depth:
+            return
+        self._load_check_children(node)
+        for child in sorted_children(node):
+            self._load_check_tree_to_relative_depth(child, current_depth + 1, max_depth)
+
+    def _nodes_at_relative_depth(
+        self, node: TreeNode, current_depth: int, target_depth: int
+    ) -> list[TreeNode]:
+        if current_depth == target_depth:
+            return [node]
+        if not node.children_loaded:
+            return []
+        result: list[TreeNode] = []
+        for child in sorted_children(node):
+            result.extend(
+                self._nodes_at_relative_depth(child, current_depth + 1, target_depth)
+            )
+        return result
+
+    def _check_node_short_circuit_risk(
+        self, node: TreeNode, *, ignore_metadata: bool
+    ) -> bool:
+        if node.left_load_error or node.right_load_error:
+            return True
+        if node.left_entry is None or node.right_entry is None:
+            return node.right_entry is not None
+        if node.left_entry.entry_type != node.right_entry.entry_type:
+            return True
+        if node.left_entry.entry_type != EntryType.FILE:
+            return False
+        if node.left_entry.size != node.right_entry.size:
+            return True
+        if node.left_entry.mtime_s == node.right_entry.mtime_s:
+            return False
+        if not ignore_metadata:
+            return True
+        return self._rsync_content_check([node]) != 1
+
+    def _check_until_short_circuit_risk(
+        self, node: TreeNode, *, ignore_metadata: bool
+    ) -> bool:
+        if self._interrupt_requested:
+            return True
+        if self._check_node_short_circuit_risk(node, ignore_metadata=ignore_metadata):
+            return True
+        self._load_check_children(node)
+        for child in sorted_children(node):
+            if self._check_until_short_circuit_risk(
+                child, ignore_metadata=ignore_metadata
+            ):
+                return True
+        return False
+
+    def _execute_check_with_stop_depth(
+        self, selected_nodes: list[TreeNode], stop_depth: int, *, ignore_metadata: bool
+    ) -> None:
+        for node in selected_nodes:
+            self._load_check_tree_to_relative_depth(node, 0, stop_depth + 1)
+        for node in selected_nodes:
+            units = self._nodes_at_relative_depth(node, 0, stop_depth)
+            if not units:
+                units = [node]
+            for unit in units:
+                self._check_until_short_circuit_risk(
+                    unit, ignore_metadata=ignore_metadata
+                )
 
     def execute_check(self) -> None:
         """Recursively load all selected nodes to resolve white (unexplored) state."""
@@ -2491,14 +2591,30 @@ class SyncApp:
         self.message = f"Checking {len(selected_nodes)} selected entries..."
         self.render()
         count = 0
+        ignore_metadata = getattr(self, "pending_check_ignore_metadata", True)
+        stop_depth_text = getattr(self, "pending_check_stop_depth_text", "")
+        if stop_depth_text:
+            self._execute_check_with_stop_depth(
+                selected_nodes,
+                int(stop_depth_text),
+                ignore_metadata=ignore_metadata,
+            )
+            count = len(selected_nodes)
+            self.message = (
+                f"Check complete for {count} selected entries. "
+                f"Stopped at depth {int(stop_depth_text)}."
+            )
+            return
         for node in selected_nodes:
             self._load_subtree(node)
             count += 1
 
-        # rsync --checksum for files that share size but differ in mtime
+        # rsync --checksum for files that share size but differ in mtime when
+        # the check is allowed to ignore metadata-only differences.
         candidates: list[TreeNode] = []
-        for node in selected_nodes:
-            candidates.extend(self._collect_content_check_candidates(node))
+        if ignore_metadata:
+            for node in selected_nodes:
+                candidates.extend(self._collect_content_check_candidates(node))
         matched = 0
         if candidates:
             matched = self._rsync_content_check(candidates)
@@ -2521,6 +2637,8 @@ class SyncApp:
             if not selected_nodes:
                 self.message = "No entries selected to check."
                 return
+            self.pending_check_ignore_metadata = True
+            self.pending_check_stop_depth_text = ""
             self.pending_action = "check"
             return
 
@@ -3020,7 +3138,7 @@ class SyncApp:
             "f                  Preview diff in built-in popup (red entries only)",
             "F                  Preview diff with external viewer (vim -d by default)",
             "p                  Change remote permissions for selected entries",
-            "c                  Recursively check selected entries",
+            "c                  Configure and check selected entries",
             "x                  Clear all selections (with confirmation)",
             "r                  Refresh manifests",
             "?                  Show this help",
@@ -3049,6 +3167,11 @@ class SyncApp:
             "",
             "Remote permissions",
             "  p offers pvt/rdo/pub after owner preflight",
+            "",
+            "Check",
+            "  c opens a confirmation line with m/depth/y/n/? controls",
+            "  ignore metadata is on by default",
+            "  stop depth is relative to each selected root",
         ]
         self._show_popup("Help", lines)
 
@@ -3202,8 +3325,71 @@ class SyncApp:
 
     # ------------------------------- key events ----------------------------- #
 
+    def _handle_pending_check_key(self, key: int) -> None:
+        if key == ord("y"):
+            self.execute_pending_action()
+            return
+        if key == ord("n"):
+            self.pending_action = None
+            self.message = "Cancelled pending check."
+            return
+        if key == ord("m"):
+            self.pending_check_ignore_metadata = not getattr(
+                self, "pending_check_ignore_metadata", True
+            )
+            return
+        if ord("0") <= key <= ord("9"):
+            self.pending_check_stop_depth_text = (
+                getattr(self, "pending_check_stop_depth_text", "") + chr(key)
+            )
+            return
+        backspace_keys = {8, 127}
+        curses_backspace = getattr(curses, "KEY_BACKSPACE", -1)
+        if curses_backspace != -1:
+            backspace_keys.add(curses_backspace)
+        if key in backspace_keys:
+            self.pending_check_stop_depth_text = getattr(
+                self, "pending_check_stop_depth_text", ""
+            )[:-1]
+            return
+        if key == ord("?"):
+            self._show_check_help_popup()
+            return
+
+    def _show_check_help_popup(self) -> None:
+        self._show_popup(
+            "check help",
+            [
+                "Check options:",
+                "  m      toggle ignore metadata",
+                "  0-9    set stop depth",
+                "  Backspace deletes the last depth digit",
+                "  y      run check",
+                "  n      cancel check",
+                "",
+                "Depth is relative to each selected root.",
+                "",
+                "Example:",
+                "  dataset/              depth 0",
+                "    scene_a/            depth 1",
+                "      camera/           depth 2",
+                "        0001.png        depth 3",
+                "        0002.png        depth 3",
+                "      labels/           depth 2",
+                "    scene_b/            depth 1",
+                "",
+                "With stop depth 1, the first remote-only, type conflict,",
+                "or content difference under scene_a marks the discovered",
+                "path and ancestors, skips unchecked siblings under scene_a,",
+                "then continues with scene_b. Local-only does not short-circuit.",
+            ],
+        )
+
     def handle_key(self, key: int) -> None:
         if self.pending_action is not None:
+            if self.pending_action == "check":
+                self._handle_pending_check_key(key)
+                return
             if key == ord("y"):
                 self.execute_pending_action()
             elif key == ord("n"):
@@ -3212,6 +3398,8 @@ class SyncApp:
                 self.pending_permission = None
                 if cancelled_action == "permission":
                     self.message = "Cancelled pending permission action."
+                elif cancelled_action == "check":
+                    self.message = "Cancelled pending check."
                 else:
                     self.message = "Cancelled pending sync action."
             return  # block all other keys while confirmation is pending

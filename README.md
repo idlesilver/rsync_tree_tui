@@ -167,7 +167,24 @@ python rsync_tree_tui.py \
 - 小于等于 `size_threshold_mb` 的文件使用 rsync checksum。
 - `checksum_suffixes` 中列出的后缀始终使用 checksum。
 - 其他大文件使用 size+mtime。
-- TUI 内 `c` 检查动作仍会对选中项执行 checksum 内容校验。
+- TUI 内 `c` 检查动作默认会对 same-size/different-mtime 文件执行 checksum 内容校验，用于忽略 metadata-only 差异。
+
+## Check
+
+按 `c` 后会进入 check 配置确认态。此时只接受 `m`、数字、Backspace、`?`、`y`、`n`，其他按键会被屏蔽，避免误触主界面操作。
+
+```text
+m                  切换 ignore metadata，默认 on
+0-9                输入 stop depth
+Backspace          删除 stop depth 的最后一位
+?                  显示 check help
+y                  执行 check
+n                  取消 check
+```
+
+`ignore metadata: on` 时，same-size/different-mtime 文件会用 rsync checksum 判断内容；内容相同则视为 same，内容不同才视为 diff。`ignore metadata: off` 时，mtime 不同按旧式 metadata diff 处理。
+
+`stop depth` 为空表示完整递归检查。输入非负整数后，depth 相对每个选中根计算；选中根为 depth 0。启用后会先加载到 `stop depth + 1` 层，再在每个 stop-depth 单元内继续向下检查；遇到 remote-only、同路径文件/目录类型冲突或内容不同会停止该单元剩余未检查分支，继续下一个同级单元。local-only 不触发短路，local-only/remote-only 目录在 check 中都不会继续深入；手动展开目录的浏览行为不变。
 
 ## 键盘操作
 
@@ -181,7 +198,7 @@ u                  上传选中项
 f                  内置弹窗预览当前文件 diff
 F                  外部工具预览当前文件 diff（默认 vim -d）
 p                  对选中远端项递归变更权限
-c                  递归检查选中项
+c                  配置并递归检查选中项
 x                  清空选择
 r                  刷新 manifest
 ?                  显示帮助

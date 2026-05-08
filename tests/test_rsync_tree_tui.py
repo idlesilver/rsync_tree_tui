@@ -1016,6 +1016,357 @@ class MouseTests(unittest.TestCase):
         refresh.assert_called_once_with(initial_load=False)
 
 
+class CheckActionTests(unittest.TestCase):
+    def make_app(self) -> tui.SyncApp:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        selected = tui.TreeNode(
+            name="dataset",
+            rel_path="dataset",
+            parent=root,
+            is_selected=True,
+            left_entry=tui.EntryMeta(
+                rel_path="dataset",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+            right_entry=tui.EntryMeta(
+                rel_path="dataset",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+        )
+        root.children = {"dataset": selected}
+        app.root_node = root
+        app.cursor_index = 0
+        app.scroll_offset = 0
+        app.message = ""
+        app.pending_action = None
+        app.pending_permission = None
+        app.footer_shortcut_hits = []
+        app.pagination_size = tui.DEFAULT_PAGINATION_SIZE
+        return app
+
+    def test_check_confirmation_collects_options_and_blocks_other_keys(self) -> None:
+        app = self.make_app()
+
+        app.handle_key(ord("c"))
+
+        self.assertEqual(app.pending_action, "check")
+        self.assertTrue(app.pending_check_ignore_metadata)
+        self.assertEqual(app.pending_check_stop_depth_text, "")
+
+        app.handle_key(ord("1"))
+        app.handle_key(ord("2"))
+        app.handle_key(127)
+        app.handle_key(ord("m"))
+        app.handle_key(ord("q"))
+
+        self.assertEqual(app.pending_action, "check")
+        self.assertFalse(app.pending_check_ignore_metadata)
+        self.assertEqual(app.pending_check_stop_depth_text, "1")
+
+    def test_check_help_preserves_pending_options(self) -> None:
+        app = self.make_app()
+        app._show_popup = mock.Mock()
+
+        app.handle_key(ord("c"))
+        app.handle_key(ord("3"))
+        app.handle_key(ord("m"))
+        app.handle_key(ord("?"))
+
+        app._show_popup.assert_called_once()
+        self.assertEqual(app.pending_action, "check")
+        self.assertFalse(app.pending_check_ignore_metadata)
+        self.assertEqual(app.pending_check_stop_depth_text, "3")
+
+    def test_check_with_metadata_enabled_does_not_checksum_mtime_only_diff(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        changed = tui.TreeNode(
+            name="asset.txt",
+            rel_path="asset.txt",
+            parent=root,
+            is_selected=True,
+            left_entry=tui.EntryMeta(
+                rel_path="asset.txt",
+                entry_type=tui.EntryType.FILE,
+                size=10,
+                mtime_s=1,
+                perms=0o644,
+            ),
+            right_entry=tui.EntryMeta(
+                rel_path="asset.txt",
+                entry_type=tui.EntryType.FILE,
+                size=10,
+                mtime_s=2,
+                perms=0o644,
+            ),
+            children_loaded=True,
+        )
+        root.children = {"asset.txt": changed}
+        app.root_node = root
+        app.pending_action = "check"
+        app.pending_check_ignore_metadata = False
+        app.pending_check_stop_depth_text = ""
+        app.message = ""
+        app._interrupt_requested = False
+        app.render = mock.Mock()
+        app._rsync_content_check = mock.Mock(return_value=0)
+
+        app.execute_check()
+
+        app._rsync_content_check.assert_not_called()
+        self.assertTrue(tui.node_has_difference(changed))
+
+    def test_content_check_itemizes_mtime_only_checksum_matches(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        app.local_root = Path("/local")
+        app.remote_target = "host"
+        app.remote_root = "/remote"
+        app.message = ""
+        app.render = mock.Mock()
+        app._ssh_opts = mock.Mock(return_value=[])
+        node = tui.TreeNode(
+            name="coacd.json",
+            rel_path="model/usd/usd_layers/collision_ready_usd_layer/coacd/coacd.json",
+            left_entry=tui.EntryMeta(
+                rel_path="model/usd/usd_layers/collision_ready_usd_layer/coacd/coacd.json",
+                entry_type=tui.EntryType.FILE,
+                size=10,
+                mtime_s=1,
+                perms=0o644,
+            ),
+            right_entry=tui.EntryMeta(
+                rel_path="model/usd/usd_layers/collision_ready_usd_layer/coacd/coacd.json",
+                entry_type=tui.EntryType.FILE,
+                size=10,
+                mtime_s=2,
+                perms=0o644,
+            ),
+        )
+        result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=".f..t...... model/usd/usd_layers/collision_ready_usd_layer/coacd/coacd.json\n",
+        )
+
+        with mock.patch("rsync_tree_tui.subprocess.run", return_value=result) as run:
+            matched = app._rsync_content_check([node])
+
+        command = run.call_args.args[0]
+        self.assertIn("-aniv", command)
+        self.assertEqual(matched, 1)
+        self.assertFalse(tui.node_has_difference(node))
+
+    def test_stop_depth_skips_remaining_unit_after_diff_and_continues_next_unit(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        dataset = tui.TreeNode(
+            name="dataset",
+            rel_path="dataset",
+            parent=root,
+            is_selected=True,
+            left_entry=tui.EntryMeta(
+                rel_path="dataset",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+            right_entry=tui.EntryMeta(
+                rel_path="dataset",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+        )
+        root.children = {"dataset": dataset}
+        app.root_node = root
+        app.pending_action = "check"
+        app.pending_check_ignore_metadata = False
+        app.pending_check_stop_depth_text = "1"
+        app.message = ""
+        app._interrupt_requested = False
+        app.render = mock.Mock()
+        loaded: list[str] = []
+
+        def entry(rel_path: str, entry_type: tui.EntryType, size: int = 0) -> tui.EntryMeta:
+            return tui.EntryMeta(
+                rel_path=rel_path,
+                entry_type=entry_type,
+                size=size,
+                mtime_s=1,
+                perms=0o755 if entry_type == tui.EntryType.DIRECTORY else 0o644,
+            )
+
+        def make_child(parent: tui.TreeNode, name: str, entry_type: tui.EntryType, size: int = 0) -> tui.TreeNode:
+            rel_path = f"{parent.rel_path}/{name}" if parent.rel_path else name
+            return tui.TreeNode(
+                name=name,
+                rel_path=rel_path,
+                parent=parent,
+                left_entry=entry(rel_path, entry_type, size),
+                right_entry=entry(rel_path, entry_type, size),
+                children_loaded=entry_type == tui.EntryType.FILE,
+            )
+
+        def load_children(node: tui.TreeNode, limited: bool = True) -> None:
+            loaded.append(node.rel_path)
+            if node.rel_path == "dataset":
+                node.children = {
+                    "scene_a": make_child(node, "scene_a", tui.EntryType.DIRECTORY),
+                    "scene_b": make_child(node, "scene_b", tui.EntryType.DIRECTORY),
+                }
+            elif node.rel_path == "dataset/scene_a":
+                node.children = {
+                    "camera": make_child(node, "camera", tui.EntryType.DIRECTORY),
+                    "labels": make_child(node, "labels", tui.EntryType.DIRECTORY),
+                }
+            elif node.rel_path == "dataset/scene_b":
+                node.children = {
+                    "deep": make_child(node, "deep", tui.EntryType.DIRECTORY),
+                }
+            elif node.rel_path == "dataset/scene_a/camera":
+                same = make_child(node, "0001.png", tui.EntryType.FILE, size=10)
+                diff = make_child(node, "0002.png", tui.EntryType.FILE, size=10)
+                diff.right_entry = entry(diff.rel_path, tui.EntryType.FILE, size=11)
+                node.children = {"0001.png": same, "0002.png": diff}
+            elif node.rel_path == "dataset/scene_a/labels":
+                self.fail("short-circuited check should not load scene_a/labels")
+            elif node.rel_path == "dataset/scene_b/deep":
+                node.children = {
+                    "ok.txt": make_child(node, "ok.txt", tui.EntryType.FILE, size=1),
+                }
+            node.children_loaded = True
+            tui.clear_node_caches(node, include_sorted=True)
+            tui.clear_ancestor_caches(node.parent)
+
+        app.load_children = load_children
+
+        app.execute_check()
+
+        scene_a = dataset.children["scene_a"]
+        camera = scene_a.children["camera"]
+        labels = scene_a.children["labels"]
+        scene_b_deep = dataset.children["scene_b"].children["deep"]
+        self.assertTrue(tui.node_has_difference(scene_a))
+        self.assertTrue(tui.node_has_difference(camera))
+        self.assertFalse(labels.children_loaded)
+        self.assertTrue(scene_b_deep.children_loaded)
+
+    def test_stop_depth_local_only_does_not_short_circuit_but_remote_only_does(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        dataset = tui.TreeNode(
+            name="dataset",
+            rel_path="dataset",
+            parent=root,
+            is_selected=True,
+            left_entry=tui.EntryMeta(
+                rel_path="dataset",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+            right_entry=tui.EntryMeta(
+                rel_path="dataset",
+                entry_type=tui.EntryType.DIRECTORY,
+                size=0,
+                mtime_s=1,
+                perms=0o755,
+            ),
+        )
+        root.children = {"dataset": dataset}
+        app.root_node = root
+        app.pending_action = "check"
+        app.pending_check_ignore_metadata = False
+        app.pending_check_stop_depth_text = "1"
+        app.message = ""
+        app._interrupt_requested = False
+        app.render = mock.Mock()
+        loaded: list[str] = []
+
+        def meta(rel_path: str, entry_type: tui.EntryType) -> tui.EntryMeta:
+            return tui.EntryMeta(
+                rel_path=rel_path,
+                entry_type=entry_type,
+                size=0,
+                mtime_s=1,
+                perms=0o755 if entry_type == tui.EntryType.DIRECTORY else 0o644,
+            )
+
+        def both_dir(parent: tui.TreeNode, name: str) -> tui.TreeNode:
+            rel_path = f"{parent.rel_path}/{name}" if parent.rel_path else name
+            return tui.TreeNode(
+                name=name,
+                rel_path=rel_path,
+                parent=parent,
+                left_entry=meta(rel_path, tui.EntryType.DIRECTORY),
+                right_entry=meta(rel_path, tui.EntryType.DIRECTORY),
+            )
+
+        def load_children(node: tui.TreeNode, limited: bool = True) -> None:
+            loaded.append(node.rel_path)
+            if node.rel_path == "dataset":
+                node.children = {
+                    "scene_a": both_dir(node, "scene_a"),
+                    "scene_b": both_dir(node, "scene_b"),
+                }
+            elif node.rel_path == "dataset/scene_a":
+                local_rel = "dataset/scene_a/local_new"
+                node.children = {
+                    "local_new": tui.TreeNode(
+                        name="local_new",
+                        rel_path=local_rel,
+                        parent=node,
+                        left_entry=meta(local_rel, tui.EntryType.DIRECTORY),
+                    ),
+                    "shared": both_dir(node, "shared"),
+                }
+            elif node.rel_path == "dataset/scene_a/shared":
+                node.children = {
+                    "ok.txt": tui.TreeNode(
+                        name="ok.txt",
+                        rel_path="dataset/scene_a/shared/ok.txt",
+                        parent=node,
+                        left_entry=meta("dataset/scene_a/shared/ok.txt", tui.EntryType.FILE),
+                        right_entry=meta("dataset/scene_a/shared/ok.txt", tui.EntryType.FILE),
+                        children_loaded=True,
+                    ),
+                }
+            elif node.rel_path == "dataset/scene_b":
+                remote_rel = "dataset/scene_b/remote_new"
+                node.children = {
+                    "remote_new": tui.TreeNode(
+                        name="remote_new",
+                        rel_path=remote_rel,
+                        parent=node,
+                        right_entry=meta(remote_rel, tui.EntryType.DIRECTORY),
+                    )
+                }
+            elif node.rel_path.endswith("local_new") or node.rel_path.endswith("remote_new"):
+                self.fail("check should not descend into single-side directories")
+            node.children_loaded = True
+            tui.clear_node_caches(node, include_sorted=True)
+            tui.clear_ancestor_caches(node.parent)
+
+        app.load_children = load_children
+
+        app.execute_check()
+
+        self.assertIn("dataset/scene_a/shared", loaded)
+        self.assertTrue(tui.node_has_difference(dataset.children["scene_b"]))
+        self.assertNotIn("dataset/scene_a/local_new", loaded)
+        self.assertNotIn("dataset/scene_b/remote_new", loaded)
+
+
 class PermissionActionTests(unittest.TestCase):
     def make_app(self) -> tui.SyncApp:
         app = tui.SyncApp.__new__(tui.SyncApp)
