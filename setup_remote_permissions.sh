@@ -5,11 +5,12 @@
 # Normalize access on shared storage directories.
 #
 # Modes (applied recursively to all content under each target):
-#   pvt   — owner only
-#   grp:r — owner + group read
-#   grp:w — owner + group write
-#   any:r — owner + group + other read
-#   any:w — owner + group + other write
+#   pvt:pvt — owner only
+#   grp:pvt — owner + group read
+#   grp:grp — owner + group write
+#   any:pvt — owner + group + other read
+#   any:grp — owner + group write, other read
+#   any:any — owner + group + other write
 #
 # Usage:
 #   setup_remote_permissions.sh [--group GROUP] [--dry-run] [-v] <mode> <path> [<path> ...]
@@ -26,29 +27,29 @@
 #
 # Examples:
 #   # Preview what would change, without applying
-#   ./setup_remote_permissions.sh --dry-run any:r /data/storage/sn_assets
+#   ./setup_remote_permissions.sh --dry-run any:pvt /data/storage/sn_assets
 #
 #   # Lock a released dataset so teammates can only download it
-#   ./setup_remote_permissions.sh any:r /data/storage/datasets/v1.0
+#   ./setup_remote_permissions.sh any:pvt /data/storage/datasets/v1.0
 #
 #   # Open a staging area so teammates can upload into it
-#   ./setup_remote_permissions.sh grp:w /data/storage/datasets/staging
+#   ./setup_remote_permissions.sh grp:grp /data/storage/datasets/staging
 #
 #   # Hide a work-in-progress directory from teammates
 #   ./setup_remote_permissions.sh pvt /data/storage/wip_secret
 #
 #   # Apply to multiple paths at once
-#   ./setup_remote_permissions.sh any:r /data/storage/v1.0 /data/storage/v1.1
+#   ./setup_remote_permissions.sh any:pvt /data/storage/v1.0 /data/storage/v1.1
 #
 # Run remotely from local machine:
-#   ssh user@host "bash /path/to/scripts/setup_remote_permissions.sh any:r /remote/path"
+#   ssh user@host "bash /path/to/scripts/setup_remote_permissions.sh any:pvt /remote/path"
 #
 
 set -euo pipefail
 
 # ─────────────────────────── config ─────────────────────────────────────── #
 
-VERSION="0.2.6"
+VERSION="0.2.8"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/setup_remote_permissions.sh"
 
 # Edit this line to persist a site-specific default, or pass --group.
@@ -152,7 +153,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=1; shift ;;
         -v|--verbose)     VERBOSE=1; shift ;;
         --help|-h)        usage ;;
-        pvt|grp:r|grp:w|any:r|any:w)
+        pvt|grp:r|grp:w|any:r|any:w|pvt:pvt|grp:pvt|grp:grp|any:pvt|any:grp|any:any)
             [[ -n "$MODE" ]] && { echo "ERROR: mode specified twice ('$MODE' and '$1')"; exit 1; }
             MODE="$1"
             shift
@@ -175,7 +176,15 @@ if [[ $UPDATE -eq 1 ]]; then
     do_self_update
 fi
 
-[[ -z "$MODE"            ]] && { echo "ERROR: mode is required (pvt|grp:r|grp:w|any:r|any:w)"; echo; usage; }
+case "$MODE" in
+    pvt) MODE="pvt:pvt" ;;
+    grp:r) MODE="grp:pvt" ;;
+    grp:w) MODE="grp:grp" ;;
+    any:r) MODE="any:pvt" ;;
+    any:w) MODE="any:any" ;;
+esac
+
+[[ -z "$MODE"            ]] && { echo "ERROR: mode is required"; echo; usage; }
 [[ ${#TARGETS[@]} -eq 0 ]] && { echo "ERROR: at least one path is required"; echo; usage; }
 [[ -z "$OWNER"           ]] && { echo "ERROR: owner must not be empty"; echo; usage; }
 
@@ -209,34 +218,40 @@ find_permission_mismatches() {
             special=$((mode & 07000))
             ok=1
             case "$wanted_mode:$entry_type" in
-                pvt:d)
+                pvt:pvt:d)
                     (( bits == 0700 && (special & 02000) == 0 )) || ok=0
                     ;;
-                pvt:f)
+                pvt:pvt:f)
                     (( (bits & 0600) == 0600 && (bits & 0077) == 0 && special == 0 )) || ok=0
                     ;;
-                grp:r:d)
+                grp:pvt:d)
                     (( bits == 0750 && (special & 02000) != 0 )) || ok=0
                     ;;
-                grp:r:f)
+                grp:pvt:f)
                     (( (bits & 0600) == 0600 && (bits & 0040) != 0 && (bits & 0020) == 0 && (bits & 0007) == 0 && special == 0 )) || ok=0
                     ;;
-                grp:w:d)
+                grp:grp:d)
                     (( bits == 0770 && (special & 02000) != 0 )) || ok=0
                     ;;
-                grp:w:f)
+                grp:grp:f)
                     (( (bits & 0600) == 0600 && (bits & 0060) == 0060 && (bits & 0007) == 0 && special == 0 )) || ok=0
                     ;;
-                any:r:d)
+                any:pvt:d)
                     (( bits == 0755 && (special & 02000) != 0 )) || ok=0
                     ;;
-                any:r:f)
+                any:pvt:f)
                     (( (bits & 0600) == 0600 && (bits & 0044) == 0044 && (bits & 0022) == 0 && special == 0 )) || ok=0
                     ;;
-                any:w:d)
+                any:grp:d)
+                    (( bits == 0775 && (special & 02000) != 0 )) || ok=0
+                    ;;
+                any:grp:f)
+                    (( (bits & 0600) == 0600 && (bits & 0060) == 0060 && (bits & 0004) != 0 && (bits & 0002) == 0 && special == 0 )) || ok=0
+                    ;;
+                any:any:d)
                     (( bits == 0777 && (special & 02000) != 0 )) || ok=0
                     ;;
-                any:w:f)
+                any:any:f)
                     (( (bits & 0600) == 0600 && (bits & 0066) == 0066 && special == 0 )) || ok=0
                     ;;
             esac
@@ -274,20 +289,23 @@ show_skipped_owners() {
 find_mismatched_dirs() {
     local target="$1"
     case "$MODE" in
-        pvt)
-            find_permission_mismatches "$target" d pvt
+        pvt:pvt)
+            find_permission_mismatches "$target" d pvt:pvt
             ;;
-        grp:r)
-            find_permission_mismatches "$target" d grp:r
+        grp:pvt)
+            find_permission_mismatches "$target" d grp:pvt
             ;;
-        grp:w)
-            find_permission_mismatches "$target" d grp:w
+        grp:grp)
+            find_permission_mismatches "$target" d grp:grp
             ;;
-        any:r)
-            find_permission_mismatches "$target" d any:r
+        any:pvt)
+            find_permission_mismatches "$target" d any:pvt
             ;;
-        any:w)
-            find_permission_mismatches "$target" d any:w
+        any:grp)
+            find_permission_mismatches "$target" d any:grp
+            ;;
+        any:any)
+            find_permission_mismatches "$target" d any:any
             ;;
     esac
 }
@@ -295,20 +313,23 @@ find_mismatched_dirs() {
 find_mismatched_files() {
     local target="$1"
     case "$MODE" in
-        pvt)
-            find_permission_mismatches "$target" f pvt
+        pvt:pvt)
+            find_permission_mismatches "$target" f pvt:pvt
             ;;
-        grp:r)
-            find_permission_mismatches "$target" f grp:r
+        grp:pvt)
+            find_permission_mismatches "$target" f grp:pvt
             ;;
-        grp:w)
-            find_permission_mismatches "$target" f grp:w
+        grp:grp)
+            find_permission_mismatches "$target" f grp:grp
             ;;
-        any:r)
-            find_permission_mismatches "$target" f any:r
+        any:pvt)
+            find_permission_mismatches "$target" f any:pvt
             ;;
-        any:w)
-            find_permission_mismatches "$target" f any:w
+        any:grp)
+            find_permission_mismatches "$target" f any:grp
+            ;;
+        any:any)
+            find_permission_mismatches "$target" f any:any
             ;;
     esac
 }
@@ -361,41 +382,38 @@ fix_target() {
     changed_files=$(echo -n "$file_list" | grep -c . || true)
 
     echo "[2/3] Applying selected group to owned entries..."
+    if [[ -n "$GROUP" ]]; then
+        find -L "$target" -user "$OWNER" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
+    else
+        echo "No selected group; skipping chgrp."
+    fi
     case "$MODE" in
-        pvt)
-            echo "Mode pvt does not use selected group; skipping chgrp."
+        pvt:pvt)
             echo "[3/3] Applying chmod to owned directories/files..."
             find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,go-rwx,g-s {} + || return 1
             find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,go-rwx      {} + || return 1
             ;;
-        grp:r)
-            if [[ -n "$GROUP" ]]; then
-                find -L "$target" -user "$OWNER" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
-            else
-                echo "No selected group; skipping chgrp."
-            fi
+        grp:pvt)
             echo "[3/3] Applying chmod to owned directories/files..."
             find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,g+rx,g-w,o-rwx,g+s {} + || return 1
             find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,g+r,g-w,o-rwx       {} + || return 1
             ;;
-        grp:w)
-            if [[ -n "$GROUP" ]]; then
-                find -L "$target" -user "$OWNER" ! -group "$GROUP" -exec chgrp "$GROUP" {} + || return 1
-            else
-                echo "No selected group; skipping chgrp."
-            fi
+        grp:grp)
             echo "[3/3] Applying chmod to owned directories/files..."
             find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,g+rwx,o-rwx,g+s {} + || return 1
             find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,g+rw,o-rwx       {} + || return 1
             ;;
-        any:r)
-            echo "Mode any:r does not use selected group; skipping chgrp."
+        any:pvt)
             echo "[3/3] Applying chmod to owned directories/files..."
-            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,go+rx,go-w,g+s {} + || return 1
-            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,go+r,go-w       {} + || return 1
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,g+rx,g-w,o+rx,o-w,g+s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,g+r,g-w,o+r,o-w       {} + || return 1
             ;;
-        any:w)
-            echo "Mode any:w does not use selected group; skipping chgrp."
+        any:grp)
+            echo "[3/3] Applying chmod to owned directories/files..."
+            find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,g+rwx,o+rx,o-w,g+s {} + || return 1
+            find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,g+rw,o+r,o-w       {} + || return 1
+            ;;
+        any:any)
             echo "[3/3] Applying chmod to owned directories/files..."
             find -L "$target" -user "$OWNER" -type d -exec chmod u+rwx,go+rwx,g+s {} + || return 1
             find -L "$target" -user "$OWNER" -type f -exec chmod u+rw,go+rw       {} + || return 1

@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-05-09
+
+### Changed
+
+- permission 弹窗的 inactive 选项改用更明显的 dim-gray 显示。
+- permission 弹窗改为 `read/write/group` 三轴模型，常规写权限不再赋予 other write；新增 `[any:g]` 表示 any readable + group writable。
+- permission mode 内部使用 `read:write` 语义，并兼容旧的 `pvt`、`grp:r`、`grp:w`、`any:r`、`any:w` 输入。
+
 ## [0.2.7] - 2026-05-09
 
 ### Added

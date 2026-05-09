@@ -220,7 +220,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.8"
+    FUTURE_VERSION = "0.2.9"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -605,6 +605,18 @@ class RenderTests(unittest.TestCase):
         )
 
         self.assertEqual(tui.remote_permission_badge(entry), "[any:r]")
+        self.assertEqual(tui.badge_color_pair(entry), 4)
+
+    def test_remote_any_group_write_permission_uses_distinct_badge(self) -> None:
+        entry = tui.EntryMeta(
+            rel_path="dataset",
+            entry_type=tui.EntryType.DIRECTORY,
+            size=0,
+            mtime_s=1,
+            perms=0o2775,
+        )
+
+        self.assertEqual(tui.remote_permission_badge(entry), "[any:g]")
         self.assertEqual(tui.badge_color_pair(entry), 4)
 
     def test_remote_nonstandard_permission_uses_numeric_badge(self) -> None:
@@ -1711,7 +1723,7 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path") as preflight,
-            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:r", "")),
+            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:pvt", "")),
         ):
             app.start_action("permission")
 
@@ -1724,14 +1736,14 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path") as preflight,
-            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:w", "shared")),
+            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:grp", "shared")),
         ):
             app.start_action("permission")
 
         preflight.assert_not_called()
         self.assertEqual(app.pending_action, "permission")
         self.assertIsNotNone(app.pending_permission)
-        self.assertEqual(app.pending_permission.mode, "grp:w")
+        self.assertEqual(app.pending_permission.mode, "grp:grp")
         self.assertEqual(app.pending_permission.permission_group, "shared")
         self.assertEqual(app.pending_permission.rel_paths, ["remote.txt"])
         self.assertIn("Press y to confirm", app.message)
@@ -1742,7 +1754,7 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path") as preflight,
-            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:r", "")),
+            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:pvt", "")),
         ):
             app.start_action("permission")
 
@@ -1752,7 +1764,7 @@ class PermissionActionTests(unittest.TestCase):
     def test_permission_confirmation_runs_foreground_command_and_refreshes(self) -> None:
         app = self.make_app()
         app.pending_action = "permission"
-        app.pending_permission = tui.PermissionRequest("grp:w", ["remote.txt"], "shared")
+        app.pending_permission = tui.PermissionRequest("grp:grp", ["remote.txt"], "shared")
         process = mock.Mock()
         process.stdout = [
             "[1/3] Collecting skipped non-owned owners...\n",
@@ -1785,7 +1797,7 @@ class PermissionActionTests(unittest.TestCase):
         self.assertIn("find -L remote.txt -user alice ! -group shared -exec chgrp shared {} +", command[2])
         self.assertIn("chmod u+rwx,g+rwx,o-rwx,g+s", command[2])
         self.assertIn("chmod u+rw,g+rw,o-rwx", command[2])
-        print_mock.assert_any_call("Running permission: grp:w")
+        print_mock.assert_any_call("Running permission: grp:grp")
         print_mock.assert_any_call("  alice                12\n", end="")
         app.refresh_manifests.assert_called_once_with(initial_load=False)
         self.assertEqual(
@@ -1796,7 +1808,7 @@ class PermissionActionTests(unittest.TestCase):
     def test_permission_foreground_nonzero_reports_warnings(self) -> None:
         app = self.make_app()
         app.pending_action = "permission"
-        app.pending_permission = tui.PermissionRequest("any:w", ["remote.txt"], "")
+        app.pending_permission = tui.PermissionRequest("any:grp", ["remote.txt"], "")
         process = mock.Mock()
         process.stdout = [
             "Skipped non-owned owners:\n",
@@ -1826,7 +1838,7 @@ class PermissionActionTests(unittest.TestCase):
     def test_permission_foreground_interrupt_reports_refresh(self) -> None:
         app = self.make_app()
         app.pending_action = "permission"
-        app.pending_permission = tui.PermissionRequest("any:w", ["remote.txt"], "")
+        app.pending_permission = tui.PermissionRequest("any:grp", ["remote.txt"], "")
         process = mock.Mock()
         process.stdout = []
         process.wait.return_value = 130
@@ -1853,6 +1865,22 @@ class PermissionActionTests(unittest.TestCase):
         self.assertIsNone(app.pending_permission)
         self.assertEqual(app.message, "Cancelled pending permission action.")
 
+    def test_any_write_permission_requires_double_y_confirmation(self) -> None:
+        app = self.make_app()
+        app.pending_action = "permission"
+        app.pending_permission = tui.PermissionRequest("any:any", ["remote.txt"], "")
+        app.execute_permission_request = mock.Mock()
+
+        app.handle_key(ord("y"))
+
+        app.execute_permission_request.assert_not_called()
+        self.assertTrue(app.pending_permission_any_write_confirmed)
+        self.assertIn("Other writable is dangerous", app.message)
+
+        app.handle_key(ord("y"))
+
+        app.execute_permission_request.assert_called_once()
+
     def test_permission_mode_popup_only_esc_cancels(self) -> None:
         app = self.make_app()
         app.stdscr = mock.Mock()
@@ -1874,7 +1902,7 @@ class PermissionActionTests(unittest.TestCase):
         app._interrupt_requested = True
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [ord("s"), ord("w"), ord("y")]
+        app.stdscr.getch.side_effect = [ord("r"), ord("w"), ord("y")]
         win = mock.Mock()
 
         with (
@@ -1883,14 +1911,14 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("grp:w", "shared"))
+        self.assertEqual(mode, ("grp:grp", "shared"))
         self.assertFalse(app._interrupt_requested)
 
     def test_permission_mode_popup_colors_configured_group_value_green(self) -> None:
         app = self.make_app()
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [ord("s"), 27]
+        app.stdscr.getch.side_effect = [27]
         win = mock.Mock()
 
         with (
@@ -1904,13 +1932,32 @@ class PermissionActionTests(unittest.TestCase):
             any(call.args[2].startswith("shared") and call.args[4] == 500 for call in calls)
         )
 
-    def test_permission_mode_popup_colors_missing_group_value_yellow(self) -> None:
+    def test_permission_mode_popup_dims_missing_group_value(self) -> None:
         app = self.make_app()
         app.permission_group = ""
         app.permission_group_source = "none"
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [ord("s"), 27]
+        app.stdscr.getch.side_effect = [27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+        ):
+            app._choose_permission_mode(1)
+
+        calls = win.addnstr.call_args_list
+        disabled_attr = 600 | tui.curses.A_DIM
+        self.assertTrue(
+            any(call.args[2].startswith("not change group") and call.args[4] == disabled_attr for call in calls)
+        )
+
+    def test_permission_mode_popup_uses_red_for_hidden_any_write(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("r"), ord("r"), ord("W"), 27]
         win = mock.Mock()
 
         with (
@@ -1921,7 +1968,7 @@ class PermissionActionTests(unittest.TestCase):
 
         calls = win.addnstr.call_args_list
         self.assertTrue(
-            any(call.args[2].startswith("not change group") and call.args[4] == 300 for call in calls)
+            any(call.args[2].startswith("any") and call.args[4] == 100 for call in calls)
         )
 
     def test_permission_mode_popup_returns_any_readonly_without_group(self) -> None:
@@ -1930,7 +1977,7 @@ class PermissionActionTests(unittest.TestCase):
         app.permission_group_source = "none"
         app.stdscr = mock.Mock()
         app.stdscr.getmaxyx.return_value = (24, 100)
-        app.stdscr.getch.side_effect = [ord("s"), ord("s"), ord("y")]
+        app.stdscr.getch.side_effect = [ord("r"), ord("r"), ord("y")]
         win = mock.Mock()
 
         with (
@@ -1939,7 +1986,22 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("any:r", ""))
+        self.assertEqual(mode, ("any:pvt", ""))
+
+    def test_permission_mode_popup_hidden_shift_w_returns_any_write(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("r"), ord("r"), ord("W"), ord("y")]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("any:any", "shared"))
 
     def test_diff_shortcuts_use_f_and_permission_uses_p_and_perm_view_uses_shift_p(self) -> None:
         app = self.make_app()
@@ -1966,7 +2028,7 @@ class RemotePermissionCommandTests(unittest.TestCase):
         command = tui.build_remote_permission_command(
             "/root path",
             ["dir one"],
-            "grp:w",
+            "grp:grp",
             "asset team",
             owner="alice",
         )
@@ -1979,20 +2041,31 @@ class RemotePermissionCommandTests(unittest.TestCase):
         self.assertIn("chmod u+rwx,g+rwx,o-rwx,g+s", command)
         self.assertIn("chmod u+rw,g+rw,o-rwx", command)
 
-    def test_permission_command_any_scope_does_not_chgrp(self) -> None:
+    def test_permission_command_any_group_write_keeps_other_readonly(self) -> None:
         command = tui.build_remote_permission_command(
             "/remote",
             ["staging"],
-            "any:r",
+            "any:grp",
             "asset_team",
             owner="alice",
         )
 
-        self.assertNotIn("-exec chgrp", command)
-        self.assertIn("Mode any:r does not use selected group; skipping chgrp.", command)
+        self.assertIn("-exec chgrp asset_team", command)
         self.assertIn("find -L staging -user alice -type d", command)
-        self.assertIn("chmod u+rwx,go+rx,go-w,g+s", command)
-        self.assertIn("chmod u+rw,go+r,go-w", command)
+        self.assertIn("chmod u+rwx,g+rwx,o+rx,o-w,g+s", command)
+        self.assertIn("chmod u+rw,g+rw,o+r,o-w", command)
+
+    def test_permission_command_accepts_legacy_modes(self) -> None:
+        command = tui.build_remote_permission_command(
+            "/remote",
+            ["staging"],
+            "any:r",
+            "",
+            owner="alice",
+        )
+
+        self.assertIn("No selected group; skipping chgrp.", command)
+        self.assertIn("chmod u+rwx,g+rx,g-w,o+rx,o-w,g+s", command)
 
     def test_permission_command_rejects_old_modes(self) -> None:
         with self.assertRaises(ValueError):
@@ -2061,6 +2134,36 @@ class RemotePermissionsScriptTests(unittest.TestCase):
             self.assertEqual(dir_mode & 0o777, 0o755)
             self.assertEqual(dir_mode & 0o2000, 0o2000)
             self.assertEqual(file_mode & 0o777, 0o644)
+
+    def test_any_grp_mode_keeps_other_readonly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "any-group"
+            child_file = target / "data.txt"
+            target.mkdir()
+            child_file.write_text("release\n")
+            target.chmod(0o777)
+            child_file.chmod(0o666)
+
+            subprocess.run(
+                [
+                    "bash",
+                    "setup_remote_permissions.sh",
+                    "--group",
+                    target.group(),
+                    "any:grp",
+                    str(target),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            dir_mode = target.stat().st_mode
+            file_mode = child_file.stat().st_mode
+            self.assertEqual(dir_mode & 0o777, 0o775)
+            self.assertEqual(dir_mode & 0o2000, 0o2000)
+            self.assertEqual(file_mode & 0o777, 0o664)
 
     def test_dry_run_respects_preserved_file_execute_bits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

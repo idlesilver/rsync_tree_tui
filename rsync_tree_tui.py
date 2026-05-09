@@ -31,7 +31,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -53,6 +53,7 @@ DEFAULT_CHECKSUM_SUFFIXES = [
 DEFAULT_PAGINATION_SIZE = 20
 MIN_MAIN_RENDER_WIDTH = 34
 MIN_MAIN_RENDER_HEIGHT = 8
+DIM_TEXT_COLOR_256 = 244
 DEFAULT_DIFF_VIEWERS = ["vim -d {local} {remote}"]
 ANSI_GREEN = "\033[32m"
 ANSI_CYAN = "\033[36m"
@@ -472,7 +473,16 @@ class PermissionRequest:
 
 
 PERMISSION_VIEWS = ("badge", "owner", "group", "mode")
-PERMISSION_SCOPE_ORDER = ("pvt", "grp", "any")
+PERMISSION_READ_ORDER = ("pvt", "grp", "any")
+PERMISSION_WRITE_ORDER = ("pvt", "grp", "any")
+PERMISSION_SCOPE_ORDER = PERMISSION_READ_ORDER
+LEGACY_PERMISSION_MODE_MAP = {
+    "pvt": "pvt:pvt",
+    "grp:r": "grp:pvt",
+    "grp:w": "grp:grp",
+    "any:r": "any:pvt",
+    "any:w": "any:any",
+}
 
 
 class PermissionActionInterrupted(Exception):
@@ -1029,16 +1039,29 @@ def build_remote_owner_preflight_command(
     return build_remote_permission_preflight_command(remote_root, rel_path, owner)
 
 
+def normalize_permission_mode(mode: str) -> str:
+    mode = LEGACY_PERMISSION_MODE_MAP.get(mode, mode)
+    if mode not in {"pvt:pvt", "grp:pvt", "grp:grp", "any:pvt", "any:grp", "any:any"}:
+        raise ValueError(f"Invalid permission mode: {mode}")
+    read_scope, write_scope = mode.split(":", 1)
+    if PERMISSION_READ_ORDER.index(write_scope) > PERMISSION_READ_ORDER.index(read_scope):
+        raise ValueError(f"Invalid permission mode: {mode}")
+    return mode
+
+
 def permission_chmod_modes(mode: str) -> tuple[str, str]:
-    if mode == "pvt":
+    mode = normalize_permission_mode(mode)
+    if mode == "pvt:pvt":
         return ("u+rwx,go-rwx,g-s", "u+rw,go-rwx")
-    if mode == "grp:r":
+    if mode == "grp:pvt":
         return ("u+rwx,g+rx,g-w,o-rwx,g+s", "u+rw,g+r,g-w,o-rwx")
-    if mode == "grp:w":
+    if mode == "grp:grp":
         return ("u+rwx,g+rwx,o-rwx,g+s", "u+rw,g+rw,o-rwx")
-    if mode == "any:r":
-        return ("u+rwx,go+rx,go-w,g+s", "u+rw,go+r,go-w")
-    if mode == "any:w":
+    if mode == "any:pvt":
+        return ("u+rwx,g+rx,g-w,o+rx,o-w,g+s", "u+rw,g+r,g-w,o+r,o-w")
+    if mode == "any:grp":
+        return ("u+rwx,g+rwx,o+rx,o-w,g+s", "u+rw,g+rw,o+r,o-w")
+    if mode == "any:any":
         return ("u+rwx,go+rwx,g+s", "u+rw,go+rw")
     raise ValueError(f"Invalid permission mode: {mode}")
 
@@ -1051,6 +1074,7 @@ def build_remote_permission_command(
     *,
     owner: str = "",
 ) -> str:
+    mode = normalize_permission_mode(mode)
     dir_mode, file_mode = permission_chmod_modes(mode)
     if not rel_paths:
         raise ValueError("No permission paths provided")
@@ -1085,16 +1109,14 @@ def build_remote_permission_command(
         "echo '[2/3] Applying selected group to owned entries...'",
     ]
     owner_filter = f"-user {shlex.quote(owner)}" if owner else '-user "$owner"'
-    if mode.startswith("grp:") and permission_group:
+    if permission_group:
         quoted_group = shlex.quote(permission_group)
         commands.append(
             f"find -L {quoted_paths} {owner_filter} ! -group {quoted_group} "
             f"-exec chgrp {quoted_group} {{}} + || failed=1"
         )
-    elif mode.startswith("grp:"):
-        commands.append("echo 'No selected group; skipping chgrp.'")
     else:
-        commands.append(f"echo 'Mode {mode} does not use selected group; skipping chgrp.'")
+        commands.append("echo 'No selected group; skipping chgrp.'")
     commands.extend(
         [
             "echo '[3/3] Applying chmod to owned directories/files...'",
@@ -1115,18 +1137,15 @@ def build_remote_permission_command(
     return "; ".join(commands)
 
 
-def permission_mode_from_parts(scope: str, writable: bool) -> str:
-    if scope == "pvt":
-        return "pvt"
-    if scope in {"grp", "any"}:
-        return f"{scope}:{'w' if writable else 'r'}"
-    raise ValueError(f"Invalid permission scope: {scope}")
+def permission_mode_from_parts(read_scope: str, write_scope: str) -> str:
+    return normalize_permission_mode(f"{read_scope}:{write_scope}")
 
 
 def permission_result_lines(mode: str, permission_group: str = "") -> list[str]:
+    mode = normalize_permission_mode(mode)
     dir_mode, file_mode = permission_chmod_modes(mode)
     lines = [f"result: {permission_mode_label(mode)}"]
-    if mode.startswith("grp:") and permission_group:
+    if permission_group:
         lines.append(f"  chgrp: {permission_group}")
     lines.append(f"  dirs:  {dir_mode}")
     lines.append(f"  files: {file_mode}")
@@ -1134,11 +1153,19 @@ def permission_result_lines(mode: str, permission_group: str = "") -> list[str]:
 
 
 def permission_mode_label(mode: str) -> str:
-    if mode == "pvt":
+    mode = normalize_permission_mode(mode)
+    if mode == "pvt:pvt":
         return "[pvt:-]"
-    if mode in {"grp:r", "grp:w", "any:r", "any:w"}:
-        scope, write = mode.split(":", 1)
-        return f"[{scope}:{write}]"
+    if mode == "grp:pvt":
+        return "[grp:r]"
+    if mode == "grp:grp":
+        return "[grp:w]"
+    if mode == "any:pvt":
+        return "[any:r]"
+    if mode == "any:grp":
+        return "[any:g]"
+    if mode == "any:any":
+        return "[any:w]"
     raise ValueError(f"Invalid permission mode: {mode}")
 
 
@@ -1522,6 +1549,8 @@ def remote_permission_badge(entry: EntryMeta) -> str:
             return "[grp:w]"
         if mode == 0o755:
             return "[any:r]"
+        if mode == 0o775:
+            return "[any:g]"
         if mode == 0o777:
             return "[any:w]"
     else:
@@ -1535,6 +1564,8 @@ def remote_permission_badge(entry: EntryMeta) -> str:
             return "[grp:w]"
         if mode == 0o644:
             return "[any:r]"
+        if mode == 0o664:
+            return "[any:g]"
         if mode == 0o666:
             return "[any:w]"
     return _mode_label(entry.perms)
@@ -1584,11 +1615,16 @@ def permission_view_color_pair(view: str, entry: EntryMeta | None) -> int:
 def permission_badge_color_segments(label: str) -> list[tuple[str, int, bool]]:
     if label == "[pvt:-]":
         return [(label, 6, True)]
-    if label in {"[grp:r]", "[grp:w]", "[any:r]", "[any:w]"}:
+    if label in {"[grp:r]", "[grp:w]", "[any:r]", "[any:g]", "[any:w]"}:
         scope = label[1:4]
         write = label[5]
         scope_pair = 5 if scope == "grp" else 4
-        write_pair = 8 if write == "r" else 1
+        if write == "r":
+            write_pair = 8
+        elif write == "g":
+            write_pair = 5
+        else:
+            write_pair = 1
         return [
             ("[", 0, False),
             (scope, scope_pair, False),
@@ -1803,6 +1839,7 @@ class SyncApp:
         self.message = "Loading manifests..."
         self.pending_action: str | None = None
         self.pending_permission: PermissionRequest | None = None
+        self.pending_permission_any_write_confirmed = False
         self.pending_check_ignore_metadata = True
         self.pending_check_stop_depth_text = ""
         self.last_cursor_rel_path = ""
@@ -1938,6 +1975,9 @@ class SyncApp:
         if self.permission_group:
             return curses.color_pair(5)
         return curses.color_pair(3)
+
+    def _disabled_text_attr(self) -> int:
+        return curses.color_pair(6) | curses.A_DIM
 
     # ------------------------------- content verification ------------------- #
 
@@ -2251,7 +2291,12 @@ class SyncApp:
         curses.init_pair(3, curses.COLOR_YELLOW, -1)  # help text / local-only
         curses.init_pair(4, curses.COLOR_CYAN, -1)  # remote-only
         curses.init_pair(5, curses.COLOR_GREEN,  -1)   # both exist, confirmed same
-        curses.init_pair(6, curses.COLOR_WHITE, -1)  # [pvt:-] dimmed gray
+        dim_text_color = (
+            DIM_TEXT_COLOR_256
+            if getattr(curses, "COLORS", 0) > DIM_TEXT_COLOR_256
+            else curses.COLOR_WHITE
+        )
+        curses.init_pair(6, dim_text_color, -1)  # dimmed gray
         curses.init_pair(7, curses.COLOR_GREEN, -1)  # reserved permission green
         curses.init_pair(8, curses.COLOR_YELLOW, -1)  # readonly / warning
         curses.init_pair(9, curses.COLOR_MAGENTA, -1)  # numeric permission
@@ -2331,11 +2376,19 @@ class SyncApp:
             elif self.pending_action == "clear":
                 status_text = "Clear ALL selections? Press y to confirm, n to cancel."
             elif self.pending_action == "permission" and self.pending_permission is not None:
-                status_text = (
-                    f"Apply permission {self.pending_permission.mode} to "
-                    f"{len(self.pending_permission.rel_paths)} remote entries. "
-                    "Press y to confirm, n to cancel."
-                )
+                if (
+                    normalize_permission_mode(self.pending_permission.mode) == "any:any"
+                    and getattr(self, "pending_permission_any_write_confirmed", False)
+                ):
+                    status_text = (
+                        "Other writable is dangerous. Press y again to execute, n to cancel."
+                    )
+                else:
+                    status_text = (
+                        f"Apply permission {self.pending_permission.mode} to "
+                        f"{len(self.pending_permission.rel_paths)} remote entries. "
+                        "Press y to confirm, n to cancel."
+                    )
             else:
                 status_text = (
                     f"{self.pending_action} selected entries. Press y to confirm, n to cancel."
@@ -3019,6 +3072,7 @@ class SyncApp:
                 rel_paths=selected_paths,
                 permission_group=permission_group,
             )
+            self.pending_permission_any_write_confirmed = False
             self.pending_action = "permission"
             self.message = (
                 f"Apply permission {mode} to {len(selected_paths)} remote entries. "
@@ -3034,7 +3088,7 @@ class SyncApp:
                 p for p in selected_paths if self._remote_path_writable(p)
             ]
             if not selected_paths:
-                self.message = "No writable remote paths in selection. Check [grp:w]/[any:w] dirs."
+                self.message = "No writable remote paths in selection. Check [grp:w]/[any:g] dirs."
                 self.pending_action = None
                 return
 
@@ -3104,6 +3158,7 @@ class SyncApp:
 
         self.pending_action = None
         self.pending_permission = None
+        self.pending_permission_any_write_confirmed = False
         self.message = (
             f"Applying permission {request.mode} to {len(request.rel_paths)} remote entries..."
         )
@@ -3532,28 +3587,29 @@ class SyncApp:
                 hscroll = max(0, max_line_len - content_w)
 
     def _choose_permission_mode(self, target_count: int) -> tuple[str, str] | None:
-        scope_index = 0
-        writable = False
+        read_index = 0
+        write_scope = "pvt"
         use_selected_group = bool(self.permission_group)
         while True:
             if getattr(self, "_interrupt_requested", False):
                 self._interrupt_requested = False
-            scope = PERMISSION_SCOPE_ORDER[scope_index]
-            mode = permission_mode_from_parts(scope, writable)
-            effective_group = self.permission_group if scope == "grp" and use_selected_group else ""
+            read_scope = PERMISSION_READ_ORDER[read_index]
+            if PERMISSION_READ_ORDER.index(write_scope) > read_index:
+                write_scope = read_scope
+            mode = permission_mode_from_parts(read_scope, write_scope)
+            effective_group = self.permission_group if use_selected_group else ""
             group_value = (
                 self.permission_group
                 if self.permission_group and use_selected_group
                 else "not change group"
             )
-            write_value = "writable" if writable else "readonly"
             lines = [
                 "Remote permission",
                 "",
                 f"Targets: {target_count} selected remote entries",
                 "",
-                f"[s] scope:  {scope}",
-                f"[w] write:  {write_value}",
+                f"[r] read:   {read_scope}",
+                f"[w] write:  {write_scope}",
                 f"[g] group:  {group_value}",
                 "",
                 *permission_result_lines(mode, effective_group),
@@ -3574,15 +3630,26 @@ class SyncApp:
             title = " Permission "
             title_x = max((box_w - self._text_cell_width(title)) // 2, 1)
             self._popup_add_cells(win, 0, title_x, title, box_w - title_x - 1, curses.A_BOLD)
+            disabled_attr = self._disabled_text_attr()
             for row, line in enumerate(lines[: max(box_h - 2, 0)]):
-                if line.startswith("[w] write:") and scope == "pvt":
-                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4, curses.A_DIM)
+                if line.startswith("[w] write:"):
+                    prefix = "[w] write:  "
+                    attr = curses.color_pair(1) if write_scope == "any" else curses.A_NORMAL
+                    self._popup_add_cells(win, row + 1, 2, prefix, box_w - 4)
+                    self._popup_add_cells(
+                        win,
+                        row + 1,
+                        2 + len(prefix),
+                        write_scope,
+                        box_w - 4 - len(prefix),
+                        attr,
+                    )
                 elif line.startswith("[g] group:"):
                     prefix = "[g] group:  "
-                    if scope == "grp":
+                    if self.permission_group:
                         attr = self._permission_group_display_attr() if use_selected_group else curses.color_pair(3)
                     else:
-                        attr = curses.A_DIM
+                        attr = disabled_attr
                     self._popup_add_cells(win, row + 1, 2, prefix, box_w - 4)
                     self._popup_add_cells(
                         win,
@@ -3596,11 +3663,23 @@ class SyncApp:
                     self._popup_add_cells(win, row + 1, 2, line, box_w - 4)
             win.refresh()
             key = self.stdscr.getch()
-            if key in (ord("s"), ord("S")):
-                scope_index = (scope_index + 1) % len(PERMISSION_SCOPE_ORDER)
+            if key in (ord("r"), ord("R")):
+                read_index = (read_index + 1) % len(PERMISSION_READ_ORDER)
+                next_read_scope = PERMISSION_READ_ORDER[read_index]
+                if PERMISSION_READ_ORDER.index(write_scope) > read_index:
+                    write_scope = next_read_scope
                 continue
-            if key in (ord("w"), ord("W")):
-                writable = not writable
+            if key == ord("w"):
+                if write_scope == "pvt":
+                    write_scope = "grp"
+                    if read_scope == "pvt":
+                        read_index = PERMISSION_READ_ORDER.index("grp")
+                else:
+                    write_scope = "pvt"
+                continue
+            if key == ord("W"):
+                if read_scope == "any":
+                    write_scope = "any" if write_scope != "any" else "grp"
                 continue
             if key in (ord("g"), ord("G")):
                 if self.permission_group:
@@ -3650,6 +3729,7 @@ class SyncApp:
             "  [grp:r]          Owner + group read",
             "  [grp:w]          Owner + group write",
             "  [any:r]          Owner + group + other read",
+            "  [any:g]          Owner + group write, other read",
             "  [any:w]          Owner + group + other write",
             "  [ 755 ]          Non-standard numeric mode",
             "",
@@ -3659,8 +3739,8 @@ class SyncApp:
             "",
             "Remote permissions",
             "  p opens a two-dimensional permission editor",
-            "  scope: pvt / grp / any",
-            "  write: readonly / writable (ignored for pvt)",
+            "  read: pvt / grp / any",
+            "  write: pvt / grp",
             "  group: selected group / not change group (grp only)",
             "",
             "Check",
@@ -3886,11 +3966,23 @@ class SyncApp:
                 self._handle_pending_check_key(key)
                 return
             if key == ord("y"):
+                if (
+                    self.pending_action == "permission"
+                    and self.pending_permission is not None
+                    and normalize_permission_mode(self.pending_permission.mode) == "any:any"
+                    and not getattr(self, "pending_permission_any_write_confirmed", False)
+                ):
+                    self.pending_permission_any_write_confirmed = True
+                    self.message = (
+                        "Other writable is dangerous. Press y again to execute, n to cancel."
+                    )
+                    return
                 self.execute_pending_action()
             elif key == ord("n"):
                 cancelled_action = self.pending_action
                 self.pending_action = None
                 self.pending_permission = None
+                self.pending_permission_any_write_confirmed = False
                 if cancelled_action == "permission":
                     self.message = "Cancelled pending permission action."
                 elif cancelled_action == "check":
