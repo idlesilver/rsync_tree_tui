@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.2.6`
+当前版本：`v0.2.7`
 
 ## 运行
 
@@ -12,6 +12,12 @@ python rsync_tree_tui.py --remote user@host:/path/to/remote
 python rsync_tree_tui.py
 python rsync_tree_tui.py --version
 python rsync_tree_tui.py --update
+```
+
+推荐设置一个本地 alias：
+
+```bash
+alias rsynctui="python /path/to/rsync_tree_tui.py"
 ```
 
 依赖命令：
@@ -239,6 +245,7 @@ q                  退出
 当前发布 tag：
 
 ```text
+v0.2.7
 v0.2.6
 v0.2.5
 v0.2.4

@@ -31,7 +31,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -51,6 +51,8 @@ DEFAULT_CHECKSUM_SUFFIXES = [
     ".md",
 ]
 DEFAULT_PAGINATION_SIZE = 20
+MIN_MAIN_RENDER_WIDTH = 34
+MIN_MAIN_RENDER_HEIGHT = 8
 DEFAULT_DIFF_VIEWERS = ["vim -d {local} {remote}"]
 ANSI_GREEN = "\033[32m"
 ANSI_CYAN = "\033[36m"
@@ -1256,6 +1258,8 @@ def node_has_difference(node: TreeNode) -> bool:
             node.has_difference_cache = True
         elif not node.children_loaded:
             node.has_difference_cache = False
+        elif node.children_status_unchecked:
+            node.has_difference_cache = False
         else:
             node.has_difference_cache = any(
                 node_has_difference(child_node) for child_node in node.children.values()
@@ -1275,7 +1279,7 @@ def node_is_confirmed_same(node: TreeNode) -> bool:
         elif node_has_self_difference(node):
             node.confirmed_same_cache = False
         elif node_is_directory(node):
-            if not node.children_loaded:
+            if not node.children_loaded or node.children_status_unchecked:
                 node.confirmed_same_cache = False
             else:
                 node.confirmed_same_cache = all(
@@ -1745,6 +1749,7 @@ class TreeNode:
     right_load_error: str = ""
     children: dict[str, TreeNode] = field(default_factory=dict)
     children_loaded: bool = False
+    children_status_unchecked: bool = False
     is_expanded: bool = False
     is_selected: bool = False
     content_verified_same: bool = (
@@ -2185,12 +2190,14 @@ class SyncApp:
                 clear_node_caches(child_node, include_sorted=True)
             child_node.left_entry = new_left
             child_node.right_entry = new_right
+            child_node.children_status_unchecked = False
             if not node_is_directory(child_node):
                 child_node.children_loaded = True
                 child_node.children = {}
             node.children[child_name] = child_node
 
         node.children_loaded = True
+        node.children_status_unchecked = bool(limited and total_count > self.pagination_size)
         clear_node_caches(node, include_sorted=True)
         clear_ancestor_caches(node.parent)
 
@@ -2276,6 +2283,9 @@ class SyncApp:
         stdscr = self.stdscr
         stdscr.erase()
         height, width = stdscr.getmaxyx()
+        if height < MIN_MAIN_RENDER_HEIGHT or width < MIN_MAIN_RENDER_WIDTH:
+            self._render_too_small_warning(height, width)
+            return
 
         header_left = f"Local:  {self.local_root}"
         header_right = f"Remote: {self.remote_spec}"
@@ -2380,26 +2390,29 @@ class SyncApp:
                 row_color = 0  # white/default
                 row_attr = (curses.A_REVERSE if is_cursor_row else curses.A_DIM) | row_color
                 stdscr.addnstr(screen_row, 0, "    ", selection_width, row_attr)
-                stdscr.addnstr(
+                self._addnstr_clipped(
                     screen_row,
                     selection_width,
                     render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index]),
                     panel_width,
                     row_attr,
+                    width,
                 )
-                stdscr.addnstr(
+                self._addnstr_clipped(
                     screen_row,
                     selection_width + panel_width,
                     " " * badge_width,
                     badge_width,
                     curses.A_DIM,
+                    width,
                 )
-                stdscr.addnstr(
+                self._addnstr_clipped(
                     screen_row,
                     selection_width + panel_width + badge_width,
                     render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index]),
                     panel_width,
                     row_attr,
+                    width,
                 )
                 continue
 
@@ -2422,15 +2435,16 @@ class SyncApp:
             marker_attr = row_attr
             if selection_state(node) != SelectionState.UNSELECTED:
                 marker_attr |= curses.A_BOLD
-            stdscr.addnstr(screen_row, 0, marker_text, selection_width, marker_attr)
+            self._addnstr_clipped(screen_row, 0, marker_text, selection_width, marker_attr, width)
 
             left_attr = row_attr | (curses.A_BOLD if left_exists else 0)
-            stdscr.addnstr(
+            self._addnstr_clipped(
                 screen_row,
                 selection_width,
                 render_side_cell(node, "left", panel_width, tree_prefix=tree_prefixes[visible_index]),
                 panel_width,
                 left_attr,
+                width,
             )
 
             badge_text = ""
@@ -2454,33 +2468,93 @@ class SyncApp:
                         segment_attr |= curses.A_DIM
                     if is_cursor_row:
                         segment_attr |= curses.A_REVERSE
-                    stdscr.addnstr(
+                    self._addnstr_clipped(
                         screen_row,
                         segment_x,
                         segment_text,
                         max(badge_width - (segment_x - badge_x), 0),
                         segment_attr,
+                        width,
                     )
                     segment_x += len(segment_text)
             else:
-                stdscr.addnstr(
+                self._addnstr_clipped(
                     screen_row,
                     badge_x,
                     badge_text,
                     badge_width,
                     badge_attr,
+                    width,
                 )
 
             right_attr = row_attr | (curses.A_BOLD if right_exists else 0)
-            stdscr.addnstr(
+            self._addnstr_clipped(
                 screen_row,
                 selection_width + panel_width + badge_width,
                 render_side_cell(node, "right", panel_width, tree_prefix=tree_prefixes[visible_index]),
                 panel_width,
                 right_attr,
+                width,
             )
 
         stdscr.refresh()
+
+    def _render_too_small_warning(self, height: int, width: int) -> None:
+        self.footer_shortcut_hits = []
+        if height <= 0 or width <= 1:
+            self.stdscr.refresh()
+            return
+
+        warning_attr = curses.color_pair(8) | curses.A_BOLD
+        lines = [
+            "Window too small",
+            f"Need {MIN_MAIN_RENDER_WIDTH}x{MIN_MAIN_RENDER_HEIGHT}+",
+            "Resize terminal",
+        ]
+        if height < 5 or width < 20:
+            self._addnstr_clipped(0, 0, "Resize terminal", width - 1, warning_attr, width)
+            self.stdscr.refresh()
+            return
+
+        content_width = max(len(line) for line in lines)
+        box_width = min(max(content_width + 4, 20), width - 1)
+        box_height = min(len(lines) + 2, height)
+        top = max((height - box_height) // 2, 0)
+        left = max((width - box_width) // 2, 0)
+
+        border = "+" + "-" * max(box_width - 2, 0) + "+"
+        self._addnstr_clipped(top, left, border, box_width, warning_attr, width)
+        for index, line in enumerate(lines[: max(box_height - 2, 0)]):
+            row = top + 1 + index
+            padded = line.center(max(box_width - 4, 0))
+            self._addnstr_clipped(row, left, f"| {padded} |", box_width, warning_attr, width)
+        if box_height >= 2:
+            self._addnstr_clipped(
+                top + box_height - 1,
+                left,
+                border,
+                box_width,
+                warning_attr,
+                width,
+            )
+        self.stdscr.refresh()
+
+    def _addnstr_clipped(
+        self,
+        y: int,
+        x: int,
+        text: str,
+        max_chars: int,
+        attr: int,
+        screen_width: int,
+    ) -> None:
+        right_edge = screen_width - 1
+        if x < 0 or x >= right_edge or max_chars <= 0:
+            return
+        clipped_chars = min(max_chars, right_edge - x)
+        if clipped_chars <= 0:
+            return
+        self.stdscr.addnstr(y, x, text, clipped_chars, attr)
 
     def _render_footer_shortcuts(self, y: int, width: int) -> None:
         nav_shortcuts = [
@@ -2746,6 +2820,10 @@ class SyncApp:
             return
         if node.rel_path and (node.left_entry is None or node.right_entry is None):
             return
+        if node.children_status_unchecked:
+            node.children_status_unchecked = False
+            clear_node_caches(node)
+            clear_ancestor_caches(node.parent)
         if not node.children_loaded:
             self.message = f"Checking {node.rel_path or '/'} ..."
             self.render()
@@ -2772,6 +2850,10 @@ class SyncApp:
     def _load_check_children(self, node: TreeNode) -> None:
         if self._interrupt_requested or not self._can_check_descend(node):
             return
+        if node.children_status_unchecked:
+            node.children_status_unchecked = False
+            clear_node_caches(node)
+            clear_ancestor_caches(node.parent)
         if not node.children_loaded:
             self.message = f"Checking {node.rel_path or '/'} ..."
             self.render()

@@ -220,6 +220,8 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
+    FUTURE_VERSION = "0.2.8"
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.config_path = Path(self.tmp.name) / "config.json"
@@ -229,12 +231,12 @@ class AutoUpdateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def remote_source(self, version: str | None) -> tui.RemoteUpdateSource:
-        source_version = version or "0.2.7"
+        source_version = version or self.FUTURE_VERSION
         source = f'#!/usr/bin/env python3\n__version__ = "{source_version}"\n# rsync\n'
         return tui.RemoteUpdateSource(source=source, version=version)
 
     def run_prompt_with_input(self, answer: str) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.7"
+        self.config_data["auto_update"]["latest_version"] = self.FUTURE_VERSION
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -259,8 +261,8 @@ class AutoUpdateTests(unittest.TestCase):
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
     def test_cached_auto_update_skips_configured_version(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.7"
-        self.config_data["auto_update"]["skipped_version"] = "0.2.7"
+        self.config_data["auto_update"]["latest_version"] = self.FUTURE_VERSION
+        self.config_data["auto_update"]["skipped_version"] = self.FUTURE_VERSION
 
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
@@ -276,14 +278,14 @@ class AutoUpdateTests(unittest.TestCase):
             self.run_prompt_with_input("")
 
         auto_update = self.config_data["auto_update"]
-        self.assertEqual(auto_update["last_prompted_version"], "0.2.7")
+        self.assertEqual(auto_update["last_prompted_version"], self.FUTURE_VERSION)
         self.assertEqual(auto_update["last_prompted_at"], "2026-04-27T12:00:00+08:00")
         self.assertEqual(auto_update["skipped_version"], "")
 
     def test_cached_auto_update_skip_records_skipped_version(self) -> None:
         self.run_prompt_with_input("s")
 
-        self.assertEqual(self.config_data["auto_update"]["skipped_version"], "0.2.7")
+        self.assertEqual(self.config_data["auto_update"]["skipped_version"], self.FUTURE_VERSION)
 
     def test_cached_auto_update_disable_turns_off_checks(self) -> None:
         self.run_prompt_with_input("d")
@@ -291,21 +293,21 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertFalse(self.config_data["auto_update"]["enabled"])
 
     def test_cached_auto_update_update_downloads_payload_installs_and_exits(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.7"
+        self.config_data["auto_update"]["latest_version"] = self.FUTURE_VERSION
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
             mock.patch("builtins.input", return_value="u"),
-            mock.patch("rsync_tree_tui.install_remote_update", return_value="0.2.7") as install,
+            mock.patch("rsync_tree_tui.install_remote_update", return_value=self.FUTURE_VERSION) as install,
         ):
             with self.assertRaises(SystemExit) as raised:
                 tui.maybe_prompt_for_cached_auto_update(self.config_path, self.config_data)
 
         self.assertEqual(raised.exception.code, 0)
-        install.assert_called_once_with("0.2.7")
+        install.assert_called_once_with(self.FUTURE_VERSION)
 
     def test_cached_auto_update_payload_failure_exits_without_replacing(self) -> None:
-        self.config_data["auto_update"]["latest_version"] = "0.2.7"
+        self.config_data["auto_update"]["latest_version"] = self.FUTURE_VERSION
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("builtins.print"),
@@ -323,12 +325,12 @@ class AutoUpdateTests(unittest.TestCase):
         with (
             mock.patch("rsync_tree_tui.sys.stdin.isatty", return_value=True),
             mock.patch("rsync_tree_tui.current_local_iso8601", return_value="2026-04-27T12:00:00+08:00"),
-            mock.patch("rsync_tree_tui.download_remote_version", return_value="0.2.7"),
+            mock.patch("rsync_tree_tui.download_remote_version", return_value=self.FUTURE_VERSION),
         ):
             tui.background_refresh_latest_version(self.config_path, self.config_data)
 
         data = tui.load_json_config(self.config_path)
-        self.assertEqual(data["auto_update"]["latest_version"], "0.2.7")
+        self.assertEqual(data["auto_update"]["latest_version"], self.FUTURE_VERSION)
         self.assertEqual(data["auto_update"]["latest_checked_at"], "2026-04-27T12:00:00+08:00")
 
     def test_background_check_treats_version_failure_as_no_update(self) -> None:
@@ -641,6 +643,63 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(tui.remote_permission_badge(entry), "[pvt:-]")
         self.assertEqual(tui.badge_color_pair(entry), 6)
 
+    def test_large_loaded_directory_stays_unexplored_until_check(self) -> None:
+        root = tui.TreeNode(
+            name="dataset",
+            rel_path="dataset",
+            left_entry=tui.EntryMeta("dataset", tui.EntryType.DIRECTORY, 0, 1, 0o755),
+            right_entry=tui.EntryMeta("dataset", tui.EntryType.DIRECTORY, 0, 1, 0o755),
+            children_loaded=True,
+            children_status_unchecked=True,
+        )
+        child = tui.TreeNode(
+            name="0001.png",
+            rel_path="dataset/0001.png",
+            parent=root,
+            left_entry=tui.EntryMeta("dataset/0001.png", tui.EntryType.FILE, 1, 1, 0o644),
+            right_entry=tui.EntryMeta("dataset/0001.png", tui.EntryType.FILE, 2, 1, 0o644),
+            children_loaded=True,
+        )
+        root.children = {"0001.png": child}
+
+        self.assertFalse(tui.node_has_difference(root))
+        self.assertFalse(tui.node_is_confirmed_same(root))
+
+        root.children_status_unchecked = False
+        tui.clear_node_caches(root)
+        self.assertTrue(tui.node_has_difference(root))
+
+    def test_limited_large_directory_load_marks_child_status_unchecked(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        app.pagination_size = 1
+        app.message = ""
+        app._interrupt_requested = False
+        app.node_by_rel_path = {}
+        node = tui.TreeNode(
+            name="dataset",
+            rel_path="dataset",
+            left_entry=tui.EntryMeta("dataset", tui.EntryType.DIRECTORY, 0, 1, 0o755),
+            right_entry=tui.EntryMeta("dataset", tui.EntryType.DIRECTORY, 0, 1, 0o755),
+        )
+        app.node_by_rel_path["dataset"] = node
+        app.list_local_child_entries = mock.Mock(
+            return_value={
+                "0001.png": tui.EntryMeta("dataset/0001.png", tui.EntryType.FILE, 1, 1, 0o644),
+                "0002.png": tui.EntryMeta("dataset/0002.png", tui.EntryType.FILE, 1, 1, 0o644),
+            }
+        )
+        app.list_remote_child_entries = mock.Mock(
+            return_value={
+                "0001.png": tui.EntryMeta("dataset/0001.png", tui.EntryType.FILE, 2, 1, 0o644),
+                "0002.png": tui.EntryMeta("dataset/0002.png", tui.EntryType.FILE, 1, 1, 0o644),
+            }
+        )
+
+        app.load_children(node, limited=True)
+
+        self.assertTrue(node.children_status_unchecked)
+        self.assertFalse(tui.node_has_difference(node))
+
     def test_permission_label_views_use_fixed_brackets(self) -> None:
         entry = tui.EntryMeta(
             rel_path="dataset",
@@ -706,6 +765,61 @@ class RenderTests(unittest.TestCase):
                 for call in calls
             )
         )
+
+    def test_render_too_narrow_window_shows_warning_only(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        remote_file = tui.TreeNode(
+            name="asset.bin",
+            rel_path="asset.bin",
+            parent=root,
+            right_entry=tui.EntryMeta(
+                rel_path="asset.bin",
+                entry_type=tui.EntryType.FILE,
+                size=1,
+                mtime_s=1,
+                perms=0o644,
+            ),
+        )
+        root.children = {"asset.bin": remote_file}
+        app.root_node = root
+        app.local_root = Path("/local")
+        app.remote_spec = "host:/remote"
+        app.cursor_index = 0
+        app.scroll_offset = 0
+        app.message = ""
+        app.pending_action = None
+        app.pending_permission = None
+        app.footer_shortcut_hits = []
+        app.pagination_size = tui.DEFAULT_PAGINATION_SIZE
+        app.last_cursor_rel_path = ""
+        app.permission_view = "mode"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (10, 24)
+        written: list[str] = []
+
+        def strict_addnstr(y: int, x: int, text: str, n: int, _attr: int = 0) -> None:
+            self.assertGreaterEqual(y, 0)
+            self.assertGreaterEqual(x, 0)
+            self.assertLess(x, 23)
+            self.assertGreater(n, 0)
+            self.assertLessEqual(x + n, 23)
+            written.append(text[:n])
+
+        app.stdscr.addnstr.side_effect = strict_addnstr
+
+        with (
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+            mock.patch("rsync_tree_tui.curses.A_REVERSE", 0),
+        ):
+            app.render()
+
+        rendered = "\n".join(written)
+        self.assertIn("Window too small", rendered)
+        self.assertIn("Resize terminal", rendered)
+        self.assertNotIn("LOCAL", rendered)
+        self.assertNotIn("asset.bin", rendered)
+        self.assertEqual(app.footer_shortcut_hits, [])
 
 
 class PopupTextTests(unittest.TestCase):

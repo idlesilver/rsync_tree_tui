@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-05-09
+
+### Added
+
+- README 增加 `rsynctui` alias 推荐配置。
+
+### Changed
+
+- 主界面普通展开大目录时不再聚合子层 diff 状态，目录保持未检测白色；显式 check 仍会恢复完整检查。
+
+### Fixed
+
+- 主界面窗口过窄时只显示 resize warning，避免 curses 越界渲染崩溃。
+
 ## [0.2.6] - 2026-05-08
 
 ### Changed
