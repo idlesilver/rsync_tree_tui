@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -31,7 +32,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -51,10 +52,37 @@ DEFAULT_CHECKSUM_SUFFIXES = [
     ".md",
 ]
 DEFAULT_PAGINATION_SIZE = 20
+DEFAULT_ESC_DELAY_MS = 25
+DEFAULT_MOUSE_WHEEL_STEP = 1
+DEFAULT_MOUSE_WHEEL_COALESCE_MS = 0
 MIN_MAIN_RENDER_WIDTH = 34
 MIN_MAIN_RENDER_HEIGHT = 8
 DIM_TEXT_COLOR_256 = 244
 DEFAULT_DIFF_VIEWERS = ["vim -d {local} {remote}"]
+DEFAULT_FILE_EDITOR = "vim {file}"
+DEFAULT_IMAGE_OPENER = (
+    "sh -c 'timg \"$1\" && printf \"\\nPress Ctrl+C to return to rsync-tree-tui...\\n\" "
+    "&& sleep 2147483647' timg-view {file}"
+)
+IMAGE_FILE_SUFFIXES = {
+    ".apng",
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+SYSTEM_FILE_OPENERS = {
+    "darwin": "open {file}",
+    "linux": "xdg-open {file}",
+    "win32": "start {file}",
+}
 ANSI_GREEN = "\033[32m"
 ANSI_CYAN = "\033[36m"
 ANSI_YELLOW = "\033[33m"
@@ -85,6 +113,12 @@ def default_config_data() -> dict[str, object]:
             "checksum_suffixes": DEFAULT_CHECKSUM_SUFFIXES,
         },
         "diff_viewers": DEFAULT_DIFF_VIEWERS,
+        "file_editor": DEFAULT_FILE_EDITOR,
+        "image_opener": DEFAULT_IMAGE_OPENER,
+        "mouse_wheel": {
+            "step": DEFAULT_MOUSE_WHEEL_STEP,
+            "coalesce_ms": DEFAULT_MOUSE_WHEEL_COALESCE_MS,
+        },
         "permission_group": "",
         "known_connections": [],
     }
@@ -120,6 +154,13 @@ def load_json_config(config_path: Path) -> dict[str, object]:
 def save_json_config(config_path: Path, data: dict[str, object]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def configure_escape_delay(delay_ms: int = DEFAULT_ESC_DELAY_MS) -> None:
+    if hasattr(curses, "set_escdelay"):
+        curses.set_escdelay(delay_ms)
+    else:
+        os.environ.setdefault("ESCDELAY", str(delay_ms))
 
 
 def read_dotenv(env_file: Path) -> dict[str, str]:
@@ -351,6 +392,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         permission_group = str(config_data["permission_group"])
         permission_group_source = "global config"
 
+    file_editor = resolve_file_editor(config_data)
     return AppConfig(
         local_root=local_root,
         remote_spec=remote,
@@ -358,6 +400,9 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         config_data=config_data,
         checksum_policy=ChecksumPolicy.from_config(config_data),
         diff_viewers=parse_diff_viewers(config_data),
+        file_editor=file_editor,
+        image_opener=resolve_image_opener(config_data, file_editor),
+        mouse_wheel=parse_mouse_wheel_config(config_data),
         permission_group=permission_group,
         permission_group_source=permission_group_source,
         pagination_size=int(config_data.get("pagination_size", DEFAULT_PAGINATION_SIZE)),
@@ -434,6 +479,34 @@ def parse_diff_viewers(config_data: dict[str, object]) -> list[str]:
     return viewers or DEFAULT_DIFF_VIEWERS
 
 
+@dataclass(slots=True)
+class MouseWheelConfig:
+    step: int
+    coalesce_ms: int
+
+
+def _parse_int_config(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_mouse_wheel_config(config_data: dict[str, object]) -> MouseWheelConfig:
+    value = config_data.get("mouse_wheel", {})
+    if not isinstance(value, dict):
+        value = {}
+    step = _parse_int_config(value.get("step"), DEFAULT_MOUSE_WHEEL_STEP)
+    coalesce_ms = _parse_int_config(
+        value.get("coalesce_ms"),
+        DEFAULT_MOUSE_WHEEL_COALESCE_MS,
+    )
+    return MouseWheelConfig(
+        step=max(1, step),
+        coalesce_ms=max(0, coalesce_ms),
+    )
+
+
 def is_supported_external_diff_viewer(command: str) -> bool:
     try:
         argv = shlex.split(command)
@@ -453,6 +526,81 @@ def is_supported_external_diff_viewer(command: str) -> bool:
 
 
 @dataclass(slots=True)
+class FileEditor:
+    command: str
+    can_modify: bool
+    source: str
+    wait: bool = True
+
+
+def resolve_file_editor(
+    config_data: dict[str, object],
+    *,
+    environ: dict[str, str] | os._Environ[str] | None = None,
+    platform: str | None = None,
+) -> FileEditor:
+    env = os.environ if environ is None else environ
+    configured = config_data.get("file_editor")
+    if isinstance(configured, str) and configured.strip():
+        command = configured.strip()
+        if command != DEFAULT_FILE_EDITOR or shutil.which("vim") is not None:
+            return FileEditor(command, True, "config")
+
+    for env_name in ("VISUAL", "EDITOR"):
+        value = env.get(env_name)
+        if value:
+            return FileEditor(f"{value} {{file}}", True, f"${env_name}")
+
+    platform_name = platform or sys.platform
+    command = SYSTEM_FILE_OPENERS.get(platform_name)
+    if command is None and platform_name.startswith("linux"):
+        command = SYSTEM_FILE_OPENERS["linux"]
+    if command is None:
+        command = "vi {file}"
+        return FileEditor(command, True, "fallback")
+    return FileEditor(command, False, "system opener", wait=False)
+
+
+def resolve_image_opener(
+    config_data: dict[str, object],
+    file_editor: FileEditor,
+) -> FileEditor:
+    configured = config_data.get("image_opener", DEFAULT_IMAGE_OPENER)
+    command = configured if isinstance(configured, str) and configured.strip() else DEFAULT_IMAGE_OPENER
+    command = command.strip()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return file_editor
+    executable = "timg" if command == DEFAULT_IMAGE_OPENER else argv[0] if argv else ""
+    if executable and shutil.which(executable) is not None:
+        return FileEditor(command, False, "image_opener")
+    return file_editor
+
+
+def is_image_file_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in IMAGE_FILE_SUFFIXES
+
+
+def build_file_editor_command(editor: FileEditor, file_path: Path) -> list[str]:
+    try:
+        argv = shlex.split(editor.command)
+    except ValueError as exc:
+        raise ValueError(f"Invalid file editor command: {exc}") from exc
+    if not argv:
+        raise ValueError("Invalid file editor command: empty command")
+
+    format_values = {"file": str(file_path)}
+    try:
+        command = [part.format(**format_values) for part in argv]
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"Invalid file editor placeholder: {exc}") from exc
+    if not any("{file}" in part for part in argv):
+        command.append(str(file_path))
+    return command
+
+
+@dataclass(slots=True)
 class AppConfig:
     local_root: Path
     remote_spec: str
@@ -460,6 +608,9 @@ class AppConfig:
     config_data: dict[str, object]
     checksum_policy: ChecksumPolicy
     diff_viewers: list[str]
+    file_editor: FileEditor
+    image_opener: FileEditor
+    mouse_wheel: MouseWheelConfig
     permission_group: str = ""
     permission_group_source: str = "none"
     pagination_size: int = DEFAULT_PAGINATION_SIZE
@@ -470,6 +621,12 @@ class PermissionRequest:
     mode: str
     rel_paths: list[str]
     permission_group: str
+
+
+@dataclass(slots=True)
+class RemoteEditUploadRequest:
+    rel_path: str
+    temp_root: Path
 
 
 PERMISSION_VIEWS = ("badge", "owner", "group", "mode")
@@ -1081,6 +1238,7 @@ def build_remote_permission_command(
 
     quoted_paths = " ".join(shlex.quote(rel_path) for rel_path in rel_paths)
     quoted_owner = shlex.quote(owner) if owner else "$(id -un)"
+    owner_filter = shlex.quote(owner) if owner else '"$owner"'
     commands = [
         "failed=0",
         f"owner={quoted_owner}",
@@ -1092,7 +1250,7 @@ def build_remote_permission_command(
         f"cd {shlex.quote(remote_root)} || exit 1",
         "echo '[1/3] Collecting skipped non-owned owners...'",
         (
-            f"find -L {quoted_paths} ! -user {shlex.quote(owner) if owner else '\"$owner\"'} "
+            f"find -L {quoted_paths} ! -user {owner_filter} "
             "-printf '%u\\n' > \"$owner_tmp\" 2> \"$owner_err\" || true"
         ),
         "echo 'Skipped non-owned owners:'",
@@ -1839,6 +1997,7 @@ class SyncApp:
         self.message = "Loading manifests..."
         self.pending_action: str | None = None
         self.pending_permission: PermissionRequest | None = None
+        self.pending_remote_edit_upload: RemoteEditUploadRequest | None = None
         self.pending_permission_any_write_confirmed = False
         self.pending_check_ignore_metadata = True
         self.pending_check_stop_depth_text = ""
@@ -1846,8 +2005,13 @@ class SyncApp:
         self.initial_connection_ok = False
         self.list_layout: ListLayout | None = None
         self.footer_shortcut_hits: list[FooterShortcutHit] = []
+        self.last_wheel_direction: int | None = None
+        self.last_wheel_at: float = 0.0
         self.pagination_size = config.pagination_size
         self.diff_viewers = config.diff_viewers
+        self.file_editor = config.file_editor
+        self.image_opener = config.image_opener
+        self.mouse_wheel = config.mouse_wheel
         self.permission_group = config.permission_group
         self.permission_group_source = config.permission_group_source
         self.permission_view = "badge"
@@ -2113,6 +2277,50 @@ class SyncApp:
         self.ensure_cursor_visible()
         self.message = f"Loaded {len(self.root_node.children)} root entries."
 
+    def _refresh_file_manifest_side(self, rel_path: str, side: str) -> bool:
+        node = self.node_by_rel_path.get(rel_path)
+        if node is None:
+            return False
+
+        try:
+            if side == "left":
+                entry_by_path = list_local_tree_entries(self.local_root, rel_path)
+                new_entry = entry_by_path.get(rel_path)
+                if new_entry != node.left_entry:
+                    node.content_verified_same = False
+                    clear_node_caches(node, include_sorted=True)
+                node.left_entry = new_entry
+                node.left_load_error = ""
+            elif side == "right":
+                entry_by_path = list_remote_tree_entries(
+                    self.remote_target,
+                    self.remote_root,
+                    rel_path,
+                    self._ssh_opts(),
+                )
+                new_entry = entry_by_path.get(rel_path)
+                if new_entry != node.right_entry:
+                    node.content_verified_same = False
+                    clear_node_caches(node, include_sorted=True)
+                node.right_entry = new_entry
+                node.right_load_error = ""
+            else:
+                raise ValueError(f"Invalid manifest side: {side}")
+        except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+            if side == "left":
+                node.left_load_error = str(exc)
+            else:
+                node.right_load_error = str(exc)
+            self.message = f"Error refreshing {side} {rel_path}: {exc}"
+            clear_ancestor_caches(node)
+            return False
+
+        if not node_is_directory(node):
+            node.children_loaded = True
+            node.children = {}
+        clear_ancestor_caches(node)
+        return True
+
     def initialize_tree(self) -> None:
         self.root_node = TreeNode(name="", rel_path="", is_expanded=True)
         self.node_by_rel_path = {"": self.root_node}
@@ -2283,6 +2491,7 @@ class SyncApp:
 
         curses.curs_set(0)
         stdscr.keypad(True)
+        configure_escape_delay()
         curses.mousemask(mouse_event_mask())
         curses.mouseinterval(180)
         curses.use_default_colors()
@@ -2389,6 +2598,14 @@ class SyncApp:
                         f"{len(self.pending_permission.rel_paths)} remote entries. "
                         "Press y to confirm, n to cancel."
                     )
+            elif (
+                self.pending_action == "remote_edit_upload"
+                and self.pending_remote_edit_upload is not None
+            ):
+                status_text = (
+                    f"Upload edited remote file {self.pending_remote_edit_upload.rel_path}? "
+                    "Press y to confirm, n to cancel."
+                )
             else:
                 status_text = (
                     f"{self.pending_action} selected entries. Press y to confirm, n to cancel."
@@ -2619,6 +2836,7 @@ class SyncApp:
             ("d", "download", ord("d")),
             ("u", "upload", ord("u")),
             ("f/F", "diff", ord("f")),
+            ("o/O", "open", ord("o")),
             ("p/P", "permission", ord("p")),
             ("c", "check", ord("c")),
             ("x", "clear", ord("x")),
@@ -2827,10 +3045,10 @@ class SyncApp:
                 return
 
         if mouse_has_button(bstate, "BUTTON4_PRESSED"):
-            self.move_cursor_by(-1)
+            self._handle_mouse_wheel(-1)
             return
         if mouse_has_button(bstate, "BUTTON5_PRESSED"):
-            self.move_cursor_by(1)
+            self._handle_mouse_wheel(1)
             return
 
         if not mouse_is_primary_click(bstate):
@@ -2862,6 +3080,26 @@ class SyncApp:
             return
         if mouse_has_button(bstate, "BUTTON1_DOUBLE_CLICKED"):
             self.toggle_expand_current_directory()
+
+    def _handle_mouse_wheel(self, direction: int) -> None:
+        mouse_wheel = getattr(
+            self,
+            "mouse_wheel",
+            MouseWheelConfig(
+                step=DEFAULT_MOUSE_WHEEL_STEP,
+                coalesce_ms=DEFAULT_MOUSE_WHEEL_COALESCE_MS,
+            ),
+        )
+        coalesce_seconds = max(0, mouse_wheel.coalesce_ms) / 1000
+        if coalesce_seconds > 0:
+            now = time.monotonic()
+            last_direction = getattr(self, "last_wheel_direction", None)
+            last_at = getattr(self, "last_wheel_at", 0.0)
+            self.last_wheel_direction = direction
+            self.last_wheel_at = now
+            if last_direction == direction and now - last_at < coalesce_seconds:
+                return
+        self.move_cursor_by(direction * max(1, mouse_wheel.step))
 
     # ------------------------------- sync logic ----------------------------- #
 
@@ -3327,6 +3565,10 @@ class SyncApp:
             self.execute_permission_request()
             return
 
+        if self.pending_action == "remote_edit_upload":
+            self._execute_remote_edit_upload()
+            return
+
         action = self.pending_action
         source_side = "right" if action == "download" else "left"
         selected_paths = sorted(collect_selected_paths(self.root_node, source_side))
@@ -3586,6 +3828,229 @@ class SyncApp:
             elif key == getattr(curses, "KEY_END", -1):
                 hscroll = max(0, max_line_len - content_w)
 
+    # ------------------------------- file editor ---------------------------- #
+
+    def _file_opener_for_path(self, file_path: Path) -> FileEditor:
+        if is_image_file_path(file_path):
+            return getattr(self, "image_opener", self.file_editor)
+        return self.file_editor
+
+    def _run_file_editor(self, file_path: Path) -> FileEditor | None:
+        opener = self._file_opener_for_path(file_path)
+        try:
+            command = build_file_editor_command(opener, file_path)
+        except ValueError as exc:
+            self.message = str(exc)
+            return None
+
+        if opener.wait:
+            should_suspend = hasattr(self, "stdscr")
+            if should_suspend:
+                self.suspend_tui()
+            try:
+                result = subprocess.run(command)
+            finally:
+                if should_suspend:
+                    self.resume_tui()
+            if (
+                result.returncode in (130, -signal.SIGINT)
+                and not opener.can_modify
+            ):
+                self._interrupt_requested = False
+                return opener
+            if result.returncode != 0:
+                self.message = f"Opener exited with status {result.returncode}."
+                return None
+            return opener
+
+        try:
+            subprocess.Popen(command)
+        except OSError as exc:
+            self.message = f"Failed to open file: {exc}"
+            return None
+        return opener
+
+    def _try_open_local_file(self) -> None:
+        node = self.current_node()
+        if node is None:
+            return
+        if node_is_directory(node):
+            self.message = "Open file is only available for files, not directories."
+            return
+        if not node_exists_on_left(node):
+            self.message = "Local open requires the file to exist on the local side."
+            return
+
+        local_path = self.local_root / node.rel_path
+        if not local_path.exists():
+            self.message = f"Local file does not exist: {node.rel_path}"
+            return
+
+        opener = self._run_file_editor(local_path)
+        if opener is not None:
+            if opener.can_modify:
+                if self._refresh_file_manifest_side(node.rel_path, "left"):
+                    self.message = f"Opened local file {node.rel_path}."
+            else:
+                self.message = (
+                    f"Opened local file {node.rel_path}; press r to refresh after external edits."
+                )
+
+    def _try_open_remote_file(self) -> None:
+        node = self.current_node()
+        if node is None:
+            return
+        if node_is_directory(node):
+            self.message = "Open remote file is only available for files, not directories."
+            return
+        if not node_exists_on_right(node):
+            self.message = "Remote open requires the file to exist on the remote side."
+            return
+
+        remote_path = f"{self.remote_root.rstrip('/')}/{node.rel_path}"
+        self.message = f"Fetching remote {node.rel_path}..."
+        if hasattr(self, "stdscr"):
+            self.render()
+
+        try:
+            fetch = subprocess.run(
+                ["ssh", *self._ssh_opts(), self.remote_target, f"cat {shlex.quote(remote_path)}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            err = exc.stderr.decode(errors="replace").strip() if exc.stderr else str(exc)
+            self.message = f"Failed to fetch remote file: {err or '(no output)'}"
+            return
+
+        temp_root = Path(tempfile.mkdtemp(prefix=f"{APP_NAME}-remote-edit-"))
+        temp_path = temp_root / node.rel_path
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_bytes(fetch.stdout)
+        before_hash = hashlib.sha256(fetch.stdout).hexdigest()
+
+        opener = self._run_file_editor(temp_path)
+        if opener is None:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            return
+
+        if not opener.can_modify:
+            self.message = (
+                f"Opened temporary remote copy {node.rel_path}; system opener cannot upload changes."
+            )
+            return
+
+        after_hash = hashlib.sha256(temp_path.read_bytes()).hexdigest()
+        if after_hash == before_hash:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            self.message = f"Remote file {node.rel_path} closed without changes."
+            return
+
+        self.pending_remote_edit_upload = RemoteEditUploadRequest(
+            rel_path=node.rel_path,
+            temp_root=temp_root,
+        )
+        self.pending_action = "remote_edit_upload"
+        self.message = (
+            f"Upload edited remote file {node.rel_path}? Press y to confirm, n to cancel."
+        )
+
+    def _execute_remote_edit_upload(self) -> None:
+        request = self.pending_remote_edit_upload
+        self.pending_action = None
+        self.pending_remote_edit_upload = None
+        if request is None:
+            self.message = "No pending remote edit upload."
+            return
+        try:
+            if not self._remote_path_writable(request.rel_path):
+                self.message = "Remote file is not writable; edited temporary copy was discarded."
+                return
+            if self._execute_upload_from_local_root([request.rel_path], request.temp_root):
+                self._refresh_file_manifest_side(request.rel_path, "right")
+                self.message = "Completed edited file upload."
+        finally:
+            shutil.rmtree(request.temp_root, ignore_errors=True)
+
+    def _execute_upload_from_local_root(
+        self,
+        selected_paths: list[str],
+        source_local_root: Path,
+    ) -> bool:
+        entry_by_path: dict[str, EntryMeta] = {}
+        for rel_path in selected_paths:
+            local_path = source_local_root / rel_path
+            if not local_path.exists():
+                continue
+            stat = local_path.stat()
+            entry_by_path[rel_path] = EntryMeta(
+                rel_path=rel_path,
+                entry_type=EntryType.DIRECTORY if local_path.is_dir() else EntryType.FILE,
+                size=stat.st_size,
+                mtime_s=int(stat.st_mtime),
+                perms=stat.st_mode & 0o777,
+            )
+
+        upload_paths = sorted(entry_by_path)
+        sync_groups = self._split_paths_by_checksum(upload_paths, entry_by_path)
+        if not sync_groups:
+            self.message = "No source paths were found during recursive expansion."
+            return False
+
+        ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
+        commands: list[tuple[Path, bool, list[str]]] = []
+        for use_checksum, group_paths in sync_groups:
+            with tempfile.NamedTemporaryFile("wb", delete=False) as file_list_file:
+                for rel_path in group_paths:
+                    file_list_file.write(rel_path.encode("utf-8"))
+                    file_list_file.write(b"\0")
+                file_list_path = Path(file_list_file.name)
+            commands.append(
+                (
+                    file_list_path,
+                    use_checksum,
+                    build_rsync_command(
+                        file_list_path,
+                        format_local_root(source_local_root),
+                        format_remote_root(self.remote_target, self.remote_root),
+                        ssh_cmd,
+                        use_checksum,
+                    ),
+                )
+            )
+
+        if hasattr(self, "stdscr"):
+            self.suspend_tui()
+        sync_ok = False
+        try:
+            for _file_list_path, use_checksum, command in commands:
+                mode = "checksum" if use_checksum else "size+mtime"
+                if hasattr(self, "stdscr"):
+                    print(f"Running {mode}: {' '.join(command)}")
+                subprocess.run(command, check=True)
+            if hasattr(self, "stdscr"):
+                input("Upload completed. Press Enter to return to the TUI...")
+            sync_ok = True
+        except subprocess.CalledProcessError as exc:
+            if hasattr(self, "stdscr"):
+                input(
+                    f"Upload failed (rsync exit code {exc.returncode}). "
+                    "Press Enter to return to the TUI..."
+                )
+        finally:
+            for file_list_path, _use_checksum, _command in commands:
+                file_list_path.unlink(missing_ok=True)
+            if hasattr(self, "stdscr"):
+                self.resume_tui()
+
+        self.message = (
+            "Completed edited file upload."
+            if sync_ok
+            else "Upload failed - check terminal output above for details."
+        )
+        return sync_ok
+
     def _choose_permission_mode(self, target_count: int) -> tuple[str, str] | None:
         read_index = 0
         write_scope = "pvt"
@@ -3705,6 +4170,8 @@ class SyncApp:
             "u                  Upload selected    (local → remote)",
             "f                  Preview diff in built-in popup (red entries only)",
             "F                  Preview diff with external viewer (vim -d by default)",
+            "o                  Open local file with configured editor",
+            "O                  Open remote temp copy; changed copy can upload",
             "p                  Configure remote permissions for selected entries",
             "P                  Cycle PERM column: badge / owner / group / mode",
             "c                  Configure and check selected entries",
@@ -3736,6 +4203,19 @@ class SyncApp:
             "Diff preview",
             "  f uses built-in popup with Left/Right horizontal pan",
             "  F uses vim -d by default, or configured diff viewer",
+            "",
+            "File open",
+            "  file_editor supports {file}, e.g. vim {file}",
+            "  image_opener supports {file}, defaults to foreground timg",
+            "  timg stays open until Ctrl+C returns to the TUI",
+            "  If timg is unavailable, image files fall back to file_editor",
+            "  Default GUI opener is view-only for remote temp copies",
+            "  Changed remote temp copies ask y/n before single-file upload",
+            "",
+            "Mouse wheel",
+            "  mouse_wheel.step controls rows per event",
+            "  mouse_wheel.coalesce_ms filters repeated reports",
+            "  Default coalesce_ms=0 keeps continuous scrolling smooth",
             "",
             "Remote permissions",
             "  p opens a two-dimensional permission editor",
@@ -3983,10 +4463,23 @@ class SyncApp:
                 self.pending_action = None
                 self.pending_permission = None
                 self.pending_permission_any_write_confirmed = False
+                pending_remote_edit_upload = getattr(
+                    self,
+                    "pending_remote_edit_upload",
+                    None,
+                )
+                if pending_remote_edit_upload is not None:
+                    shutil.rmtree(
+                        pending_remote_edit_upload.temp_root,
+                        ignore_errors=True,
+                    )
+                    self.pending_remote_edit_upload = None
                 if cancelled_action == "permission":
                     self.message = "Cancelled pending permission action."
                 elif cancelled_action == "check":
                     self.message = "Cancelled pending check."
+                elif cancelled_action == "remote_edit_upload":
+                    self.message = "Cancelled remote edit upload."
                 else:
                     self.message = "Cancelled pending sync action."
             return  # block all other keys while confirmation is pending
@@ -4030,6 +4523,12 @@ class SyncApp:
             return
         if key == ord("F"):
             self._try_preview_diff(external=True)
+            return
+        if key == ord("o"):
+            self._try_open_local_file()
+            return
+        if key == ord("O"):
+            self._try_open_remote_file()
             return
         if key == ord("p"):
             self.start_action("permission")

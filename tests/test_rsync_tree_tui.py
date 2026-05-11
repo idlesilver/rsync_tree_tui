@@ -1,5 +1,7 @@
 import argparse
 import os
+import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,6 +53,15 @@ class ConfigTests(unittest.TestCase):
             },
         )
         self.assertEqual(data["diff_viewers"], tui.DEFAULT_DIFF_VIEWERS)
+        self.assertEqual(data["file_editor"], tui.DEFAULT_FILE_EDITOR)
+        self.assertEqual(data["image_opener"], tui.DEFAULT_IMAGE_OPENER)
+        self.assertEqual(
+            data["mouse_wheel"],
+            {
+                "step": 1,
+                "coalesce_ms": 0,
+            },
+        )
         self.assertTrue(config_path.exists())
 
     def test_config_file_backfills_auto_update_defaults(self) -> None:
@@ -218,9 +229,72 @@ class ConfigTests(unittest.TestCase):
             ["delta", "vimdiff {local} {remote}"],
         )
 
+    def test_file_editor_uses_configured_editor(self) -> None:
+        editor = tui.resolve_file_editor({"file_editor": "nvim {file}"}, environ={})
+
+        self.assertEqual(editor.command, "nvim {file}")
+        self.assertTrue(editor.can_modify)
+        self.assertEqual(editor.source, "config")
+
+    def test_default_file_editor_falls_back_to_readonly_system_opener_when_vim_missing(self) -> None:
+        with mock.patch("rsync_tree_tui.shutil.which", return_value=None):
+            editor = tui.resolve_file_editor(
+                {"file_editor": tui.DEFAULT_FILE_EDITOR},
+                environ={},
+                platform="linux",
+            )
+
+        self.assertEqual(editor.command, "xdg-open {file}")
+        self.assertFalse(editor.can_modify)
+        self.assertEqual(editor.source, "system opener")
+
+    def test_image_opener_uses_default_timg_when_available(self) -> None:
+        file_editor = tui.FileEditor("nvim {file}", True, "config")
+
+        with mock.patch("rsync_tree_tui.shutil.which", return_value="/usr/bin/timg"):
+            opener = tui.resolve_image_opener(
+                {"image_opener": tui.DEFAULT_IMAGE_OPENER},
+                file_editor,
+            )
+
+        self.assertEqual(opener.command, tui.DEFAULT_IMAGE_OPENER)
+        self.assertFalse(opener.can_modify)
+        self.assertTrue(opener.wait)
+        self.assertEqual(opener.source, "image_opener")
+
+    def test_image_opener_falls_back_to_file_editor_when_timg_missing(self) -> None:
+        file_editor = tui.FileEditor("nvim {file}", True, "config")
+
+        with mock.patch("rsync_tree_tui.shutil.which", return_value=None):
+            opener = tui.resolve_image_opener(
+                {"image_opener": tui.DEFAULT_IMAGE_OPENER},
+                file_editor,
+            )
+
+        self.assertIs(opener, file_editor)
+
+    def test_mouse_wheel_config_defaults_to_smooth_single_row(self) -> None:
+        config = tui.parse_mouse_wheel_config({})
+
+        self.assertEqual(config.step, 1)
+        self.assertEqual(config.coalesce_ms, 0)
+
+    def test_mouse_wheel_config_clamps_invalid_low_values(self) -> None:
+        config = tui.parse_mouse_wheel_config(
+            {
+                "mouse_wheel": {
+                    "step": 0,
+                    "coalesce_ms": -1,
+                }
+            }
+        )
+
+        self.assertEqual(config.step, 1)
+        self.assertEqual(config.coalesce_ms, 0)
+
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.9"
+    FUTURE_VERSION = "0.2.10"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -430,6 +504,245 @@ class AutoUpdateTests(unittest.TestCase):
             tui.install_remote_update("0.2.7")
 
         install.assert_not_called()
+
+
+class FileOpenTests(unittest.TestCase):
+    def make_app_with_current_node(self, node: tui.TreeNode, local_root: Path) -> tui.SyncApp:
+        root = tui.TreeNode(name="", rel_path="", children_loaded=True, is_expanded=True)
+        node.parent = root
+        root.children[node.name] = node
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        app.root_node = root
+        app.node_by_rel_path = {"": root, node.rel_path: node}
+        app.cursor_index = 0
+        app.scroll_offset = 0
+        app.pagination_size = tui.DEFAULT_PAGINATION_SIZE
+        app.local_root = local_root
+        app.remote_target = "user@example"
+        app.remote_root = "/remote/root"
+        app.config = argparse.Namespace(
+            checksum_policy=tui.ChecksumPolicy(
+                mode="balanced",
+                size_threshold_bytes=1024,
+                checksum_suffixes={".txt"},
+            )
+        )
+        app._ssh_opts = mock.Mock(return_value=[])
+        app._remote_path_writable = mock.Mock(return_value=True)
+        app.file_editor = tui.FileEditor("sh -c true {file}", True, "config")
+        app.image_opener = tui.FileEditor(tui.DEFAULT_IMAGE_OPENER, False, "image_opener")
+        app.message = ""
+        app.pending_action = None
+        app.pending_remote_edit_upload = None
+        app.refresh_manifests = mock.Mock()
+        return app
+
+    def test_o_opens_local_file_and_refreshes_only_that_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_root = Path(tmp_dir)
+            (local_root / "notes.txt").write_text("local\n")
+            node = tui.TreeNode(
+                name="notes.txt",
+                rel_path="notes.txt",
+                left_entry=tui.EntryMeta(
+                    rel_path="notes.txt",
+                    entry_type=tui.EntryType.FILE,
+                    size=6,
+                    mtime_s=1,
+                    perms=0o644,
+                ),
+            )
+            app = self.make_app_with_current_node(node, local_root)
+            updated_entry = tui.EntryMeta(
+                rel_path="notes.txt",
+                entry_type=tui.EntryType.FILE,
+                size=13,
+                mtime_s=2,
+                perms=0o644,
+            )
+
+            with (
+                mock.patch(
+                    "rsync_tree_tui.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ) as run,
+                mock.patch(
+                    "rsync_tree_tui.list_local_tree_entries",
+                    return_value={"notes.txt": updated_entry},
+                ) as list_local,
+            ):
+                app.handle_key(ord("o"))
+
+            run.assert_called_once_with(["sh", "-c", "true", str(local_root / "notes.txt")])
+            list_local.assert_called_once_with(local_root, "notes.txt")
+            app.refresh_manifests.assert_not_called()
+            self.assertEqual(node.left_entry, updated_entry)
+
+    def test_o_opens_local_image_with_image_opener_without_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_root = Path(tmp_dir)
+            (local_root / "preview.png").write_bytes(b"png")
+            node = tui.TreeNode(
+                name="preview.png",
+                rel_path="preview.png",
+                left_entry=tui.EntryMeta(
+                    rel_path="preview.png",
+                    entry_type=tui.EntryType.FILE,
+                    size=3,
+                    mtime_s=1,
+                    perms=0o644,
+                ),
+            )
+            app = self.make_app_with_current_node(node, local_root)
+
+            with mock.patch(
+                "rsync_tree_tui.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ) as run:
+                app.handle_key(ord("o"))
+
+            run.assert_called_once_with(
+                [
+                    "sh",
+                    "-c",
+                    'timg "$1" && printf "\\nPress Ctrl+C to return to rsync-tree-tui...\\n" && sleep 2147483647',
+                    "timg-view",
+                    str(local_root / "preview.png"),
+                ]
+            )
+            app.refresh_manifests.assert_not_called()
+
+    def test_image_opener_ctrl_c_returns_to_tui_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_root = Path(tmp_dir)
+            image_path = local_root / "preview.png"
+            image_path.write_bytes(b"png")
+            node = tui.TreeNode(
+                name="preview.png",
+                rel_path="preview.png",
+                left_entry=tui.EntryMeta(
+                    rel_path="preview.png",
+                    entry_type=tui.EntryType.FILE,
+                    size=3,
+                    mtime_s=1,
+                    perms=0o644,
+                ),
+            )
+            app = self.make_app_with_current_node(node, local_root)
+            app._interrupt_requested = True
+
+            with mock.patch(
+                "rsync_tree_tui.subprocess.run",
+                return_value=subprocess.CompletedProcess([], -signal.SIGINT),
+            ):
+                opener = app._run_file_editor(image_path)
+
+            self.assertIsNotNone(opener)
+            self.assertFalse(app._interrupt_requested)
+            self.assertEqual(app.message, "")
+
+    def test_O_prompts_for_single_file_upload_after_remote_edit_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_root = Path(tmp_dir)
+            node = tui.TreeNode(
+                name="notes.txt",
+                rel_path="notes.txt",
+                right_entry=tui.EntryMeta(
+                    rel_path="notes.txt",
+                    entry_type=tui.EntryType.FILE,
+                    size=7,
+                    mtime_s=1,
+                    perms=0o664,
+                ),
+            )
+            app = self.make_app_with_current_node(node, local_root)
+
+            def run_side_effect(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+                if command and command[0] == "ssh":
+                    return subprocess.CompletedProcess(command, 0, stdout=b"before\n", stderr=b"")
+                Path(command[-1]).write_text("after\n")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch("rsync_tree_tui.subprocess.run", side_effect=run_side_effect):
+                app.handle_key(ord("O"))
+
+            self.assertEqual(app.pending_action, "remote_edit_upload")
+            self.assertEqual(app.pending_remote_edit_upload.rel_path, "notes.txt")
+            self.assertTrue((app.pending_remote_edit_upload.temp_root / "notes.txt").exists())
+
+    def test_remote_edit_confirmation_uploads_single_file_with_rsync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_root = Path(tmp_dir)
+            node = tui.TreeNode(
+                name="notes.txt",
+                rel_path="notes.txt",
+                right_entry=tui.EntryMeta(
+                    rel_path="notes.txt",
+                    entry_type=tui.EntryType.FILE,
+                    size=7,
+                    mtime_s=1,
+                    perms=0o664,
+                ),
+            )
+            app = self.make_app_with_current_node(node, local_root)
+            temp_root = Path(tempfile.mkdtemp())
+            try:
+                (temp_root / "notes.txt").write_text("after\n")
+                app.pending_action = "remote_edit_upload"
+                app.pending_remote_edit_upload = tui.RemoteEditUploadRequest(
+                    rel_path="notes.txt",
+                    temp_root=temp_root,
+                )
+
+                updated_entry = tui.EntryMeta(
+                    rel_path="notes.txt",
+                    entry_type=tui.EntryType.FILE,
+                    size=6,
+                    mtime_s=2,
+                    perms=0o664,
+                )
+                with (
+                    mock.patch(
+                        "rsync_tree_tui.subprocess.run",
+                        return_value=subprocess.CompletedProcess([], 0),
+                    ) as run,
+                    mock.patch(
+                        "rsync_tree_tui.list_remote_tree_entries",
+                        return_value={"notes.txt": updated_entry},
+                    ) as list_remote,
+                ):
+                    app.handle_key(ord("y"))
+
+                rsync_calls = [
+                    call.args[0]
+                    for call in run.call_args_list
+                    if call.args and call.args[0] and call.args[0][0] == "rsync"
+                ]
+                self.assertEqual(len(rsync_calls), 1)
+                self.assertEqual(
+                    len([arg for arg in rsync_calls[0] if arg.startswith("--files-from=")]),
+                    1,
+                )
+                self.assertIn(tui.format_local_root(temp_root), rsync_calls[0])
+                self.assertIn(tui.format_remote_root("user@example", "/remote/root"), rsync_calls[0])
+                list_remote.assert_called_once_with(
+                    "user@example",
+                    "/remote/root",
+                    "notes.txt",
+                    [],
+                )
+                app.refresh_manifests.assert_not_called()
+                self.assertEqual(node.right_entry, updated_entry)
+            finally:
+                shutil.rmtree(temp_root, ignore_errors=True)
+
+
+class CursesConfigTests(unittest.TestCase):
+    def test_configure_escape_delay_uses_short_delay(self) -> None:
+        with mock.patch("rsync_tree_tui.curses.set_escdelay", create=True) as set_escdelay:
+            tui.configure_escape_delay()
+
+        set_escdelay.assert_called_once_with(tui.DEFAULT_ESC_DELAY_MS)
 
 
 class KnownConnectionDisplayTests(unittest.TestCase):
@@ -1012,6 +1325,7 @@ class MouseTests(unittest.TestCase):
         app.message = ""
         app.pending_action = None
         app.diff_viewers = tui.DEFAULT_DIFF_VIEWERS
+        app.mouse_wheel = tui.MouseWheelConfig(step=1, coalesce_ms=0)
         return app
 
     def test_list_layout_hit_test(self) -> None:
@@ -1086,6 +1400,65 @@ class MouseTests(unittest.TestCase):
             app.handle_mouse_event()
 
         move.assert_called_once_with(1)
+
+    def test_mouse_wheel_burst_moves_every_reported_event_by_default(self) -> None:
+        app = self.make_app_with_nodes()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 4, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON5_PRESSED" in names,
+            ),
+            mock.patch(
+                "rsync_tree_tui.time.monotonic",
+                side_effect=[10.00, 10.01, 10.02],
+            ),
+            mock.patch.object(app, "move_cursor_by") as move,
+        ):
+            app.handle_mouse_event()
+            app.handle_mouse_event()
+            app.handle_mouse_event()
+
+        move.assert_has_calls([mock.call(1), mock.call(1), mock.call(1)])
+
+    def test_mouse_wheel_configured_coalesce_moves_one_row_for_burst(self) -> None:
+        app = self.make_app_with_nodes()
+        app.mouse_wheel = tui.MouseWheelConfig(step=1, coalesce_ms=50)
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 4, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON5_PRESSED" in names,
+            ),
+            mock.patch(
+                "rsync_tree_tui.time.monotonic",
+                side_effect=[10.00, 10.01, 10.02],
+            ),
+            mock.patch.object(app, "move_cursor_by") as move,
+        ):
+            app.handle_mouse_event()
+            app.handle_mouse_event()
+            app.handle_mouse_event()
+
+        move.assert_called_once_with(1)
+
+    def test_mouse_wheel_configured_step_moves_multiple_rows(self) -> None:
+        app = self.make_app_with_nodes()
+        app.mouse_wheel = tui.MouseWheelConfig(step=3, coalesce_ms=0)
+
+        with (
+            mock.patch("rsync_tree_tui.curses.getmouse", return_value=(0, 8, 4, 0, 1)),
+            mock.patch(
+                "rsync_tree_tui.mouse_has_button",
+                side_effect=lambda _bstate, *names: "BUTTON5_PRESSED" in names,
+            ),
+            mock.patch.object(app, "move_cursor_by") as move,
+        ):
+            app.handle_mouse_event()
+
+        move.assert_called_once_with(3)
 
     def test_mouse_motion_without_click_is_ignored(self) -> None:
         app = self.make_app_with_nodes()

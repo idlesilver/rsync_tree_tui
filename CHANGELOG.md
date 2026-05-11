@@ -6,6 +6,24 @@
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-05-11
+
+### Added
+
+- 新增 `o` / `O` 打开文件：`o` 直接编辑 local 文件；`O` 拉取 remote 临时副本，修改后可确认执行单文件 upload。
+- 默认配置增加 `file_editor: "vim {file}"`，支持 `{file}` 占位符；默认 `vim` 不可用时会继续 fallback。
+- 默认配置增加 `image_opener`；图片文件优先用前台 `timg` image opener，`timg` 不可用时 fallback 到 `file_editor`。
+- 新增 `mouse_wheel.step` / `mouse_wheel.coalesce_ms` 配置；默认不合并滚轮事件以保持连续滚动顺滑。
+
+### Changed
+
+- `o` / `O` 编辑文件后只刷新当前文件的 manifest，不再触发全量刷新。
+
+### Fixed
+
+- 修复 permission shell command 构造中的 f-string 语法错误，避免启动时报 `SyntaxError`。
+- 缩短 curses `Esc` 判定延迟，使 diff/help 等弹窗按 Esc 关闭更快。
+
 ## [0.2.8] - 2026-05-09
 
 ### Changed

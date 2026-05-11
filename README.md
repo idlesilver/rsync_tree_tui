@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.2.8`
+当前版本：`v0.2.9`
 
 ## 运行
 
@@ -28,6 +28,18 @@ rsync
 diff
 GNU find with -printf
 ```
+
+推荐安装可选工具：
+
+```bash
+# Debian / Ubuntu
+sudo apt install vim neovim timg
+
+# Conda
+conda install -c conda-forge vim neovim timg
+```
+
+`vim` 是默认文件编辑器；`nvim` 可手动配置为 `file_editor`。`timg` 用于在终端中预览图片文件；没有安装 `timg` 时，图片会 fallback 到 `file_editor`。
 
 ## 配置优先级
 
@@ -103,6 +115,34 @@ RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
     "vimdiff {local} {remote}",
     "nvim -d {local} {remote}"
   ]
+}
+```
+
+### File Editor
+
+`o` 使用配置的编辑器直接打开 local 文件，编辑器退出后刷新 manifest。`O` 会先把 remote 文件拉到本地临时副本，用编辑器打开；如果临时副本有修改，会提示是否执行单文件 upload，确认后复用现有 upload/rsync 逻辑写回 remote。
+
+默认生成的配置文件会写入 `file_editor: "vim {file}"` 和 `image_opener`。如果没有安装 `vim`，会继续按 fallback 规则选择编辑器；如果没有安装 `timg`，图片文件会 fallback 到 `file_editor`。默认 `image_opener` 会让 `timg` 作为前台进程保持显示，按 Ctrl+C 回到 TUI。可以手动改为：
+
+```json
+{
+  "file_editor": "vim {file}",
+  "image_opener": "sh -c 'timg \"$1\" && printf \"\\nPress Ctrl+C to return to rsync-tree-tui...\\n\" && sleep 2147483647' timg-view {file}"
+}
+```
+
+默认 `vim` 不可用或旧配置未配置时，优先使用 `VISUAL` / `EDITOR` 环境变量；如果只能 fallback 到系统 GUI opener（如 `xdg-open` / `open`），remote 临时副本只作为查看，不会提示上传修改。此时要修改 remote 文件，应先下载到 local，修改后再 upload。
+
+### Mouse Wheel
+
+鼠标滚轮默认每个上报事件移动一行，不做合并，避免连续滚动时卡顿。如果某些终端或鼠标把一个滚轮刻度上报成多个同向事件，可以手动设置 `coalesce_ms` 过滤短时间重复事件；`step` 控制每个有效滚轮事件移动的行数。
+
+```json
+{
+  "mouse_wheel": {
+    "step": 1,
+    "coalesce_ms": 0
+  }
 }
 ```
 
@@ -220,6 +260,8 @@ d                  下载选中项
 u                  上传选中项
 f                  内置弹窗预览当前文件 diff
 F                  外部工具预览当前文件 diff（默认 vim -d）
+o                  用编辑器打开 local 文件
+O                  打开 remote 临时副本，修改后可确认单文件上传
 p                  对选中远端项递归变更权限
 c                  配置并递归检查选中项
 x                  清空选择
@@ -235,7 +277,7 @@ q                  退出
 单击行             移动光标到该行
 单击复选框列       切换该行选择
 双击目录           展开或折叠目录
-双击底部快捷键     触发 Space/d/u/f/p/P/c/x/r/? 对应功能
+双击底部快捷键     触发 Space/d/u/f/o/p/P/c/x/r/? 对应功能
 ```
 
 ## 版本
@@ -245,6 +287,7 @@ q                  退出
 当前发布 tag：
 
 ```text
+v0.2.9
 v0.2.8
 v0.2.7
 v0.2.6
