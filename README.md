@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比本地目录和远端 rsync 目标，并交互式选择文件或目录进行上传、下载、校验和 diff preview。
 
-当前版本：`v0.2.9`
+当前版本：`v0.2.10`
 
 ## 运行
 
@@ -23,10 +23,10 @@ alias rsynctui="python /path/to/rsync_tree_tui.py"
 依赖命令：
 
 ```text
-ssh
 rsync
 diff
 GNU find with -printf
+ssh（仅 SSH remote 模式需要）
 ```
 
 推荐安装可选工具：
@@ -69,7 +69,9 @@ RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
 ```
 
-`.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。`.env` 中的 `RSYNC_TREE_TUI_LOCAL_ROOT=./storage` 这类相对路径会相对 `.env` 所在目录解析；CLI 参数和 shell 环境变量中的相对路径仍相对启动目录解析。
+`remote` 可以是 SSH rsync 目标（`user@host:/path`、`ssh-config-name:/path`），也可以是本地路径。以 `/`、`./`、`../`、`~` 开头的值会按本地路径处理，即使路径中包含冒号，例如 GVFS SMB 挂载路径 `/run/user/1000/gvfs/smb-share:server=...`。不含冒号的值也会按本地路径处理；`host:path` 这类歧义形式保持 SSH remote 语义。
+
+`.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。`.env` 中的 `RSYNC_TREE_TUI_LOCAL_ROOT=./storage` 和本地 `RSYNC_TREE_TUI_REMOTE=./nas` 这类相对路径会相对 `.env` 所在目录解析；CLI 参数和 shell 环境变量中的相对路径仍相对启动目录解析。本地 remote 会在 known connections 中保存为绝对路径；local root 和本地 remote 路径相同或互相嵌套时会拒绝启动。
 
 ## 全局配置
 
@@ -212,6 +214,14 @@ printf "remote value\n" > "$remote_dir/sub/different.txt"
 python rsync_tree_tui.py \
   --local-root "$local_dir" \
   --remote "localhost:$remote_dir"
+```
+
+本地 remote 模式不需要 SSH：
+
+```bash
+python rsync_tree_tui.py \
+  --local-root "$local_dir" \
+  --remote "$remote_dir"
 ```
 
 ## Checksum Policy

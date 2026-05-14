@@ -123,6 +123,38 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.permission_group, "cli_group")
         self.assertEqual(config.permission_group_source, "cli")
 
+    def test_absolute_remote_path_with_colon_is_local_remote(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        local_root = Path(self.tmp.name) / "local"
+        gvfs_path = "/run/user/1000/gvfs/smb-share:server=disk.galbot.vip,share=simvla/long_horizon_vla"
+        args = argparse.Namespace(
+            local_root=local_root,
+            remote=gvfs_path,
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertTrue(config.remote_is_local)
+        self.assertEqual(config.remote_spec, str(Path(gvfs_path).resolve()))
+
+    def test_host_colon_remote_stays_ssh_remote(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        args = argparse.Namespace(
+            local_root=Path("local"),
+            remote="disk-alias:/data",
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertFalse(config.remote_is_local)
+        self.assertEqual(config.remote_spec, "disk-alias:/data")
+
     def test_dotenv_local_root_relative_to_dotenv_parent(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
         project_dir = Path("project")
@@ -147,6 +179,28 @@ class ConfigTests(unittest.TestCase):
             (Path(self.tmp.name) / "project" / "storage").resolve(),
         )
 
+    def test_dotenv_local_remote_relative_to_dotenv_parent(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        project_dir = Path("project")
+        project_dir.mkdir()
+        env_file = project_dir / ".env"
+        env_file.write_text("RSYNC_TREE_TUI_REMOTE=./nas\n")
+        args = argparse.Namespace(
+            local_root=Path("../local"),
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertTrue(config.remote_is_local)
+        self.assertEqual(
+            config.remote_spec,
+            str((Path(self.tmp.name) / "project" / "nas").resolve()),
+        )
+
     def test_shell_env_local_root_stays_relative_to_cwd(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
         os.environ["RSYNC_TREE_TUI_LOCAL_ROOT"] = "./storage"
@@ -162,6 +216,19 @@ class ConfigTests(unittest.TestCase):
         config = tui.resolve_app_config(args)
 
         self.assertEqual(config.local_root, (Path(self.tmp.name) / "storage").resolve())
+
+    def test_local_remote_must_not_be_nested_under_local_root(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        args = argparse.Namespace(
+            local_root=Path("local"),
+            remote="./local/nas",
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must not be nested"):
+            tui.resolve_app_config(args)
 
     def test_cli_local_root_stays_relative_to_cwd(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
@@ -294,7 +361,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.10"
+    FUTURE_VERSION = "0.2.11"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -758,6 +825,11 @@ class KnownConnectionDisplayTests(unittest.TestCase):
             ("", "example.com", ":/data/assets"),
         )
 
+    def test_remote_display_keeps_local_path_with_colon_intact(self) -> None:
+        path = "/run/user/1000/gvfs/smb-share:server=disk,share=simvla/root"
+
+        self.assertEqual(tui.split_remote_for_display(path), ("", path, ""))
+
     def test_colored_remote_display_uses_ansi_segments(self) -> None:
         text = tui.format_remote_for_display("alice@example.com:/data", use_color=True)
 
@@ -875,6 +947,18 @@ class ChecksumPolicyTests(unittest.TestCase):
 
         self.assertIn("--whole-file", whole_file_cmd)
         self.assertNotIn("--whole-file", default_cmd)
+
+    def test_build_rsync_command_omits_remote_shell_for_local_remote(self) -> None:
+        command = tui.build_rsync_command(
+            Path("/tmp/list"),
+            "/src/",
+            "/dst/",
+            "",
+            False,
+        )
+
+        self.assertNotIn("-e", command)
+        self.assertNotIn("ssh", command)
 
 
 class RenderTests(unittest.TestCase):
@@ -2177,6 +2261,32 @@ class PermissionActionTests(unittest.TestCase):
             app.message,
             "Permission completed and refreshed. Skipped non-owned: alice=12, bob=3.",
         )
+
+    def test_local_remote_permission_runs_without_ssh(self) -> None:
+        app = self.make_app()
+        app.remote_is_local = True
+        app.remote_target = ""
+        app.remote_root = "/mnt/nas"
+        app.remote_spec = "/mnt/nas"
+        app.pending_action = "permission"
+        app.pending_permission = tui.PermissionRequest("grp:grp", ["remote.txt"], "shared")
+        process = mock.Mock()
+        process.stdout = ["Summary:\n", "  status: success\n"]
+        process.wait.return_value = 0
+
+        with (
+            mock.patch.object(app, "suspend_tui"),
+            mock.patch.object(app, "resume_tui"),
+            mock.patch("builtins.print"),
+            mock.patch("builtins.input"),
+            mock.patch("rsync_tree_tui.subprocess.Popen", return_value=process) as popen,
+        ):
+            app.handle_key(ord("y"))
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:2], ["bash", "-lc"])
+        self.assertIn("cd /mnt/nas", command[2])
+        self.assertIn("find -L remote.txt -user alice", command[2])
 
     def test_permission_foreground_nonzero_reports_warnings(self) -> None:
         app = self.make_app()

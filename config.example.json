@@ -38,6 +38,13 @@
       "permission_group": "shared",
       "remote": "user@host:/abs/remote/path",
       "trigger_count": 1
+    },
+    {
+      "id": "example2",
+      "local_root": "/abs/local/path",
+      "permission_group": "shared",
+      "remote": "/run/user/1000/gvfs/smb-share:server=disk.example,share=data/path",
+      "trigger_count": 1
     }
   ],
   "permission_group": "",

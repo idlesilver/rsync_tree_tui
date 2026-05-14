@@ -7,9 +7,11 @@ import atexit
 import concurrent.futures
 import curses
 from datetime import datetime
+import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import signal
 import shlex
@@ -32,7 +34,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.9"
+__version__ = "0.2.10"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -200,11 +202,70 @@ def get_local_root_value(
     return None, cwd
 
 
+def get_remote_value(
+    args: argparse.Namespace,
+    dotenv: dict[str, str],
+    dotenv_base_dir: Path,
+    cwd: Path,
+) -> tuple[str | None, Path]:
+    if args.remote is not None:
+        return str(args.remote), cwd
+    val = os.environ.get(REMOTE_ENV)
+    if val:
+        return val, cwd
+    if dotenv.get(REMOTE_ENV):
+        return dotenv[REMOTE_ENV], dotenv_base_dir
+    return None, cwd
+
+
 def resolve_local_root(value: str | Path | None, cwd: Path) -> Path:
     if value is None:
         return cwd.resolve()
     path = Path(value).expanduser()
     return (path if path.is_absolute() else cwd / path).resolve()
+
+
+def remote_spec_is_local(remote_spec: str) -> bool:
+    return (
+        ":" not in remote_spec
+        or remote_spec.startswith("/")
+        or remote_spec.startswith("./")
+        or remote_spec.startswith("../")
+        or remote_spec.startswith("~")
+    )
+
+
+def split_remote_spec(remote_spec: str) -> tuple[str, str]:
+    if ":" not in remote_spec:
+        raise ValueError(f"Invalid remote spec: {remote_spec}")
+    remote_target, remote_root = remote_spec.split(":", 1)
+    if not remote_target or not remote_root:
+        raise ValueError(f"Invalid remote spec: {remote_spec}")
+    return remote_target, remote_root
+
+
+def resolve_remote_spec(value: str, base_dir: Path) -> tuple[str, bool]:
+    if not value:
+        raise ValueError("Remote spec is empty")
+    if not remote_spec_is_local(value):
+        split_remote_spec(value)
+        return value, False
+    path = Path(value).expanduser()
+    resolved = (path if path.is_absolute() else base_dir / path).resolve()
+    return str(resolved), True
+
+
+def validate_local_remote_roots(local_root: Path, remote_root: Path) -> None:
+    local_resolved = local_root.resolve()
+    remote_resolved = remote_root.resolve()
+    if local_resolved == remote_resolved:
+        raise ValueError(f"Local root and remote path are the same: {local_resolved}")
+    common = os.path.commonpath([str(local_resolved), str(remote_resolved)])
+    if common == str(local_resolved) or common == str(remote_resolved):
+        raise ValueError(
+            "Local root and local remote path must not be nested: "
+            f"{local_resolved} <-> {remote_resolved}"
+        )
 
 
 def connection_id(local_root: Path, remote: str) -> str:
@@ -234,6 +295,8 @@ def color_text(text: str, color: str, use_color: bool) -> str:
 
 
 def split_remote_for_display(remote: str) -> tuple[str, str, str]:
+    if remote_spec_is_local(remote):
+        return "", remote, ""
     target, separator, path = remote.partition(":")
     if not separator:
         return "", target, ""
@@ -326,8 +389,9 @@ def record_successful_connection(
     save_json_config(config_path, config_data)
 
 
-def preflight(local_root: Path) -> None:
-    missing = [cmd for cmd in ("ssh", "rsync", "diff", "find") if shutil.which(cmd) is None]
+def preflight(local_root: Path, *, require_ssh: bool = True) -> None:
+    required_commands = ("ssh", "rsync", "diff", "find") if require_ssh else ("rsync", "diff", "find")
+    missing = [cmd for cmd in required_commands if shutil.which(cmd) is None]
     if missing:
         raise RuntimeError(f"Missing required command(s): {', '.join(missing)}")
 
@@ -360,19 +424,23 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         dotenv_base_dir,
         cwd,
     )
-    remote = args.remote or get_env_or_dotenv(REMOTE_ENV, dotenv)
+    remote_value, remote_base_dir = get_remote_value(args, dotenv, dotenv_base_dir, cwd)
     cli_permission_group = getattr(args, "permission_group", None)
     env_permission_group = get_env_or_dotenv(PERMISSION_GROUP_ENV, dotenv)
 
     selected_connection: dict[str, object] | None = None
-    if remote is None:
+    if remote_value is None:
         selected_connection = choose_known_connection(config_data)
-        remote = str(selected_connection["remote"])
+        remote_value = str(selected_connection["remote"])
+        remote_base_dir = cwd
 
     if local_value is None and selected_connection is not None:
         local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
     else:
         local_root = resolve_local_root(local_value, local_root_base_dir)
+    remote, remote_is_local = resolve_remote_spec(remote_value, remote_base_dir)
+    if remote_is_local:
+        validate_local_remote_roots(local_root, Path(remote))
 
     permission_group = ""
     permission_group_source = "none"
@@ -396,6 +464,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     return AppConfig(
         local_root=local_root,
         remote_spec=remote,
+        remote_is_local=remote_is_local,
         config_path=config_path,
         config_data=config_data,
         checksum_policy=ChecksumPolicy.from_config(config_data),
@@ -604,6 +673,7 @@ def build_file_editor_command(editor: FileEditor, file_path: Path) -> list[str]:
 class AppConfig:
     local_root: Path
     remote_spec: str
+    remote_is_local: bool
     config_path: Path
     config_data: dict[str, object]
     checksum_policy: ChecksumPolicy
@@ -1042,15 +1112,6 @@ def maybe_prompt_for_cached_auto_update(
     save_json_config(config_path, config_data)
 
 
-def split_remote_spec(remote_spec: str) -> tuple[str, str]:
-    if ":" not in remote_spec:
-        raise ValueError(f"Invalid remote spec: {remote_spec}")
-    remote_target, remote_root = remote_spec.split(":", 1)
-    if not remote_target or not remote_root:
-        raise ValueError(f"Invalid remote spec: {remote_spec}")
-    return remote_target, remote_root
-
-
 MANIFEST_FIELD_COUNT = 7
 MANIFEST_PRINTF = r"%P\0%y\0%s\0%T@\0%m\0%u\0%g\0"
 PATH_MANIFEST_PRINTF = r"%p\0%y\0%s\0%T@\0%m\0%u\0%g\0"
@@ -1142,6 +1203,32 @@ def list_local_tree_entries(local_root: Path, rel_path: str) -> dict[str, EntryM
         stdout=subprocess.PIPE,
     ).stdout
     return parse_manifest_output(output)
+
+
+def list_remote_side_entries(
+    remote_target: str,
+    remote_root: str,
+    rel_path: str,
+    ssh_opts: list[str],
+    *,
+    remote_is_local: bool,
+) -> dict[str, EntryMeta]:
+    if remote_is_local:
+        return list_local_entries(Path(remote_root), rel_path)
+    return list_remote_entries(remote_target, remote_root, rel_path, ssh_opts)
+
+
+def list_remote_side_tree_entries(
+    remote_target: str,
+    remote_root: str,
+    rel_path: str,
+    ssh_opts: list[str],
+    *,
+    remote_is_local: bool,
+) -> dict[str, EntryMeta]:
+    if remote_is_local:
+        return list_local_tree_entries(Path(remote_root), rel_path)
+    return list_remote_tree_entries(remote_target, remote_root, rel_path, ssh_opts)
 
 
 def list_remote_entries(
@@ -1857,7 +1944,14 @@ def format_local_root(local_root: Path) -> str:
     return f"{local_root.as_posix().rstrip('/')}/"
 
 
-def format_remote_root(remote_target: str, remote_root: str) -> str:
+def format_remote_root(
+    remote_target: str,
+    remote_root: str,
+    *,
+    remote_is_local: bool = False,
+) -> str:
+    if remote_is_local:
+        return f"{Path(remote_root).as_posix().rstrip('/')}/"
     return f"{remote_target}:{remote_root.rstrip('/')}/"
 
 
@@ -1882,12 +1976,14 @@ def build_rsync_command(
         "--progress",
         "--partial",
         "--partial-dir=.rsync-partial",
-        "-e", ssh_cmd,
         "--from0",
         f"--files-from={file_list_path}",
         source_root,
         dest_root,
     ]
+    if ssh_cmd:
+        from0_index = command.index("--from0")
+        command[from0_index:from0_index] = ["-e", ssh_cmd]
     if use_checksum:
         command.insert(2, "--checksum")
     if backup:
@@ -1973,17 +2069,23 @@ class SyncApp:
         self.config = config
         self.local_root = config.local_root.resolve()
         self.remote_spec = config.remote_spec
-        self.remote_target, self.remote_root = split_remote_spec(config.remote_spec)
+        self.remote_is_local = config.remote_is_local
+        if self.remote_is_local:
+            self.remote_target = ""
+            self.remote_root = str(Path(config.remote_spec).resolve())
+        else:
+            self.remote_target, self.remote_root = split_remote_spec(config.remote_spec)
 
         # SSH ControlMaster: PID-scoped socket so concurrent instances do not
         # share a socket — if they did, the first instance to exit would send
         # "ssh -O exit" and break the remaining instances.
         host_slug = hashlib.sha1(self.remote_target.encode("utf-8")).hexdigest()[:12]
-        self._ssh_socket_path: str = str(
+        self._ssh_socket_path: str = "" if self.remote_is_local else str(
             Path(tempfile.gettempdir()) / f"{APP_NAME}_{host_slug}_{os.getpid()}.sock"
         )
         self._control_master_closed: bool = False
-        atexit.register(self._close_control_master)
+        if not self.remote_is_local:
+            atexit.register(self._close_control_master)
 
         # Remote identity (queried once; first SSH call establishes the master)
         self.remote_user: str = ""
@@ -2036,13 +2138,25 @@ class SyncApp:
         file, host key checking, port, user, etc.) are left to the user's
         ~/.ssh/config so colleagues can use their own SSH configuration.
         """
+        if self._remote_is_local():
+            return []
         return [
             "-o", f"ControlPath={self._ssh_socket_path}",
             "-o", "ControlMaster=auto",
             "-o", "ControlPersist=60",
         ]
 
+    def _ssh_command(self) -> str:
+        if self._remote_is_local():
+            return ""
+        return "ssh " + " ".join(shlex.quote(option) for option in self._ssh_opts())
+
+    def _remote_is_local(self) -> bool:
+        return bool(getattr(self, "remote_is_local", False))
+
     def _close_control_master(self) -> None:
+        if self._remote_is_local():
+            return
         if self._control_master_closed:
             return
         self._control_master_closed = True
@@ -2060,6 +2174,16 @@ class SyncApp:
         Owner/group of each entry is now embedded in EntryMeta (via find %u/%g),
         so only the SSH user's own identity is needed here for comparison.
         """
+        if self._remote_is_local():
+            self.remote_user = pwd.getpwuid(os.geteuid()).pw_name
+            groups: set[str] = set()
+            for gid in set(os.getgroups()) | {os.getegid()}:
+                try:
+                    groups.add(grp.getgrgid(gid).gr_name)
+                except KeyError:
+                    continue
+            self.remote_groups = groups
+            return
         result = subprocess.run(
             ["ssh", *self._ssh_opts(), self.remote_target, "id -un && id -Gn"],
             check=False,
@@ -2114,8 +2238,13 @@ class SyncApp:
                 rel_path,
                 self.remote_user,
             )
+            command = (
+                ["bash", "-lc", remote_command]
+                if self._remote_is_local()
+                else ["ssh", *self._ssh_opts(), self.remote_target, remote_command]
+            )
             result, interrupted = self._run_interruptible_subprocess(
-                ["ssh", *self._ssh_opts(), self.remote_target, remote_command],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -2182,22 +2311,29 @@ class SyncApp:
         self.message = f"rsync --checksum: comparing {len(candidates)} same-size files..."
         self.render()
         try:
-            ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
+            ssh_cmd = self._ssh_command()
+            command = [
+                "rsync",
+                "-aniv",              # archive dry-run itemizes mtime-only checksum matches
+                "--checksum",         # compare by content checksum, not mtime
+                "--no-perms",
+                "--no-owner",
+                "--no-group",
+                "--omit-dir-times",
+                "--from0",
+                f"--files-from={tmp_path}",
+                format_local_root(self.local_root),
+                format_remote_root(
+                    self.remote_target,
+                    self.remote_root,
+                    remote_is_local=self._remote_is_local(),
+                ),
+            ]
+            if ssh_cmd:
+                from0_index = command.index("--from0")
+                command[from0_index:from0_index] = ["-e", ssh_cmd]
             result = subprocess.run(
-                [
-                    "rsync",
-                    "-aniv",              # archive dry-run itemizes mtime-only checksum matches
-                    "--checksum",         # compare by content checksum, not mtime
-                    "--no-perms",
-                    "--no-owner",
-                    "--no-group",
-                    "--omit-dir-times",
-                    "--from0",
-                    f"--files-from={tmp_path}",
-                    "-e", ssh_cmd,
-                    format_local_root(self.local_root),
-                    format_remote_root(self.remote_target, self.remote_root),
-                ],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
@@ -2292,11 +2428,12 @@ class SyncApp:
                 node.left_entry = new_entry
                 node.left_load_error = ""
             elif side == "right":
-                entry_by_path = list_remote_tree_entries(
+                entry_by_path = list_remote_side_tree_entries(
                     self.remote_target,
                     self.remote_root,
                     rel_path,
                     self._ssh_opts(),
+                    remote_is_local=self._remote_is_local(),
                 )
                 new_entry = entry_by_path.get(rel_path)
                 if new_entry != node.right_entry:
@@ -2472,11 +2609,12 @@ class SyncApp:
     def list_remote_child_entries(self, node: TreeNode) -> dict[str, EntryMeta]:
         if node.rel_path and node.right_entry is None:
             return {}
-        return list_remote_entries(
+        return list_remote_side_entries(
             self.remote_target,
             self.remote_root,
             node.rel_path,
             self._ssh_opts(),
+            remote_is_local=self._remote_is_local(),
         )
 
     def run(self) -> None:
@@ -3352,11 +3490,12 @@ class SyncApp:
                 entry_by_path.update(list_local_tree_entries(self.local_root, rel_path))
             else:
                 entry_by_path.update(
-                    list_remote_tree_entries(
+                    list_remote_side_tree_entries(
                         self.remote_target,
                         self.remote_root,
                         rel_path,
                         self._ssh_opts(),
+                        remote_is_local=self._remote_is_local(),
                     )
                 )
         return sorted(entry_by_path.keys()), entry_by_path
@@ -3408,7 +3547,11 @@ class SyncApp:
             request.permission_group,
             owner=self.remote_user,
         )
-        command = ["ssh", *self._ssh_opts(), self.remote_target, remote_command]
+        command = (
+            ["bash", "-lc", remote_command]
+            if self._remote_is_local()
+            else ["ssh", *self._ssh_opts(), self.remote_target, remote_command]
+        )
         self.suspend_tui()
         returncode = 1
         skipped_owner_counts: dict[str, int] = {}
@@ -3596,17 +3739,25 @@ class SyncApp:
             return
 
         source_root = (
-            format_remote_root(self.remote_target, self.remote_root)
+            format_remote_root(
+                self.remote_target,
+                self.remote_root,
+                remote_is_local=self._remote_is_local(),
+            )
             if action == "download"
             else format_local_root(self.local_root)
         )
         dest_root = (
             format_local_root(self.local_root)
             if action == "download"
-            else format_remote_root(self.remote_target, self.remote_root)
+            else format_remote_root(
+                self.remote_target,
+                self.remote_root,
+                remote_is_local=self._remote_is_local(),
+            )
         )
 
-        ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
+        ssh_cmd = self._ssh_command()
         commands: list[tuple[Path, bool, list[str]]] = []
         for use_checksum, group_paths in sync_groups:
             with tempfile.NamedTemporaryFile("wb", delete=False) as file_list_file:
@@ -3896,6 +4047,21 @@ class SyncApp:
                     f"Opened local file {node.rel_path}; press r to refresh after external edits."
                 )
 
+    def _remote_file_path(self, rel_path: str) -> Path:
+        return Path(self.remote_root) / rel_path
+
+    def _fetch_remote_file_bytes(self, rel_path: str) -> bytes:
+        if self._remote_is_local():
+            return self._remote_file_path(rel_path).read_bytes()
+        remote_path = f"{self.remote_root.rstrip('/')}/{rel_path}"
+        fetch = subprocess.run(
+            ["ssh", *self._ssh_opts(), self.remote_target, f"cat {shlex.quote(remote_path)}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return fetch.stdout
+
     def _try_open_remote_file(self) -> None:
         node = self.current_node()
         if node is None:
@@ -3907,28 +4073,26 @@ class SyncApp:
             self.message = "Remote open requires the file to exist on the remote side."
             return
 
-        remote_path = f"{self.remote_root.rstrip('/')}/{node.rel_path}"
         self.message = f"Fetching remote {node.rel_path}..."
         if hasattr(self, "stdscr"):
             self.render()
 
         try:
-            fetch = subprocess.run(
-                ["ssh", *self._ssh_opts(), self.remote_target, f"cat {shlex.quote(remote_path)}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
+            remote_bytes = self._fetch_remote_file_bytes(node.rel_path)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            err = (
+                exc.stderr.decode(errors="replace").strip()
+                if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
+                else str(exc)
             )
-        except subprocess.CalledProcessError as exc:
-            err = exc.stderr.decode(errors="replace").strip() if exc.stderr else str(exc)
             self.message = f"Failed to fetch remote file: {err or '(no output)'}"
             return
 
         temp_root = Path(tempfile.mkdtemp(prefix=f"{APP_NAME}-remote-edit-"))
         temp_path = temp_root / node.rel_path
         temp_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_bytes(fetch.stdout)
-        before_hash = hashlib.sha256(fetch.stdout).hexdigest()
+        temp_path.write_bytes(remote_bytes)
+        before_hash = hashlib.sha256(remote_bytes).hexdigest()
 
         opener = self._run_file_editor(temp_path)
         if opener is None:
@@ -3998,7 +4162,7 @@ class SyncApp:
             self.message = "No source paths were found during recursive expansion."
             return False
 
-        ssh_cmd = "ssh " + " ".join(shlex.quote(o) for o in self._ssh_opts())
+        ssh_cmd = self._ssh_command()
         commands: list[tuple[Path, bool, list[str]]] = []
         for use_checksum, group_paths in sync_groups:
             with tempfile.NamedTemporaryFile("wb", delete=False) as file_list_file:
@@ -4013,7 +4177,11 @@ class SyncApp:
                     build_rsync_command(
                         file_list_path,
                         format_local_root(source_local_root),
-                        format_remote_root(self.remote_target, self.remote_root),
+                        format_remote_root(
+                            self.remote_target,
+                            self.remote_root,
+                            remote_is_local=self._remote_is_local(),
+                        ),
                         ssh_cmd,
                         use_checksum,
                     ),
@@ -4326,7 +4494,6 @@ class SyncApp:
     def _preview_diff(self, node: TreeNode, *, external: bool = False) -> None:
         """Fetch the remote copy to a temp file and show unified diff in a popup."""
         local_path = self.local_root / node.rel_path
-        remote_path = f"{self.remote_root.rstrip('/')}/{node.rel_path}"
 
         self.message = f"Fetching remote {node.rel_path} for diff..."
         self.render()
@@ -4337,13 +4504,7 @@ class SyncApp:
             tmp_path = Path(tmp.name)
 
         try:
-            fetch = subprocess.run(
-                ["ssh", *self._ssh_opts(), self.remote_target, f"cat {shlex.quote(remote_path)}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            tmp_path.write_bytes(fetch.stdout)
+            tmp_path.write_bytes(self._fetch_remote_file_bytes(node.rel_path))
 
             diff_result = subprocess.run(
                 [
@@ -4369,8 +4530,12 @@ class SyncApp:
             else:
                 self._show_popup(f"diff  {node.rel_path}", lines)
             self.message = f"Diff preview closed for {node.rel_path}."
-        except subprocess.CalledProcessError as exc:
-            err = exc.stderr.decode(errors="replace").strip() if exc.stderr else str(exc)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            err = (
+                exc.stderr.decode(errors="replace").strip()
+                if isinstance(exc, subprocess.CalledProcessError) and exc.stderr
+                else str(exc)
+            )
             self._show_popup(
                 "Diff Error", ["Failed to fetch remote file:", err or "(no output)"]
             )
@@ -4567,7 +4732,9 @@ def main() -> None:
     start_background_auto_update_check(config.config_path, config.config_data)
     if not config.local_root.exists():
         raise FileNotFoundError(f"Local root does not exist: {config.local_root}")
-    preflight(config.local_root)
+    if config.remote_is_local and not Path(config.remote_spec).exists():
+        raise FileNotFoundError(f"Local remote path does not exist: {config.remote_spec}")
+    preflight(config.local_root, require_ssh=not config.remote_is_local)
 
     os.environ.setdefault("TERM", "xterm-256color")
     app = SyncApp(config)
