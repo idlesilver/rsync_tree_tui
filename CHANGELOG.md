@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-05-15
+
+### Added
+
+- permission 弹窗支持临时输入 group，并通过远端 `getent group` 验证后再允许继续。
+- `P` 切到 owner/group 视图时，PERM 列会按当前可见最长 owner/group 名称扩宽。
+
 ## [0.2.10] - 2026-05-14
 
 ### Added

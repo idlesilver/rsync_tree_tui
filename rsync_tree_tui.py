@@ -34,7 +34,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.10"
+__version__ = "0.2.11"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -710,6 +710,8 @@ LEGACY_PERMISSION_MODE_MAP = {
     "any:r": "any:pvt",
     "any:w": "any:any",
 }
+PERMISSION_GROUP_SOURCES = ("nochange", "passed_in", "input")
+PERMISSION_GROUP_INPUT_BLOCKED_CHARS = set(" \t:/\"'`$\\;|<>(){}[]!")
 
 
 class PermissionActionInterrupted(Exception):
@@ -1822,9 +1824,9 @@ def remote_permission_label(entry: EntryMeta | None, view: str) -> str:
     if view == "badge":
         return remote_permission_badge(entry)
     if view == "owner":
-        return _fixed_permission_label(entry.owner) if entry.owner else "[     ]"
+        return f"[{entry.owner}]" if entry.owner else "[     ]"
     if view == "group":
-        return _fixed_permission_label(entry.group) if entry.group else "[     ]"
+        return f"[{entry.group}]" if entry.group else "[     ]"
     if view == "mode":
         return _mode_label(entry.perms)
     raise ValueError(f"Invalid permission view: {view}")
@@ -1878,6 +1880,25 @@ def permission_badge_color_segments(label: str) -> list[tuple[str, int, bool]]:
             ("]", 0, False),
         ]
     return [(label, 9, False)]
+
+
+def permission_column_width(
+    visible: list[TreeNode],
+    view: str,
+    available_width: int,
+    *,
+    min_panel_width: int = 10,
+) -> int:
+    default_width = 7
+    if view not in {"owner", "group"}:
+        return default_width
+    longest = default_width
+    for node in visible:
+        if node.right_entry is None:
+            continue
+        longest = max(longest, len(remote_permission_label(node.right_entry, view)))
+    max_width = max(default_width, available_width - (min_panel_width * 2))
+    return min(longest, max_width)
 
 
 _TREE_MID   = "├─ "
@@ -2271,6 +2292,41 @@ class SyncApp:
 
     def _disabled_text_attr(self) -> int:
         return curses.color_pair(6) | curses.A_DIM
+
+    def _permission_group_sources(self) -> tuple[str, ...]:
+        if self.permission_group:
+            return PERMISSION_GROUP_SOURCES
+        return ("nochange", "input")
+
+    def _remote_group_exists(self, group_name: str) -> bool:
+        group_name = group_name.strip()
+        if not group_name:
+            return False
+        if self._remote_is_local():
+            result = subprocess.run(
+                ["getent", "group", group_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    *self._ssh_opts(),
+                    self.remote_target,
+                    f"getent group {shlex.quote(group_name)}",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        return result.returncode == 0
+
+    def _group_input_char_allowed(self, key: int) -> bool:
+        if key < 33 or key > 126:
+            return False
+        return chr(key) not in PERMISSION_GROUP_INPUT_BLOCKED_CHARS
 
     # ------------------------------- content verification ------------------- #
 
@@ -2761,7 +2817,12 @@ class SyncApp:
         self.ensure_cursor_visible(list_height=list_height, visible=visible)
 
         selection_width = 4
-        badge_width = 7
+        view = getattr(self, "permission_view", "badge")
+        badge_width = permission_column_width(
+            visible,
+            view,
+            width - selection_width,
+        )
         divider_width = badge_width
         panel_width = max((width - selection_width - badge_width) // 2, 10)
         self.list_layout = ListLayout(
@@ -2859,7 +2920,6 @@ class SyncApp:
             badge_attr = row_attr
             badge_segments: list[tuple[str, int, bool]] | None = None
             if node.right_entry is not None:
-                view = getattr(self, "permission_view", "badge")
                 badge_text = remote_permission_label(node.right_entry, view)
                 if view == "badge":
                     badge_segments = permission_badge_color_segments(badge_text)
@@ -4222,7 +4282,12 @@ class SyncApp:
     def _choose_permission_mode(self, target_count: int) -> tuple[str, str] | None:
         read_index = 0
         write_scope = "pvt"
-        use_selected_group = bool(self.permission_group)
+        group_sources = self._permission_group_sources()
+        group_source = "passed_in" if self.permission_group else "nochange"
+        input_group = ""
+        input_group_verified = False
+        editing_group = False
+        group_status = ""
         while True:
             if getattr(self, "_interrupt_requested", False):
                 self._interrupt_requested = False
@@ -4230,12 +4295,26 @@ class SyncApp:
             if PERMISSION_READ_ORDER.index(write_scope) > read_index:
                 write_scope = read_scope
             mode = permission_mode_from_parts(read_scope, write_scope)
-            effective_group = self.permission_group if use_selected_group else ""
-            group_value = (
-                self.permission_group
-                if self.permission_group and use_selected_group
-                else "not change group"
-            )
+            effective_group = ""
+            if group_source == "passed_in":
+                effective_group = self.permission_group
+                group_value = f"{self.permission_group} (passed-in)"
+            elif group_source == "input":
+                effective_group = input_group.strip() if input_group_verified else ""
+                marker = "_" if editing_group else ""
+                group_value = f"{input_group or '<empty>'}{marker} (input)"
+            else:
+                group_value = "not change group"
+            can_continue = group_source != "input" or bool(input_group.strip() and input_group_verified)
+            if group_source == "input":
+                if not input_group.strip():
+                    status_line = "Input group is empty. Press G to edit."
+                elif not input_group_verified:
+                    status_line = group_status or "Press Enter to verify group before continuing."
+                else:
+                    status_line = f"Group '{input_group.strip()}' verified."
+            else:
+                status_line = group_status
             lines = [
                 "Remote permission",
                 "",
@@ -4244,12 +4323,17 @@ class SyncApp:
                 f"[r] read:   {read_scope}",
                 f"[w] write:  {write_scope}",
                 f"[g] group:  {group_value}",
+                "    [G] edit input group; Enter verifies",
+            ]
+            lines.extend([
                 "",
                 *permission_result_lines(mode, effective_group),
                 "",
-                "y: continue",
+                "y: continue" if can_continue else "y: continue (disabled)",
                 "Esc: cancel",
-            ]
+            ])
+            if status_line:
+                lines.extend(["", status_line])
             self.render()
             height, width = self.stdscr.getmaxyx()
             content_w = min(max((self._text_cell_width(line) for line in lines), default=0), 56)
@@ -4279,8 +4363,12 @@ class SyncApp:
                     )
                 elif line.startswith("[g] group:"):
                     prefix = "[g] group:  "
-                    if self.permission_group:
-                        attr = self._permission_group_display_attr() if use_selected_group else curses.color_pair(3)
+                    if group_source == "passed_in":
+                        attr = self._permission_group_display_attr()
+                    elif group_source == "input" and input_group_verified:
+                        attr = self._permission_group_display_attr()
+                    elif group_source == "input":
+                        attr = curses.color_pair(3)
                     else:
                         attr = disabled_attr
                     self._popup_add_cells(win, row + 1, 2, prefix, box_w - 4)
@@ -4292,10 +4380,51 @@ class SyncApp:
                         box_w - 4 - len(prefix),
                         attr,
                     )
+                elif line.startswith("    [G]"):
+                    attr = curses.A_NORMAL if group_source == "input" else disabled_attr
+                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4, attr)
+                elif line == "y: continue (disabled)":
+                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4, disabled_attr)
+                elif line.startswith("Group '") and line.endswith("verified."):
+                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4, curses.color_pair(5))
+                elif "not found on remote" in line:
+                    self._popup_add_cells(win, row + 1, 2, line, box_w - 4, curses.color_pair(1))
                 else:
                     self._popup_add_cells(win, row + 1, 2, line, box_w - 4)
             win.refresh()
             key = self.stdscr.getch()
+            backspace_keys = {8, 127}
+            curses_backspace = getattr(curses, "KEY_BACKSPACE", -1)
+            if curses_backspace != -1:
+                backspace_keys.add(curses_backspace)
+            if editing_group:
+                if key == 27:
+                    editing_group = False
+                    continue
+                if key in (10, 13):
+                    editing_group = False
+                    input_group = input_group.strip()
+                    if not input_group:
+                        input_group_verified = False
+                        group_status = "Input group is empty. Press G to edit."
+                    elif self._remote_group_exists(input_group):
+                        input_group_verified = True
+                        group_status = f"Group '{input_group}' verified."
+                    else:
+                        input_group_verified = False
+                        group_status = f"Group '{input_group}' not found on remote."
+                    continue
+                if key in backspace_keys:
+                    input_group = input_group[:-1]
+                    input_group_verified = False
+                    group_status = "Press Enter to verify group before continuing." if input_group else ""
+                    continue
+                if self._group_input_char_allowed(key):
+                    input_group += chr(key)
+                    input_group_verified = False
+                    group_status = "Press Enter to verify group before continuing."
+                    continue
+                continue
             if key in (ord("r"), ord("R")):
                 read_index = (read_index + 1) % len(PERMISSION_READ_ORDER)
                 next_read_scope = PERMISSION_READ_ORDER[read_index]
@@ -4314,11 +4443,36 @@ class SyncApp:
                 if read_scope == "any":
                     write_scope = "any" if write_scope != "any" else "grp"
                 continue
-            if key in (ord("g"), ord("G")):
-                if self.permission_group:
-                    use_selected_group = not use_selected_group
+            if key == ord("g"):
+                next_index = (group_sources.index(group_source) + 1) % len(group_sources)
+                group_source = group_sources[next_index]
+                group_status = ""
+                editing_group = False
+                continue
+            if key == ord("G"):
+                if group_source == "input":
+                    editing_group = True
+                    group_status = "Editing group. Press Enter to verify."
+                continue
+            if key in (10, 13) and group_source == "input":
+                input_group = input_group.strip()
+                if not input_group:
+                    input_group_verified = False
+                    group_status = "Input group is empty. Press G to edit."
+                elif self._remote_group_exists(input_group):
+                    input_group_verified = True
+                    group_status = f"Group '{input_group}' verified."
+                else:
+                    input_group_verified = False
+                    group_status = f"Group '{input_group}' not found on remote."
                 continue
             if key == ord("y"):
+                if not can_continue:
+                    if not input_group.strip():
+                        group_status = "Input group is empty. Press G to edit."
+                    else:
+                        group_status = "Press Enter to verify group before continuing."
+                    continue
                 return mode, effective_group
             if key == 27:
                 return None
@@ -4389,7 +4543,7 @@ class SyncApp:
             "  p opens a two-dimensional permission editor",
             "  read: pvt / grp / any",
             "  write: pvt / grp",
-            "  group: selected group / not change group (grp only)",
+            "  group: no change / selected group / input group",
             "",
             "Check",
             "  c opens a confirmation line with m/depth/y/n/? controls",

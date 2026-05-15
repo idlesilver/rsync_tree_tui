@@ -361,7 +361,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.11"
+    FUTURE_VERSION = "0.2.12"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -1109,7 +1109,7 @@ class RenderTests(unittest.TestCase):
         self.assertTrue(node.children_status_unchecked)
         self.assertFalse(tui.node_has_difference(node))
 
-    def test_permission_label_views_use_fixed_brackets(self) -> None:
+    def test_permission_label_owner_and_group_show_full_names(self) -> None:
         entry = tui.EntryMeta(
             rel_path="dataset",
             entry_type=tui.EntryType.DIRECTORY,
@@ -1122,8 +1122,42 @@ class RenderTests(unittest.TestCase):
 
         self.assertEqual(tui.remote_permission_label(entry, "badge"), "[any:r]")
         self.assertEqual(tui.remote_permission_label(entry, "owner"), "[alice]")
-        self.assertEqual(tui.remote_permission_label(entry, "group"), "[asset]")
+        self.assertEqual(tui.remote_permission_label(entry, "group"), "[asset_team]")
         self.assertEqual(tui.remote_permission_label(entry, "mode"), "[2755 ]")
+
+    def test_permission_column_width_expands_for_visible_owner_names(self) -> None:
+        visible = [
+            tui.TreeNode(
+                name="a",
+                rel_path="a",
+                right_entry=tui.EntryMeta(
+                    "a",
+                    tui.EntryType.FILE,
+                    1,
+                    1,
+                    0o644,
+                    owner="short",
+                ),
+            ),
+            tui.TreeNode(
+                name="b",
+                rel_path="b",
+                right_entry=tui.EntryMeta(
+                    "b",
+                    tui.EntryType.FILE,
+                    1,
+                    1,
+                    0o644,
+                    owner="very_long_remote_user",
+                ),
+            ),
+        ]
+
+        self.assertEqual(
+            tui.permission_column_width(visible, "owner", 100),
+            len("[very_long_remote_user]"),
+        )
+        self.assertEqual(tui.permission_column_width(visible, "badge", 100), 7)
 
     def test_render_draws_remote_badge_in_middle_column_with_badge_color(self) -> None:
         app = tui.SyncApp.__new__(tui.SyncApp)
@@ -1172,6 +1206,52 @@ class RenderTests(unittest.TestCase):
             any(
                 call.args[2] == "w" and call.args[4] == 100
                 for call in calls
+            )
+        )
+
+    def test_render_expands_permission_column_for_owner_view(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        remote_file = tui.TreeNode(
+            name="asset.bin",
+            rel_path="asset.bin",
+            parent=root,
+            right_entry=tui.EntryMeta(
+                rel_path="asset.bin",
+                entry_type=tui.EntryType.FILE,
+                size=1,
+                mtime_s=1,
+                perms=0o660,
+                owner="very_long_remote_user",
+            ),
+        )
+        root.children = {"asset.bin": remote_file}
+        app.root_node = root
+        app.local_root = Path("/local")
+        app.remote_spec = "host:/remote"
+        app.cursor_index = 0
+        app.scroll_offset = 0
+        app.message = ""
+        app.pending_action = None
+        app.pending_permission = None
+        app.footer_shortcut_hits = []
+        app.pagination_size = tui.DEFAULT_PAGINATION_SIZE
+        app.last_cursor_rel_path = ""
+        app.permission_view = "owner"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 120)
+
+        with (
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+            mock.patch("rsync_tree_tui.curses.A_REVERSE", 0),
+        ):
+            app.render()
+
+        self.assertEqual(app.list_layout.badge_width, len("[very_long_remote_user]"))
+        self.assertTrue(
+            any(
+                call.args[2].startswith("[very_long_remote_user]")
+                for call in app.stdscr.addnstr.call_args_list
             )
         )
 
@@ -2364,6 +2444,32 @@ class PermissionActionTests(unittest.TestCase):
 
         app.execute_permission_request.assert_called_once()
 
+    def test_remote_group_exists_uses_ssh_for_ssh_remote(self) -> None:
+        app = self.make_app()
+        app.remote_is_local = False
+
+        with mock.patch(
+            "rsync_tree_tui.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as run:
+            exists = app._remote_group_exists("asset_team")
+
+        self.assertTrue(exists)
+        self.assertEqual(run.call_args.args[0], ["ssh", "host", "getent group asset_team"])
+
+    def test_remote_group_exists_uses_local_getent_for_local_remote(self) -> None:
+        app = self.make_app()
+        app.remote_is_local = True
+
+        with mock.patch(
+            "rsync_tree_tui.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 2),
+        ) as run:
+            exists = app._remote_group_exists("missing")
+
+        self.assertFalse(exists)
+        self.assertEqual(run.call_args.args[0], ["getent", "group", "missing"])
+
     def test_permission_mode_popup_only_esc_cancels(self) -> None:
         app = self.make_app()
         app.stdscr = mock.Mock()
@@ -2470,6 +2576,214 @@ class PermissionActionTests(unittest.TestCase):
             mode = app._choose_permission_mode(1)
 
         self.assertEqual(mode, ("any:pvt", ""))
+
+    def test_permission_mode_popup_accepts_verified_input_group_without_passed_in_group(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [
+            ord("g"),
+            ord("G"),
+            ord("a"),
+            ord("s"),
+            ord("s"),
+            ord("e"),
+            ord("t"),
+            ord("_"),
+            ord("t"),
+            ord("e"),
+            ord("a"),
+            ord("m"),
+            10,
+            ord("y"),
+        ]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+            mock.patch.object(app, "_remote_group_exists", return_value=True) as exists,
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("pvt:pvt", "asset_team"))
+        exists.assert_called_once_with("asset_team")
+
+    def test_permission_mode_popup_blocks_unverified_input_group(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [
+            ord("g"),
+            ord("G"),
+            ord("a"),
+            27,
+            ord("y"),
+            10,
+            ord("y"),
+        ]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+            mock.patch.object(app, "_remote_group_exists", return_value=True) as exists,
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("pvt:pvt", "a"))
+        exists.assert_called_once_with("a")
+        self.assertGreater(app.stdscr.getch.call_count, 6)
+
+    def test_permission_mode_popup_rejects_missing_input_group(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [
+            ord("g"),
+            ord("G"),
+            ord("m"),
+            ord("i"),
+            ord("s"),
+            ord("s"),
+            10,
+            ord("y"),
+            27,
+        ]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+            mock.patch.object(app, "_remote_group_exists", return_value=False) as exists,
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertIsNone(mode)
+        exists.assert_called_once_with("miss")
+        self.assertTrue(
+            any(
+                "not found on remote" in call.args[2]
+                and call.args[4] == 1
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 5
+            )
+        )
+
+    def test_permission_mode_popup_colors_verified_input_group_status_green(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("g"), ord("G"), ord("o"), ord("k"), 10, 27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+            mock.patch.object(app, "_remote_group_exists", return_value=True),
+        ):
+            app._choose_permission_mode(1)
+
+        self.assertTrue(
+            any(
+                call.args[2].startswith("Group 'ok' verified.")
+                and call.args[4] == 500
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 5
+            )
+        )
+
+    def test_permission_mode_popup_dims_shift_g_hint_when_not_input(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+        ):
+            app._choose_permission_mode(1)
+
+        disabled_attr = 600 | tui.curses.A_DIM
+        self.assertTrue(
+            any(
+                call.args[2].startswith("    [G]")
+                and call.args[4] == disabled_attr
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 5
+            )
+        )
+
+    def test_permission_mode_popup_dims_disabled_continue(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("g"), 27]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+        ):
+            app._choose_permission_mode(1)
+
+        disabled_attr = 600 | tui.curses.A_DIM
+        self.assertTrue(
+            any(
+                call.args[2].startswith("y: continue (disabled)")
+                and call.args[4] == disabled_attr
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 5
+            )
+        )
+
+    def test_permission_mode_popup_cycles_nochange_input_without_passed_in_group(self) -> None:
+        app = self.make_app()
+        app.permission_group = ""
+        app.permission_group_source = "none"
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("g"), ord("g"), ord("y")]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+            mock.patch.object(app, "_remote_group_exists") as exists,
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("pvt:pvt", ""))
+        exists.assert_not_called()
+
+    def test_permission_mode_popup_does_not_verify_passed_in_group(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("y")]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+            mock.patch.object(app, "_remote_group_exists") as exists,
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("pvt:pvt", "shared"))
+        exists.assert_not_called()
 
     def test_permission_mode_popup_hidden_shift_w_returns_any_write(self) -> None:
         app = self.make_app()
