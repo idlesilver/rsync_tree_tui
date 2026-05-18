@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-05-18
+
+### Added
+
+- upload/download 失败时保留 rsync log，并显示相关错误摘要和 log 路径。
+- 增加文档拆分：README 保留快速开始和常用说明，详细配置与完整操作迁移到 `docs/configuration.md` 和 `docs/usage.md`。
+- 增加测试覆盖 `local_root` 使用 GVFS SMB 冒号路径的解析行为。
+
 ## [0.2.11] - 2026-05-15
 
 ### Added

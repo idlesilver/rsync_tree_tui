@@ -244,6 +244,21 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.local_root, (Path(self.tmp.name) / "storage").resolve())
 
+    def test_absolute_local_root_with_colon_is_accepted(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        gvfs_path = "/run/user/1000/gvfs/smb-share:server=disk.galbot.vip,share=simvla/games"
+        args = argparse.Namespace(
+            local_root=Path(gvfs_path),
+            remote="cli@example:/data",
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.local_root, Path(gvfs_path).resolve())
+
     def test_permission_group_uses_known_connection_before_global_config(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
         data = tui.default_config_data()
@@ -361,7 +376,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.12"
+    FUTURE_VERSION = "0.2.13"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -959,6 +974,35 @@ class ChecksumPolicyTests(unittest.TestCase):
 
         self.assertNotIn("-e", command)
         self.assertNotIn("ssh", command)
+
+
+class RSyncLoggingTests(unittest.TestCase):
+    def test_run_foreground_rsync_command_keeps_failed_log_and_summary(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; print('rsync: link_stat failed: No such file'); sys.exit(23)",
+        ]
+
+        with mock.patch("builtins.print"):
+            result = tui.run_foreground_rsync_command(command)
+
+        try:
+            self.assertEqual(result.returncode, 23)
+            self.assertTrue(result.log_path.exists())
+            self.assertIn("rsync: link_stat failed", "\n".join(result.summary_lines))
+            self.assertIn("No such file", result.log_path.read_text())
+        finally:
+            result.log_path.unlink(missing_ok=True)
+
+    def test_run_foreground_rsync_command_removes_success_log(self) -> None:
+        command = [sys.executable, "-c", "print('ok')"]
+
+        with mock.patch("builtins.print"):
+            result = tui.run_foreground_rsync_command(command)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.log_path.exists())
 
 
 class RenderTests(unittest.TestCase):
@@ -2190,7 +2234,10 @@ class SyncActionTests(unittest.TestCase):
         app = self.make_download_app()
 
         with (
-            mock.patch("rsync_tree_tui.subprocess.run") as run,
+            mock.patch(
+                "rsync_tree_tui.run_foreground_rsync_command",
+                return_value=tui.RSyncRunResult(0, Path("/tmp/ok.log"), []),
+            ) as run,
             mock.patch("builtins.input"),
             mock.patch("builtins.print"),
         ):
@@ -2199,6 +2246,28 @@ class SyncActionTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--whole-file", command)
         self.assertIn("--backup", command)
+
+    def test_failed_download_reports_rsync_log_path(self) -> None:
+        app = self.make_download_app()
+
+        with (
+            mock.patch(
+                "rsync_tree_tui.run_foreground_rsync_command",
+                return_value=tui.RSyncRunResult(
+                    23,
+                    Path("/tmp/rsync-failed.log"),
+                    ["rsync: link_stat failed: No such file"],
+                ),
+            ),
+            mock.patch("builtins.input"),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            app.execute_pending_action()
+
+        print_mock.assert_any_call("Rsync failed with exit code 23.")
+        print_mock.assert_any_call("Full log: /tmp/rsync-failed.log")
+        self.assertIn("rsync exit code 23", app.message)
+        self.assertIn("/tmp/rsync-failed.log", app.message)
 
 
 class PermissionActionTests(unittest.TestCase):

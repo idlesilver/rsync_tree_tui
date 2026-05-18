@@ -6,6 +6,7 @@ import argparse
 import atexit
 import concurrent.futures
 import curses
+from collections import deque
 from datetime import datetime
 import grp
 import hashlib
@@ -34,7 +35,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.11"
+__version__ = "0.2.12"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -699,6 +700,13 @@ class RemoteEditUploadRequest:
     temp_root: Path
 
 
+@dataclass(slots=True)
+class RSyncRunResult:
+    returncode: int
+    log_path: Path
+    summary_lines: list[str]
+
+
 PERMISSION_VIEWS = ("badge", "owner", "group", "mode")
 PERMISSION_READ_ORDER = ("pvt", "grp", "any")
 PERMISSION_WRITE_ORDER = ("pvt", "grp", "any")
@@ -712,6 +720,19 @@ LEGACY_PERMISSION_MODE_MAP = {
 }
 PERMISSION_GROUP_SOURCES = ("nochange", "passed_in", "input")
 PERMISSION_GROUP_INPUT_BLOCKED_CHARS = set(" \t:/\"'`$\\;|<>(){}[]!")
+RSYNC_SUMMARY_LINE_LIMIT = 20
+RSYNC_ERROR_MARKERS = (
+    "rsync error:",
+    "rsync:",
+    "error",
+    "failed",
+    "denied",
+    "no such file",
+    "vanished",
+    "cannot",
+    "warning",
+    "io error",
+)
 
 
 class PermissionActionInterrupted(Exception):
@@ -2012,6 +2033,61 @@ def build_rsync_command(
     if whole_file:
         command.insert(2, "--whole-file")
     return command
+
+
+def rsync_output_line_is_relevant(line: str) -> bool:
+    lower = line.lower()
+    return any(marker in lower for marker in RSYNC_ERROR_MARKERS)
+
+
+def run_foreground_rsync_command(command: list[str]) -> RSyncRunResult:
+    fd, log_name = tempfile.mkstemp(prefix=f"{APP_NAME}-rsync-", suffix=".log")
+    log_path = Path(log_name)
+    summary_lines: deque[str] = deque(maxlen=RSYNC_SUMMARY_LINE_LIMIT)
+    recent_lines: deque[str] = deque(maxlen=RSYNC_SUMMARY_LINE_LIMIT)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as log_file:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            if process.stdout is not None:
+                for output_line in process.stdout:
+                    print(output_line, end="")
+                    log_file.write(output_line)
+                    log_file.flush()
+                    stripped = output_line.rstrip("\n")
+                    if stripped:
+                        recent_lines.append(stripped)
+                    if rsync_output_line_is_relevant(stripped):
+                        summary_lines.append(stripped)
+                process.stdout.close()
+            returncode = process.wait()
+    except Exception:
+        log_path.unlink(missing_ok=True)
+        raise
+
+    if returncode == 0:
+        log_path.unlink(missing_ok=True)
+    summary = list(summary_lines) or list(recent_lines)
+    return RSyncRunResult(returncode=returncode, log_path=log_path, summary_lines=summary)
+
+
+def print_rsync_failure_summary(result: RSyncRunResult) -> None:
+    print()
+    print(f"Rsync failed with exit code {result.returncode}.")
+    print(f"Full log: {result.log_path}")
+    if result.summary_lines:
+        print("Recent relevant output:")
+        for line in result.summary_lines[-RSYNC_SUMMARY_LINE_LIMIT:]:
+            print(f"  {line}")
+    else:
+        print("No rsync output was captured.")
 
 
 def node_is_expandable(node: TreeNode) -> bool:
@@ -3843,18 +3919,21 @@ class SyncApp:
 
         self.suspend_tui()
         sync_ok = False
+        failure: RSyncRunResult | None = None
         try:
             for _file_list_path, use_checksum, command in commands:
                 mode = "checksum" if use_checksum else "size+mtime"
                 print(f"Running {mode}: {' '.join(command)}")
-                subprocess.run(command, check=True)
-            input("Sync completed. Press Enter to return to the TUI...")
-            sync_ok = True
-        except subprocess.CalledProcessError as exc:
-            input(
-                f"Sync failed (rsync exit code {exc.returncode}). "
-                "Press Enter to return to the TUI..."
-            )
+                result = run_foreground_rsync_command(command)
+                if result.returncode != 0:
+                    failure = result
+                    break
+            if failure is None:
+                input("Sync completed. Press Enter to return to the TUI...")
+                sync_ok = True
+            else:
+                print_rsync_failure_summary(failure)
+                input("Sync failed. Press Enter to return to the TUI...")
         finally:
             for file_list_path, _use_checksum, _command in commands:
                 file_list_path.unlink(missing_ok=True)
@@ -3867,7 +3946,13 @@ class SyncApp:
                 f"{'local' if action == 'download' else 'remote'} sync."
             )
         else:
-            self.message = "Sync failed — check terminal output above for details."
+            if failure is not None:
+                self.message = (
+                    f"Sync failed (rsync exit code {failure.returncode}). "
+                    f"Log: {failure.log_path}"
+                )
+            else:
+                self.message = "Sync failed — check terminal output above for details."
 
     def suspend_tui(self) -> None:
         curses.def_prog_mode()
@@ -4251,21 +4336,31 @@ class SyncApp:
         if hasattr(self, "stdscr"):
             self.suspend_tui()
         sync_ok = False
+        failure: RSyncRunResult | None = None
         try:
             for _file_list_path, use_checksum, command in commands:
                 mode = "checksum" if use_checksum else "size+mtime"
                 if hasattr(self, "stdscr"):
                     print(f"Running {mode}: {' '.join(command)}")
-                subprocess.run(command, check=True)
-            if hasattr(self, "stdscr"):
-                input("Upload completed. Press Enter to return to the TUI...")
-            sync_ok = True
+                    result = run_foreground_rsync_command(command)
+                    if result.returncode != 0:
+                        failure = result
+                        break
+                else:
+                    subprocess.run(command, check=True)
+            if failure is None:
+                if hasattr(self, "stdscr"):
+                    input("Upload completed. Press Enter to return to the TUI...")
+                sync_ok = True
+            elif hasattr(self, "stdscr"):
+                print_rsync_failure_summary(failure)
+                input("Upload failed. Press Enter to return to the TUI...")
         except subprocess.CalledProcessError as exc:
-            if hasattr(self, "stdscr"):
-                input(
-                    f"Upload failed (rsync exit code {exc.returncode}). "
-                    "Press Enter to return to the TUI..."
-                )
+            failure = RSyncRunResult(
+                returncode=exc.returncode,
+                log_path=Path(""),
+                summary_lines=[],
+            )
         finally:
             for file_list_path, _use_checksum, _command in commands:
                 file_list_path.unlink(missing_ok=True)
@@ -4275,7 +4370,11 @@ class SyncApp:
         self.message = (
             "Completed edited file upload."
             if sync_ok
-            else "Upload failed - check terminal output above for details."
+            else (
+                f"Upload failed (rsync exit code {failure.returncode}). Log: {failure.log_path}"
+                if failure is not None and str(failure.log_path)
+                else "Upload failed - check terminal output above for details."
+            )
         )
         return sync_ok
 
