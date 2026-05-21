@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import pwd
+import queue
 import re
 import signal
 import shlex
@@ -35,7 +36,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.12"
+__version__ = "0.2.13"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -43,6 +44,7 @@ UPDATE_PAYLOAD_TIMEOUT = 10
 CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
+REMOTE_ENV_PREFIX = f"{REMOTE_ENV}_"
 PERMISSION_GROUP_ENV = "RSYNC_TREE_TUI_PERMISSION_GROUP"
 DEFAULT_CHECKSUM_THRESHOLD_MB = 512
 DEFAULT_CHECKSUM_SUFFIXES = [
@@ -219,6 +221,18 @@ def get_remote_value(
     return None, cwd
 
 
+def dotenv_remote_values(dotenv: dict[str, str]) -> list[str]:
+    indexed: list[tuple[int, str]] = []
+    for key, value in dotenv.items():
+        if not key.startswith(REMOTE_ENV_PREFIX):
+            continue
+        suffix = key[len(REMOTE_ENV_PREFIX):]
+        if not suffix.isdecimal() or not value:
+            continue
+        indexed.append((int(suffix), value))
+    return [value for _index, value in sorted(indexed)]
+
+
 def resolve_local_root(value: str | Path | None, cwd: Path) -> Path:
     if value is None:
         return cwd.resolve()
@@ -355,6 +369,27 @@ def choose_known_connection(config_data: dict[str, object]) -> dict[str, object]
     return entries[index]
 
 
+def choose_dotenv_remote(remote_values: list[str], local_root: Path) -> str:
+    if not remote_values:
+        raise ValueError("No project remotes provided")
+    if len(remote_values) == 1:
+        return remote_values[0]
+
+    print("Project .env remotes:")
+    color_enabled = use_ansi_color()
+    local_text = str(local_root.resolve())
+    for index, remote in enumerate(remote_values):
+        print(
+            f"  [{index}] {local_text}  <->  "
+            f"{format_remote_for_display(remote, color_enabled)}"
+        )
+    raw_index = input("Select project remote index: ").strip()
+    index = int(raw_index)
+    if index < 0 or index >= len(remote_values):
+        raise IndexError(f"Invalid project remote index: {index}")
+    return remote_values[index]
+
+
 def record_successful_connection(
     config_path: Path,
     config_data: dict[str, object],
@@ -430,15 +465,24 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     env_permission_group = get_env_or_dotenv(PERMISSION_GROUP_ENV, dotenv)
 
     selected_connection: dict[str, object] | None = None
-    if remote_value is None:
-        selected_connection = choose_known_connection(config_data)
-        remote_value = str(selected_connection["remote"])
-        remote_base_dir = cwd
-
-    if local_value is None and selected_connection is not None:
-        local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
-    else:
+    if remote_value is not None:
         local_root = resolve_local_root(local_value, local_root_base_dir)
+    else:
+        dotenv_remotes = dotenv_remote_values(dotenv)
+        if dotenv_remotes:
+            local_root = resolve_local_root(local_value, local_root_base_dir)
+            remote_value = choose_dotenv_remote(dotenv_remotes, local_root)
+            remote_base_dir = dotenv_base_dir
+        else:
+            selected_connection = choose_known_connection(config_data)
+            remote_value = str(selected_connection["remote"])
+            remote_base_dir = cwd
+
+            if local_value is None:
+                local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
+            else:
+                local_root = resolve_local_root(local_value, local_root_base_dir)
+
     remote, remote_is_local = resolve_remote_spec(remote_value, remote_base_dir)
     if remote_is_local:
         validate_local_remote_roots(local_root, Path(remote))
@@ -721,6 +765,7 @@ LEGACY_PERMISSION_MODE_MAP = {
 PERMISSION_GROUP_SOURCES = ("nochange", "passed_in", "input")
 PERMISSION_GROUP_INPUT_BLOCKED_CHARS = set(" \t:/\"'`$\\;|<>(){}[]!")
 RSYNC_SUMMARY_LINE_LIMIT = 20
+PERMISSION_PROGRESS_INTERVAL_SECONDS = 5.0
 RSYNC_ERROR_MARKERS = (
     "rsync error:",
     "rsync:",
@@ -783,7 +828,7 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Defaults (in priority order):\n"
             f"  --local-root : ${LOCAL_ROOT_ENV} → .env {LOCAL_ROOT_ENV} → current pwd\n"
-            f"  --remote     : ${REMOTE_ENV} → .env {REMOTE_ENV} → known connection picker\n"
+            f"  --remote     : ${REMOTE_ENV} → .env {REMOTE_ENV} → .env {REMOTE_ENV}_N → known connection picker\n"
             f"  --permission-group : ${PERMISSION_GROUP_ENV} → .env → known connection → config\n"
             f"  --config     : {default_config_path()}\n"
         ),
@@ -3706,9 +3751,37 @@ class SyncApp:
                 bufsize=1,
             )
             in_skipped_owner_section = False
+            output_queue: queue.Queue[str | None] = queue.Queue()
+
+            def read_permission_output() -> None:
+                try:
+                    if process.stdout is not None:
+                        for line in process.stdout:
+                            output_queue.put(line)
+                finally:
+                    output_queue.put(None)
+
+            reader = threading.Thread(target=read_permission_output, daemon=True)
+            reader.start()
+            start_time = time.monotonic()
+            last_progress_at = start_time
+            output_closed = False
             if process.stdout is not None:
-                for output_line in process.stdout:
+                while not output_closed:
+                    try:
+                        output_line = output_queue.get(
+                            timeout=PERMISSION_PROGRESS_INTERVAL_SECONDS
+                        )
+                    except queue.Empty:
+                        elapsed = int(time.monotonic() - start_time)
+                        print(f"... permission still running ({elapsed}s elapsed)")
+                        last_progress_at = time.monotonic()
+                        continue
+                    if output_line is None:
+                        output_closed = True
+                        continue
                     print(output_line, end="")
+                    last_progress_at = time.monotonic()
                     line_text = output_line.rstrip("\n")
                     if line_text == "Skipped non-owned owners:":
                         in_skipped_owner_section = True
@@ -3723,6 +3796,9 @@ class SyncApp:
                             skipped_owner_counts[owner_name] = (
                                 skipped_owner_counts.get(owner_name, 0) + owner_count
                             )
+            if time.monotonic() - last_progress_at >= PERMISSION_PROGRESS_INTERVAL_SECONDS:
+                elapsed = int(time.monotonic() - start_time)
+                print(f"... permission still running ({elapsed}s elapsed)")
             returncode = process.wait()
             if returncode == 0:
                 input("Permission completed. Press Enter to return to the TUI...")

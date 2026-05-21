@@ -101,6 +101,8 @@ n                  取消 check
 
 TUI 中按 `p` 可以直接对选中的 remote 文件或目录递归应用权限模式。权限执行只修改 owner 是当前 remote 用户的条目；非 owner 条目会跳过，并在前台日志中按 owner=count 汇总。
 
+文件很多时，远端 `find` / `chgrp` / `chmod` 可能长时间没有输出。前台日志界面会定期打印 `... permission still running` 和 elapsed 时间，表示权限进程仍在运行。
+
 权限模型分为 read、write、group 三个维度：
 
 ```text

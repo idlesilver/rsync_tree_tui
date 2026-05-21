@@ -13,7 +13,7 @@
 `remote` 的来源优先级：
 
 ```text
---remote > RSYNC_TREE_TUI_REMOTE > .env > known connection picker
+--remote > RSYNC_TREE_TUI_REMOTE > .env single > .env indexed picker > known connection picker
 ```
 
 `permission_group` 的来源优先级：
@@ -23,6 +23,25 @@
 ```
 
 `.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。`.env` 中的相对 `RSYNC_TREE_TUI_LOCAL_ROOT=./storage` 和本地 `RSYNC_TREE_TUI_REMOTE=./nas` 会相对 `.env` 所在目录解析；CLI 参数和 shell 环境变量中的相对路径仍相对启动目录解析。
+
+## Project Remotes
+
+旧的单值写法保持兼容：
+
+```bash
+RSYNC_TREE_TUI_REMOTE=ssh-box:/data/project
+```
+
+如果一个项目有多个常用 remote，可以使用编号写法：
+
+```bash
+RSYNC_TREE_TUI_REMOTE_0=/mnt/dev-nas/project
+RSYNC_TREE_TUI_REMOTE_1=ssh-box:/data/project
+```
+
+没有传 `--remote`、shell 环境变量里没有 `RSYNC_TREE_TUI_REMOTE`、且 `.env` 没有单值 `RSYNC_TREE_TUI_REMOTE` 时，工具会读取 `RSYNC_TREE_TUI_REMOTE_<number>` 并按 number 排序。只有一个编号 remote 时会直接使用；多个时会像全局 known connections 一样显示 index picker。
+
+编号 remote 中的本地相对路径会相对 `.env` 所在目录解析。单值 `RSYNC_TREE_TUI_REMOTE` 优先级高于编号 remote，因此已有项目不会被新格式影响。
 
 ## Path 解析
 

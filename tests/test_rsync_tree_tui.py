@@ -201,6 +201,115 @@ class ConfigTests(unittest.TestCase):
             str((Path(self.tmp.name) / "project" / "nas").resolve()),
         )
 
+    def test_dotenv_indexed_remotes_are_sorted_by_index(self) -> None:
+        values = tui.dotenv_remote_values(
+            {
+                "RSYNC_TREE_TUI_REMOTE_10": "ten:/data",
+                "RSYNC_TREE_TUI_REMOTE_2": "two:/data",
+                "RSYNC_TREE_TUI_REMOTE_0": "zero:/data",
+                "RSYNC_TREE_TUI_REMOTE_NAME": "ignored:/data",
+            }
+        )
+
+        self.assertEqual(values, ["zero:/data", "two:/data", "ten:/data"])
+
+    def test_dotenv_single_remote_keeps_priority_over_indexed_remotes(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        env_file = Path(".env")
+        env_file.write_text(
+            "RSYNC_TREE_TUI_REMOTE=single@example:/data\n"
+            "RSYNC_TREE_TUI_REMOTE_0=project-a:/data\n"
+            "RSYNC_TREE_TUI_REMOTE_1=project-b:/data\n"
+        )
+        args = argparse.Namespace(
+            local_root=Path("local"),
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        with mock.patch("builtins.input", side_effect=AssertionError("no picker")):
+            config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.remote_spec, "single@example:/data")
+
+    def test_dotenv_single_indexed_remote_is_used_without_prompt(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        env_file = Path(".env")
+        env_file.write_text("RSYNC_TREE_TUI_REMOTE_0=only@example:/data\n")
+        args = argparse.Namespace(
+            local_root=Path("local"),
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        with mock.patch("builtins.input", side_effect=AssertionError("no picker")):
+            config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.remote_spec, "only@example:/data")
+
+    def test_dotenv_multiple_indexed_remotes_use_project_picker(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        project_dir = Path("project")
+        project_dir.mkdir()
+        env_file = project_dir / ".env"
+        env_file.write_text(
+            "RSYNC_TREE_TUI_LOCAL_ROOT=./local\n"
+            "RSYNC_TREE_TUI_REMOTE_0=dev-nas\n"
+            "RSYNC_TREE_TUI_REMOTE_1=ssh-box:/remote/project\n"
+        )
+        args = argparse.Namespace(
+            local_root=None,
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        with (
+            mock.patch("builtins.input", return_value="1"),
+            mock.patch("builtins.print"),
+        ):
+            config = tui.resolve_app_config(args)
+
+        self.assertEqual(
+            config.local_root,
+            (Path(self.tmp.name) / "project" / "local").resolve(),
+        )
+        self.assertEqual(config.remote_spec, "ssh-box:/remote/project")
+
+    def test_dotenv_multiple_indexed_local_remotes_resolve_relative_to_dotenv(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        project_dir = Path("project")
+        project_dir.mkdir()
+        env_file = project_dir / ".env"
+        env_file.write_text(
+            "RSYNC_TREE_TUI_REMOTE_0=ssh-box:/remote/project\n"
+            "RSYNC_TREE_TUI_REMOTE_1=./nas\n"
+        )
+        args = argparse.Namespace(
+            local_root=Path("../local"),
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        with (
+            mock.patch("builtins.input", return_value="1"),
+            mock.patch("builtins.print"),
+        ):
+            config = tui.resolve_app_config(args)
+
+        self.assertTrue(config.remote_is_local)
+        self.assertEqual(
+            config.remote_spec,
+            str((Path(self.tmp.name) / "project" / "nas").resolve()),
+        )
+
     def test_shell_env_local_root_stays_relative_to_cwd(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
         os.environ["RSYNC_TREE_TUI_LOCAL_ROOT"] = "./storage"
@@ -376,7 +485,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.13"
+    FUTURE_VERSION = "0.2.14"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -2485,6 +2594,27 @@ class PermissionActionTests(unittest.TestCase):
             app.handle_key(ord("y"))
 
         self.assertEqual(app.message, "Permission interrupted. Press r to refresh.")
+
+    def test_permission_foreground_prints_progress_heartbeat_when_output_pauses(self) -> None:
+        app = self.make_app()
+        app.pending_action = "permission"
+        app.pending_permission = tui.PermissionRequest("any:grp", ["remote.txt"], "")
+        process = mock.Mock()
+        process.stdout = ["Summary:\n"]
+        process.wait.return_value = 0
+        monotonic_values = iter([0.0, 0.0, 6.0, 6.0, 6.0])
+
+        with (
+            mock.patch.object(app, "suspend_tui"),
+            mock.patch.object(app, "resume_tui"),
+            mock.patch("builtins.print") as print_mock,
+            mock.patch("builtins.input"),
+            mock.patch("rsync_tree_tui.subprocess.Popen", return_value=process),
+            mock.patch("rsync_tree_tui.time.monotonic", side_effect=lambda: next(monotonic_values)),
+        ):
+            app.handle_key(ord("y"))
+
+        print_mock.assert_any_call("... permission still running (6s elapsed)")
 
     def test_permission_confirmation_cancel_clears_request(self) -> None:
         app = self.make_app()

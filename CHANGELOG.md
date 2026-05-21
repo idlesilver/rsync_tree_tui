@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-05-21
+
+### Added
+
+- `.env` 支持 `RSYNC_TREE_TUI_REMOTE_<number>` 配置多个项目常用 remote；多个候选时使用 index picker。
+- permission 前台日志在长时间无输出时会定期打印 still-running 心跳，避免误以为卡死。
+
 ## [0.2.12] - 2026-05-18
 
 ### Added

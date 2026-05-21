@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比 local 和 remote 两棵目录树，交互式选择文件或目录执行 upload、download、diff preview、checksum check 和权限调整。
 
-当前版本：`v0.2.12`
+当前版本：`v0.2.13`
 
 ## 快速开始
 
@@ -80,7 +80,7 @@ RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
 
 ```text
 local_root       --local-root > RSYNC_TREE_TUI_LOCAL_ROOT > .env > 当前工作目录
-remote           --remote > RSYNC_TREE_TUI_REMOTE > .env > known connection picker
+remote           --remote > RSYNC_TREE_TUI_REMOTE > .env single > .env indexed picker > known connection picker
 permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > selected known connection > global config > 空
 ```
 
@@ -91,6 +91,15 @@ permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > s
 ```
 
 详细配置见 [Configuration](docs/configuration.md)。
+
+项目 `.env` 可以配置多个常用 remote：
+
+```bash
+RSYNC_TREE_TUI_REMOTE_0=/mnt/dev-nas/project
+RSYNC_TREE_TUI_REMOTE_1=ssh-box:/data/project
+```
+
+未传 `--remote` 且没有单值 `RSYNC_TREE_TUI_REMOTE` 时，会用 index 选择项目 remote。
 
 ## 本机例子
 
