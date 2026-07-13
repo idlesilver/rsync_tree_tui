@@ -12,6 +12,8 @@ python rsync_tree_tui.py --local-root /path/to/local --remote /path/to/other/loc
 python rsync_tree_tui.py
 ```
 
+第一次使用建议阅读 [Get Started](docs/getstart.md)：它会在 `/tmp` 中创建完全隔离的 local/remote example，带你实际完成目录比较、diff、upload、download、check、文件编辑、权限修改和分页浏览，不需要 SSH。
+
 推荐设置 alias：
 
 ```bash
@@ -101,30 +103,9 @@ RSYNC_TREE_TUI_REMOTE_1=ssh-box:/data/project
 
 未传 `--remote` 且没有单值 `RSYNC_TREE_TUI_REMOTE` 时，会用 index 选择项目 remote。
 
-## 本机例子
-
-下面的脚本创建两个相似但不完全相同的本地目录，不需要 SSH：
-
-```bash
-tmp_root="$(mktemp -d)"
-local_dir="$tmp_root/local"
-remote_dir="$tmp_root/remote"
-
-mkdir -p "$local_dir/sub" "$remote_dir/sub"
-printf "same\n" > "$local_dir/sub/same.txt"
-printf "same\n" > "$remote_dir/sub/same.txt"
-printf "local only\n" > "$local_dir/local_only.txt"
-printf "remote only\n" > "$remote_dir/remote_only.txt"
-printf "local value\n" > "$local_dir/sub/different.txt"
-printf "remote value\n" > "$remote_dir/sub/different.txt"
-
-python rsync_tree_tui.py \
-  --local-root "$local_dir" \
-  --remote "$remote_dir"
-```
-
 ## 更多文档
 
+- [Get Started](docs/getstart.md)：完全本地、可复制执行的主要功能上手教程。
 - [Configuration](docs/configuration.md)：配置优先级、JSON 配置、编辑器、checksum、mouse wheel、auto update。
 - [Usage Guide](docs/usage.md)：完整按键、同步行为、check、permission、rsync 失败日志。
 - [Permission Rules](docs/permission-rules.md)：权限 badge、read/write/group 模型和脚本规则。
