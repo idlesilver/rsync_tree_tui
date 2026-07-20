@@ -2438,7 +2438,11 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path") as preflight,
-            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:pvt", "")),
+            mock.patch.object(
+                app,
+                "_choose_permission_mode",
+                return_value=("grp:pvt", "", True),
+            ),
         ):
             app.start_action("permission")
 
@@ -2451,7 +2455,11 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path") as preflight,
-            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:grp", "shared")),
+            mock.patch.object(
+                app,
+                "_choose_permission_mode",
+                return_value=("grp:grp", "shared", False),
+            ),
         ):
             app.start_action("permission")
 
@@ -2461,6 +2469,8 @@ class PermissionActionTests(unittest.TestCase):
         self.assertEqual(app.pending_permission.mode, "grp:grp")
         self.assertEqual(app.pending_permission.permission_group, "shared")
         self.assertEqual(app.pending_permission.rel_paths, ["remote.txt"])
+        self.assertFalse(app.pending_permission.recursive)
+        self.assertIn("roots only", app.message)
         self.assertIn("Press y to confirm", app.message)
 
     def test_permission_action_chooses_mode_without_preflight_status(self) -> None:
@@ -2469,7 +2479,11 @@ class PermissionActionTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "_first_remote_non_owner_path") as preflight,
-            mock.patch.object(app, "_choose_permission_mode", return_value=("grp:pvt", "")),
+            mock.patch.object(
+                app,
+                "_choose_permission_mode",
+                return_value=("grp:pvt", "", True),
+            ),
         ):
             app.start_action("permission")
 
@@ -2545,6 +2559,32 @@ class PermissionActionTests(unittest.TestCase):
         self.assertEqual(command[:2], ["bash", "-lc"])
         self.assertIn("cd /mnt/nas", command[2])
         self.assertIn("find -L remote.txt -user alice", command[2])
+
+    def test_non_recursive_permission_request_runs_roots_only_and_logs_scope(self) -> None:
+        app = self.make_app()
+        app.pending_action = "permission"
+        app.pending_permission = tui.PermissionRequest(
+            "grp:grp",
+            ["remote.txt"],
+            "shared",
+            recursive=False,
+        )
+        process = mock.Mock()
+        process.stdout = ["Summary:\n", "  status: success\n"]
+        process.wait.return_value = 0
+
+        with (
+            mock.patch.object(app, "suspend_tui"),
+            mock.patch.object(app, "resume_tui"),
+            mock.patch("builtins.print") as print_mock,
+            mock.patch("builtins.input"),
+            mock.patch("rsync_tree_tui.subprocess.Popen", return_value=process) as popen,
+        ):
+            app.handle_key(ord("y"))
+
+        command = popen.call_args.args[0][2]
+        self.assertIn("find -L remote.txt -maxdepth 0", command)
+        print_mock.assert_any_call("Recursive: disabled (roots only)")
 
     def test_permission_foreground_nonzero_reports_warnings(self) -> None:
         app = self.make_app()
@@ -2685,6 +2725,57 @@ class PermissionActionTests(unittest.TestCase):
         self.assertIsNone(mode)
         self.assertEqual(app.stdscr.getch.call_count, 2)
 
+    def test_permission_mode_popup_defaults_recursive_enabled(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.return_value = ord("y")
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("pvt:pvt", "shared", True))
+        self.assertTrue(
+            any(
+                call.args[2].startswith("[R] recursive:")
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 3
+            )
+        )
+        self.assertTrue(
+            any(
+                call.args[2].startswith("enabled")
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 3
+            )
+        )
+
+    def test_permission_mode_popup_shift_r_disables_recursive(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.side_effect = [ord("R"), ord("y")]
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            mode = app._choose_permission_mode(1)
+
+        self.assertEqual(mode, ("pvt:pvt", "shared", False))
+        self.assertTrue(
+            any(
+                call.args[2].startswith("disabled (roots only)")
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 3
+            )
+        )
+
     def test_permission_mode_popup_ignores_ctrl_c_interrupt_flag(self) -> None:
         app = self.make_app()
         app._interrupt_requested = True
@@ -2699,7 +2790,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("grp:grp", "shared"))
+        self.assertEqual(mode, ("grp:grp", "shared", True))
         self.assertFalse(app._interrupt_requested)
 
     def test_permission_mode_popup_colors_configured_group_value_green(self) -> None:
@@ -2774,7 +2865,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("any:pvt", ""))
+        self.assertEqual(mode, ("any:pvt", "", True))
 
     def test_permission_mode_popup_accepts_verified_input_group_without_passed_in_group(self) -> None:
         app = self.make_app()
@@ -2807,7 +2898,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("pvt:pvt", "asset_team"))
+        self.assertEqual(mode, ("pvt:pvt", "asset_team", True))
         exists.assert_called_once_with("asset_team")
 
     def test_permission_mode_popup_blocks_unverified_input_group(self) -> None:
@@ -2834,7 +2925,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("pvt:pvt", "a"))
+        self.assertEqual(mode, ("pvt:pvt", "a", True))
         exists.assert_called_once_with("a")
         self.assertGreater(app.stdscr.getch.call_count, 6)
 
@@ -2964,7 +3055,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("pvt:pvt", ""))
+        self.assertEqual(mode, ("pvt:pvt", "", True))
         exists.assert_not_called()
 
     def test_permission_mode_popup_does_not_verify_passed_in_group(self) -> None:
@@ -2981,7 +3072,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("pvt:pvt", "shared"))
+        self.assertEqual(mode, ("pvt:pvt", "shared", True))
         exists.assert_not_called()
 
     def test_permission_mode_popup_hidden_shift_w_returns_any_write(self) -> None:
@@ -2997,7 +3088,7 @@ class PermissionActionTests(unittest.TestCase):
         ):
             mode = app._choose_permission_mode(1)
 
-        self.assertEqual(mode, ("any:any", "shared"))
+        self.assertEqual(mode, ("any:any", "shared", True))
 
     def test_diff_shortcuts_use_f_and_permission_uses_p_and_perm_view_uses_shift_p(self) -> None:
         app = self.make_app()
@@ -3020,6 +3111,37 @@ class PermissionActionTests(unittest.TestCase):
 
 
 class RemotePermissionCommandTests(unittest.TestCase):
+    def test_non_recursive_permission_command_limits_every_phase_to_roots(self) -> None:
+        command = tui.build_remote_permission_command(
+            "/remote",
+            ["staging"],
+            "grp:grp",
+            "asset_team",
+            owner="alice",
+            recursive=False,
+        )
+
+        self.assertIn(
+            "find -L staging -maxdepth 0 ! -user alice -printf '%u\\n'",
+            command,
+        )
+        self.assertIn(
+            "find -L staging -maxdepth 0 -user alice ! -group asset_team "
+            "-exec chgrp asset_team {} +",
+            command,
+        )
+        self.assertIn(
+            "find -L staging -maxdepth 0 -user alice -type d "
+            "-exec chmod u+rwx,g+rwx,o-rwx,g+s {} +",
+            command,
+        )
+        self.assertIn(
+            "find -L staging -maxdepth 0 -user alice -type f "
+            "-exec chmod u+rw,g+rw,o-rwx {} +",
+            command,
+        )
+        self.assertIn("echo '  recursive: disabled (roots only)'", command)
+
     def test_permission_command_with_group_uses_two_dimensional_rules(self) -> None:
         command = tui.build_remote_permission_command(
             "/root path",

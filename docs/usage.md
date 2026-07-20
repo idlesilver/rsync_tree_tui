@@ -99,7 +99,7 @@ n                  取消 check
 
 ## Permission
 
-TUI 中按 `p` 可以直接对选中的 remote 文件或目录递归应用权限模式。权限执行只修改 owner 是当前 remote 用户的条目；非 owner 条目会跳过，并在前台日志中按 owner=count 汇总。
+TUI 中按 `p` 可以直接对选中的 remote 文件或目录应用权限模式。弹窗中的 `recursive` 默认 enabled；按大写 `R` 切换为 disabled 后，只处理每个选中联通分量的 root，不处理其后代。每次重新打开弹窗都会恢复 enabled。权限执行只修改 owner 是当前 remote 用户的条目；非 owner 条目会跳过，并在前台日志中按 owner=count 汇总。
 
 文件很多时，远端 `find` / `chgrp` / `chmod` 可能长时间没有输出。前台日志界面会定期打印 `... permission still running` 和 elapsed 时间，表示权限进程仍在运行。
 
@@ -109,6 +109,7 @@ TUI 中按 `p` 可以直接对选中的 remote 文件或目录递归应用权限
 read:   pvt / grp / any
 write:  pvt / grp
 group:  not change group / selected group / input group
+recursive: enabled / disabled (roots only)
 ```
 
 如果没有配置 selected group，或需要临时覆盖，可以在 permission 弹窗中用 `g` 切到 input group，按 `G` 输入 group。输入后必须按 Enter 在 remote 侧通过 `getent group` 验证，验证通过后才允许继续执行。
@@ -123,7 +124,7 @@ TUI 在 LOCAL 和 REMOTE 中间使用独立 `PERM` 列显示 remote 权限。按
 
 ## Permission Script
 
-`setup_remote_permissions.sh` 提供与 TUI permission 相同的规则，可作为独立工具使用。脚本应该在目标端运行。先把脚本复制到远程机器，再对远程目录执行 dry-run，确认后再应用：
+`setup_remote_permissions.sh` 提供与 TUI permission 相同的权限模式，可作为独立工具使用。脚本始终递归，不受 TUI 的临时 `recursive` 选择影响。脚本应该在目标端运行。先把脚本复制到远程机器，再对远程目录执行 dry-run，确认后再应用：
 
 ```bash
 scp setup_remote_permissions.sh user@host:/tmp/setup_remote_permissions.sh

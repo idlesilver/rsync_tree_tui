@@ -9,6 +9,7 @@
 ### Added
 
 - 新增完全本地的 `docs/getstart.md` 交互教程，通过隔离 example 覆盖目录比较、diff、递归同步、download 备份、check、文件编辑、权限和分页等主要功能。
+- permission 弹窗增加默认启用的 recursive 选项；按大写 `R` 关闭后，owner 统计、group 和 mode 修改仅作用于选中联通分量的 root。
 
 ## [0.2.13] - 2026-05-21
 

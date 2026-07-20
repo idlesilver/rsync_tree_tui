@@ -210,7 +210,7 @@ Space              选择当前文件或目录
 
 - 连续按大写 `P`，观察 PERM 列在 badge、owner、group、mode 之间切换。
 - 移动到 REMOTE 一侧的 `target/`，按 `Space` 选择。
-- 按小写 `p` 打开权限弹窗；保持默认 `read: pvt`、`write: pvt`、`not change group`。
+- 按小写 `p` 打开权限弹窗；保持默认 `read: pvt`、`write: pvt`、`not change group` 和 `recursive: enabled`。按大写 `R` 可临时切换为只修改选中联通分量 root。
 - 按 `y` 继续，再按 `y` 确认执行。
 - 权限命令完成后按 `Enter` 返回 TUI。
 

@@ -736,6 +736,7 @@ class PermissionRequest:
     mode: str
     rel_paths: list[str]
     permission_group: str
+    recursive: bool = True
 
 
 @dataclass(slots=True)
@@ -1385,6 +1386,7 @@ def build_remote_permission_command(
     permission_group: str = "",
     *,
     owner: str = "",
+    recursive: bool = True,
 ) -> str:
     mode = normalize_permission_mode(mode)
     dir_mode, file_mode = permission_chmod_modes(mode)
@@ -1392,6 +1394,9 @@ def build_remote_permission_command(
         raise ValueError("No permission paths provided")
 
     quoted_paths = " ".join(shlex.quote(rel_path) for rel_path in rel_paths)
+    find_roots = f"find -L {quoted_paths}"
+    if not recursive:
+        find_roots += " -maxdepth 0"
     quoted_owner = shlex.quote(owner) if owner else "$(id -un)"
     owner_filter = shlex.quote(owner) if owner else '"$owner"'
     commands = [
@@ -1405,7 +1410,7 @@ def build_remote_permission_command(
         f"cd {shlex.quote(remote_root)} || exit 1",
         "echo '[1/3] Collecting skipped non-owned owners...'",
         (
-            f"find -L {quoted_paths} ! -user {owner_filter} "
+            f"{find_roots} ! -user {owner_filter} "
             "-printf '%u\\n' > \"$owner_tmp\" 2> \"$owner_err\" || true"
         ),
         "echo 'Skipped non-owned owners:'",
@@ -1425,7 +1430,7 @@ def build_remote_permission_command(
     if permission_group:
         quoted_group = shlex.quote(permission_group)
         commands.append(
-            f"find -L {quoted_paths} {owner_filter} ! -group {quoted_group} "
+            f"{find_roots} {owner_filter} ! -group {quoted_group} "
             f"-exec chgrp {quoted_group} {{}} + || failed=1"
         )
     else:
@@ -1434,16 +1439,17 @@ def build_remote_permission_command(
         [
             "echo '[3/3] Applying chmod to owned directories/files...'",
             (
-                f"find -L {quoted_paths} {owner_filter} -type d "
+                f"{find_roots} {owner_filter} -type d "
                 f"-exec chmod {shlex.quote(dir_mode)} {{}} + || failed=1"
             ),
             (
-                f"find -L {quoted_paths} {owner_filter} -type f "
+                f"{find_roots} {owner_filter} -type f "
                 f"-exec chmod {shlex.quote(file_mode)} {{}} + || failed=1"
             ),
             "echo 'Summary:'",
             "if [ \"$failed\" -eq 0 ]; then echo '  status: success'; else echo '  status: partial failed'; fi",
             f"echo '  mode: {mode}'",
+            f"echo '  recursive: {permission_recursive_setting_label(recursive)}'",
             "exit \"$failed\"",
         ]
     )
@@ -1463,6 +1469,14 @@ def permission_result_lines(mode: str, permission_group: str = "") -> list[str]:
     lines.append(f"  dirs:  {dir_mode}")
     lines.append(f"  files: {file_mode}")
     return lines
+
+
+def permission_recursive_setting_label(recursive: bool) -> str:
+    return "enabled" if recursive else "disabled (roots only)"
+
+
+def permission_scope_label(recursive: bool) -> str:
+    return "recursive" if recursive else "roots only"
 
 
 def permission_mode_label(mode: str) -> str:
@@ -2900,17 +2914,20 @@ class SyncApp:
             elif self.pending_action == "clear":
                 status_text = "Clear ALL selections? Press y to confirm, n to cancel."
             elif self.pending_action == "permission" and self.pending_permission is not None:
+                scope = permission_scope_label(self.pending_permission.recursive)
                 if (
                     normalize_permission_mode(self.pending_permission.mode) == "any:any"
                     and getattr(self, "pending_permission_any_write_confirmed", False)
                 ):
                     status_text = (
-                        "Other writable is dangerous. Press y again to execute, n to cancel."
+                        f"Other writable is dangerous ({scope}). "
+                        "Press y again to execute, n to cancel."
                     )
                 else:
                     status_text = (
                         f"Apply permission {self.pending_permission.mode} to "
-                        f"{len(self.pending_permission.rel_paths)} remote entries. "
+                        f"{len(self.pending_permission.rel_paths)} remote entries "
+                        f"({scope}). "
                         "Press y to confirm, n to cancel."
                     )
             elif (
@@ -3623,16 +3640,19 @@ class SyncApp:
                 self.pending_action = None
                 self.pending_permission = None
                 return
-            mode, permission_group = choice
+            mode, permission_group, recursive = choice
             self.pending_permission = PermissionRequest(
                 mode=mode,
                 rel_paths=selected_paths,
                 permission_group=permission_group,
+                recursive=recursive,
             )
             self.pending_permission_any_write_confirmed = False
             self.pending_action = "permission"
+            scope = permission_scope_label(recursive)
             self.message = (
-                f"Apply permission {mode} to {len(selected_paths)} remote entries. "
+                f"Apply permission {mode} to {len(selected_paths)} remote entries "
+                f"({scope}). "
                 "Press y to confirm, n to cancel."
             )
             return
@@ -3717,8 +3737,10 @@ class SyncApp:
         self.pending_action = None
         self.pending_permission = None
         self.pending_permission_any_write_confirmed = False
+        scope = permission_scope_label(request.recursive)
         self.message = (
-            f"Applying permission {request.mode} to {len(request.rel_paths)} remote entries..."
+            f"Applying permission {request.mode} to {len(request.rel_paths)} remote entries "
+            f"({scope})..."
         )
         self.render()
         remote_command = build_remote_permission_command(
@@ -3727,6 +3749,7 @@ class SyncApp:
             request.mode,
             request.permission_group,
             owner=self.remote_user,
+            recursive=request.recursive,
         )
         command = (
             ["bash", "-lc", remote_command]
@@ -3742,6 +3765,7 @@ class SyncApp:
             print(f"Remote: {self.remote_spec}")
             print(f"Targets: {len(request.rel_paths)} selected paths")
             print(f"Group: {group_display}")
+            print(f"Recursive: {permission_recursive_setting_label(request.recursive)}")
             print()
             process = subprocess.Popen(
                 command,
@@ -4454,9 +4478,10 @@ class SyncApp:
         )
         return sync_ok
 
-    def _choose_permission_mode(self, target_count: int) -> tuple[str, str] | None:
+    def _choose_permission_mode(self, target_count: int) -> tuple[str, str, bool] | None:
         read_index = 0
         write_scope = "pvt"
+        recursive = True
         group_sources = self._permission_group_sources()
         group_source = "passed_in" if self.permission_group else "nochange"
         input_group = ""
@@ -4498,6 +4523,7 @@ class SyncApp:
                 f"[r] read:   {read_scope}",
                 f"[w] write:  {write_scope}",
                 f"[g] group:  {group_value}",
+                f"[R] recursive: {permission_recursive_setting_label(recursive)}",
                 "    [G] edit input group; Enter verifies",
             ]
             lines.extend([
@@ -4508,7 +4534,7 @@ class SyncApp:
                 "Esc: cancel",
             ])
             if status_line:
-                lines.extend(["", status_line])
+                lines.append(status_line)
             self.render()
             height, width = self.stdscr.getmaxyx()
             content_w = min(max((self._text_cell_width(line) for line in lines), default=0), 56)
@@ -4552,6 +4578,19 @@ class SyncApp:
                         row + 1,
                         2 + len(prefix),
                         group_value,
+                        box_w - 4 - len(prefix),
+                        attr,
+                    )
+                elif line.startswith("[R] recursive:"):
+                    prefix = "[R] recursive: "
+                    value = permission_recursive_setting_label(recursive)
+                    attr = curses.A_NORMAL if recursive else disabled_attr
+                    self._popup_add_cells(win, row + 1, 2, prefix, box_w - 4)
+                    self._popup_add_cells(
+                        win,
+                        row + 1,
+                        2 + len(prefix),
+                        value,
                         box_w - 4 - len(prefix),
                         attr,
                     )
@@ -4600,11 +4639,14 @@ class SyncApp:
                     group_status = "Press Enter to verify group before continuing."
                     continue
                 continue
-            if key in (ord("r"), ord("R")):
+            if key == ord("r"):
                 read_index = (read_index + 1) % len(PERMISSION_READ_ORDER)
                 next_read_scope = PERMISSION_READ_ORDER[read_index]
                 if PERMISSION_READ_ORDER.index(write_scope) > read_index:
                     write_scope = next_read_scope
+                continue
+            if key == ord("R"):
+                recursive = not recursive
                 continue
             if key == ord("w"):
                 if write_scope == "pvt":
@@ -4648,7 +4690,7 @@ class SyncApp:
                     else:
                         group_status = "Press Enter to verify group before continuing."
                     continue
-                return mode, effective_group
+                return mode, effective_group, recursive
             if key == 27:
                 return None
 
@@ -4719,6 +4761,8 @@ class SyncApp:
             "  read: pvt / grp / any",
             "  write: pvt / grp",
             "  group: no change / selected group / input group",
+            "  R toggles recursive; enabled by default",
+            "  disabled changes only each selected component root",
             "",
             "Check",
             "  c opens a confirmation line with m/depth/y/n/? controls",

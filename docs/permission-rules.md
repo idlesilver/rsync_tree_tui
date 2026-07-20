@@ -65,6 +65,8 @@ Badge 只按新模型精确匹配；不再输出旧 `[rdo]` / `[pub]`。
 
 TUI 中按 `p` 或运行 `setup_remote_permissions.sh` 修改权限时，只修改 owner 是当前 SSH 用户（脚本中为 `--owner` / `OWNER`）的远端条目。非 owner 条目不会被修改，会在前台日志中按 owner=count 汇总。
 
+TUI permission 的 `recursive` 默认 enabled。按大写 `R` 切换为 disabled 后，owner 统计、`chgrp` 和 `chmod` 都只处理每个选中联通分量的 root；完整选中的目录以目录自身为 root，部分选中的目录则使用其中各完整选中分支的顶层路径。该选择只对当前操作有效。独立脚本始终递归。
+
 目录默认设置 `g+s` 继承 group，`pvt` 明确移除 `g+s`。文件使用 symbolic chmod，避免无意义地新增执行权限。
 
 | Mode | 目录 chmod | 文件 chmod |
@@ -88,15 +90,16 @@ find -L <path> -user <owner> ! -group <group> -exec chgrp <group> {} +
 
 ## 弹窗交互
 
-按 `p` 后弹窗维护三个状态：
+按 `p` 后弹窗维护四个状态：
 
 ```text
 [r] read:   pvt / grp / any
 [w] write:  pvt / grp
 [g] group:  <selected group> / not change group
+[R] recursive: enabled / disabled (roots only)
 ```
 
-`read=pvt, write=grp` 不允许出现；如果切换 read 导致 write 超过 read，会自动降级。`write=any` 只通过隐藏高级快捷键 `W` 进入，`any` 会显示为红色，按 `y` 后必须再按一次 `y` 才执行。只有 `y` 进入确认，`Esc` 取消。
+`recursive` 每次打开弹窗时默认为 enabled，按大写 `R` 只切换当前操作的递归范围。`read=pvt, write=grp` 不允许出现；如果切换 read 导致 write 超过 read，会自动降级。`write=any` 只通过隐藏高级快捷键 `W` 进入，`any` 会显示为红色，按 `y` 后必须再按一次 `y` 才执行。只有 `y` 进入确认，`Esc` 取消。
 
 ## 脚本
 
