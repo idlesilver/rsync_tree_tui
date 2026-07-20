@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比 local 和 remote 两棵目录树，交互式选择文件或目录执行 upload、download、diff preview、checksum check 和权限调整。
 
-当前版本：`v0.2.13`
+当前版本：`v0.2.14`
 
 ## 快速开始
 

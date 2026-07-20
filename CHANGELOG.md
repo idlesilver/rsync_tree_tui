@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-07-21
+
 ### Added
 
 - 新增完全本地的 `docs/getstart.md` 交互教程，通过隔离 example 覆盖目录比较、diff、递归同步、download 备份、check、文件编辑、权限和分页等主要功能。

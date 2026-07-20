@@ -485,7 +485,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.14"
+    FUTURE_VERSION = "0.2.15"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
