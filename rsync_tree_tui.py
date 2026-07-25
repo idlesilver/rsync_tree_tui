@@ -45,6 +45,7 @@ CONFIG_VERSION = 1
 LOCAL_ROOT_ENV = "RSYNC_TREE_TUI_LOCAL_ROOT"
 REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
 REMOTE_ENV_PREFIX = f"{REMOTE_ENV}_"
+LOCAL_ROOT_ENV_PREFIX = f"{LOCAL_ROOT_ENV}_"
 PERMISSION_GROUP_ENV = "RSYNC_TREE_TUI_PERMISSION_GROUP"
 DEFAULT_CHECKSUM_THRESHOLD_MB = 512
 DEFAULT_CHECKSUM_SUFFIXES = [
@@ -221,16 +222,26 @@ def get_remote_value(
     return None, cwd
 
 
-def dotenv_remote_values(dotenv: dict[str, str]) -> list[str]:
+def dotenv_indexed_values(
+    dotenv: dict[str, str],
+    prefix: str,
+) -> list[tuple[int, str]]:
     indexed: list[tuple[int, str]] = []
     for key, value in dotenv.items():
-        if not key.startswith(REMOTE_ENV_PREFIX):
+        if not key.startswith(prefix):
             continue
-        suffix = key[len(REMOTE_ENV_PREFIX):]
+        suffix = key[len(prefix):]
         if not suffix.isdecimal() or not value:
             continue
         indexed.append((int(suffix), value))
-    return [value for _index, value in sorted(indexed)]
+    return sorted(indexed)
+
+
+def dotenv_remote_values(dotenv: dict[str, str]) -> list[str]:
+    return [
+        value
+        for _index, value in dotenv_indexed_values(dotenv, REMOTE_ENV_PREFIX)
+    ]
 
 
 def resolve_local_root(value: str | Path | None, cwd: Path) -> Path:
@@ -369,25 +380,26 @@ def choose_known_connection(config_data: dict[str, object]) -> dict[str, object]
     return entries[index]
 
 
-def choose_dotenv_remote(remote_values: list[str], local_root: Path) -> str:
-    if not remote_values:
-        raise ValueError("No project remotes provided")
-    if len(remote_values) == 1:
-        return remote_values[0]
+def choose_dotenv_connection(
+    connections: list[tuple[Path, str]],
+) -> tuple[Path, str]:
+    if not connections:
+        raise ValueError("No project connections provided")
+    if len(connections) == 1:
+        return connections[0]
 
     print("Project .env remotes:")
     color_enabled = use_ansi_color()
-    local_text = str(local_root.resolve())
-    for index, remote in enumerate(remote_values):
+    for index, (local_root, remote) in enumerate(connections):
         print(
-            f"  [{index}] {local_text}  <->  "
+            f"  [{index}] {local_root.resolve()}  <->  "
             f"{format_remote_for_display(remote, color_enabled)}"
         )
     raw_index = input("Select project remote index: ").strip()
     index = int(raw_index)
-    if index < 0 or index >= len(remote_values):
+    if index < 0 or index >= len(connections):
         raise IndexError(f"Invalid project remote index: {index}")
-    return remote_values[index]
+    return connections[index]
 
 
 def record_successful_connection(
@@ -468,10 +480,46 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     if remote_value is not None:
         local_root = resolve_local_root(local_value, local_root_base_dir)
     else:
-        dotenv_remotes = dotenv_remote_values(dotenv)
+        dotenv_remotes = dotenv_indexed_values(dotenv, REMOTE_ENV_PREFIX)
         if dotenv_remotes:
-            local_root = resolve_local_root(local_value, local_root_base_dir)
-            remote_value = choose_dotenv_remote(dotenv_remotes, local_root)
+            indexed_locals = dict(
+                dotenv_indexed_values(dotenv, LOCAL_ROOT_ENV_PREFIX)
+            )
+            local_override = (
+                args.local_root is not None
+                or bool(os.environ.get(LOCAL_ROOT_ENV))
+            )
+            connections: list[tuple[Path, str]] = []
+            for remote_index, dotenv_remote in dotenv_remotes:
+                if (
+                    not local_override
+                    and remote_index not in indexed_locals
+                    and local_value is None
+                ):
+                    raise ValueError(
+                        f"{REMOTE_ENV_PREFIX}{remote_index} has no matching "
+                        f"{LOCAL_ROOT_ENV_PREFIX}{remote_index}, and "
+                        f"{LOCAL_ROOT_ENV} is not set"
+                    )
+                connection_local_value = local_value
+                connection_local_base_dir = local_root_base_dir
+                if not local_override:
+                    connection_local_value = indexed_locals.get(
+                        remote_index,
+                        local_value,
+                    )
+                    if remote_index in indexed_locals:
+                        connection_local_base_dir = dotenv_base_dir
+                connections.append(
+                    (
+                        resolve_local_root(
+                            connection_local_value,
+                            connection_local_base_dir,
+                        ),
+                        dotenv_remote,
+                    )
+                )
+            local_root, remote_value = choose_dotenv_connection(connections)
             remote_base_dir = dotenv_base_dir
         else:
             selected_connection = choose_known_connection(config_data)
