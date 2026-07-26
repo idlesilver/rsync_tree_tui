@@ -82,7 +82,7 @@ RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
 
 ```text
 local_root       --local-root > shell RSYNC_TREE_TUI_LOCAL_ROOT > .env indexed match > .env default > 当前工作目录
-remote           --remote > RSYNC_TREE_TUI_REMOTE > .env single > .env indexed picker > known connection picker
+remote           --remote > shell RSYNC_TREE_TUI_REMOTE > .env indexed match > .env default > known connection picker
 permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > selected known connection > global config > 空
 ```
 
@@ -94,19 +94,21 @@ permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > s
 
 详细配置见 [Configuration](docs/configuration.md)。
 
-项目 `.env` 可以配置多组 local/remote；相同编号自动配对，没有同编号 local
-时使用默认 `RSYNC_TREE_TUI_LOCAL_ROOT`：
+项目 `.env` 可以配置多组 local/remote；相同编号自动配对，任一侧缺少同编号
+配置时使用该侧不带编号的默认值：
 
 ```bash
 RSYNC_TREE_TUI_LOCAL_ROOT=/workspace/default
+RSYNC_TREE_TUI_REMOTE=default-box:/data/project
 RSYNC_TREE_TUI_LOCAL_ROOT_0=/workspace/project-a
 RSYNC_TREE_TUI_REMOTE_0=/mnt/dev-nas/project
-RSYNC_TREE_TUI_REMOTE_1=ssh-box:/data/project
+RSYNC_TREE_TUI_LOCAL_ROOT_1=/workspace/project-b
+RSYNC_TREE_TUI_REMOTE_2=ssh-box:/data/project
 ```
 
-上例中 `LOCAL_ROOT_0` 与 `REMOTE_0` 配对，`REMOTE_1` fallback 到默认
-`LOCAL_ROOT`。未传 `--remote` 且没有单值 `RSYNC_TREE_TUI_REMOTE` 时，会用
-index 选择项目配对。
+上例中 `0` 直接配对，`LOCAL_ROOT_1` fallback 到默认 `REMOTE`，
+`REMOTE_2` fallback 到默认 `LOCAL_ROOT`。存在编号配置时，会用 index
+选择项目配对。
 
 ## 更多文档
 

@@ -13,7 +13,7 @@
 `remote` 的来源优先级：
 
 ```text
---remote > RSYNC_TREE_TUI_REMOTE > .env single > .env indexed picker > known connection picker
+--remote > shell RSYNC_TREE_TUI_REMOTE > .env indexed match > .env default > known connection picker
 ```
 
 `permission_group` 的来源优先级：
@@ -36,25 +36,29 @@ RSYNC_TREE_TUI_REMOTE=ssh-box:/data/project
 
 ```bash
 RSYNC_TREE_TUI_LOCAL_ROOT=/workspace/default
+RSYNC_TREE_TUI_REMOTE=default-box:/data/project
 RSYNC_TREE_TUI_LOCAL_ROOT_0=/workspace/project-a
 RSYNC_TREE_TUI_LOCAL_ROOT_1=/workspace/project-b
 RSYNC_TREE_TUI_REMOTE_0=/mnt/dev-nas/project
-RSYNC_TREE_TUI_REMOTE_1=ssh-box:/data/project
 RSYNC_TREE_TUI_REMOTE_2=archive-box:/data/project
 ```
 
-没有传 `--remote`、shell 环境变量里没有 `RSYNC_TREE_TUI_REMOTE`、且 `.env` 没有单值 `RSYNC_TREE_TUI_REMOTE` 时，工具会读取 `RSYNC_TREE_TUI_REMOTE_<number>` 并按 number 排序。只有一个编号 remote 时会直接使用；多个时会像全局 known connections 一样显示 index picker。
+没有传 `--remote` 且 shell 环境变量里没有 `RSYNC_TREE_TUI_REMOTE` 时，工具会读取 `.env` 中编号 local 和 remote 的编号并集，按 number 排序。只有一个编号连接时会直接使用；多个时会像全局 known connections 一样显示 index picker。
 
 配对规则：
 
 - `RSYNC_TREE_TUI_LOCAL_ROOT_<number>` 与同编号的 `RSYNC_TREE_TUI_REMOTE_<number>` 配对。
 - 没有同编号 local 时，remote fallback 到默认 `RSYNC_TREE_TUI_LOCAL_ROOT`。
 - 如果既没有同编号 local，也没有默认 local，则配置报错，不会静默使用当前工作目录。
+- 没有同编号 remote 时，local fallback 到默认 `RSYNC_TREE_TUI_REMOTE`。
+- 如果既没有同编号 remote，也没有默认 remote，则配置报错。
 - 只有默认 `RSYNC_TREE_TUI_LOCAL_ROOT` 时，所有编号 remote 都使用它。
+- 只有默认 `RSYNC_TREE_TUI_REMOTE` 时，所有编号 local 都使用它。
 - 所有编号 remote 均有同编号 local 时，可以不配置默认 local。
-- CLI `--local-root` 或 shell 中的 `RSYNC_TREE_TUI_LOCAL_ROOT` 优先级更高，会覆盖 `.env` 中所有编号 local。
+- 所有编号 local 均有同编号 remote 时，可以不配置默认 remote。
+- CLI 或 shell 中不带编号的 local/remote 优先级更高，会覆盖 `.env` 中对应一侧的所有编号配置。
 
-编号 local 和编号 remote 中的本地相对路径都会相对 `.env` 所在目录解析。单值 `RSYNC_TREE_TUI_REMOTE` 优先级高于编号 remote，因此已有项目不会被新格式影响。
+编号 local、编号 remote 和 `.env` 默认 local/remote 中的本地相对路径都会相对 `.env` 所在目录解析。只使用不带编号配置的已有项目不会受新格式影响。
 
 ## Path 解析
 

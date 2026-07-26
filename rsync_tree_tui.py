@@ -477,59 +477,76 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     env_permission_group = get_env_or_dotenv(PERMISSION_GROUP_ENV, dotenv)
 
     selected_connection: dict[str, object] | None = None
-    if remote_value is not None:
+    local_override = (
+        args.local_root is not None
+        or bool(os.environ.get(LOCAL_ROOT_ENV))
+    )
+    remote_override = (
+        args.remote is not None
+        or bool(os.environ.get(REMOTE_ENV))
+    )
+    indexed_locals = dict(
+        dotenv_indexed_values(dotenv, LOCAL_ROOT_ENV_PREFIX)
+    )
+    indexed_remotes = dict(
+        dotenv_indexed_values(dotenv, REMOTE_ENV_PREFIX)
+    )
+    project_indices = sorted(
+        (set() if remote_override else set(indexed_remotes))
+        | (set() if local_override else set(indexed_locals))
+    )
+
+    if project_indices:
+        connections: list[tuple[Path, str]] = []
+        for project_index in project_indices:
+            if (
+                not local_override
+                and project_index not in indexed_locals
+                and local_value is None
+            ):
+                raise ValueError(
+                    f"{REMOTE_ENV_PREFIX}{project_index} has no matching "
+                    f"{LOCAL_ROOT_ENV_PREFIX}{project_index}, and "
+                    f"{LOCAL_ROOT_ENV} is not set"
+                )
+            connection_local_value = local_value
+            connection_local_base_dir = local_root_base_dir
+            if not local_override and project_index in indexed_locals:
+                connection_local_value = indexed_locals[project_index]
+                connection_local_base_dir = dotenv_base_dir
+            if not remote_override and project_index in indexed_remotes:
+                connection_remote = indexed_remotes[project_index]
+            else:
+                if remote_value is None:
+                    raise ValueError(
+                        f"{LOCAL_ROOT_ENV_PREFIX}{project_index} has no matching "
+                        f"{REMOTE_ENV_PREFIX}{project_index}, and "
+                        f"{REMOTE_ENV} is not set"
+                    )
+                connection_remote = remote_value
+            connections.append(
+                (
+                    resolve_local_root(
+                        connection_local_value,
+                        connection_local_base_dir,
+                    ),
+                    connection_remote,
+                )
+            )
+        local_root, remote_value = choose_dotenv_connection(connections)
+        if not remote_override:
+            remote_base_dir = dotenv_base_dir
+    elif remote_value is not None:
         local_root = resolve_local_root(local_value, local_root_base_dir)
     else:
-        dotenv_remotes = dotenv_indexed_values(dotenv, REMOTE_ENV_PREFIX)
-        if dotenv_remotes:
-            indexed_locals = dict(
-                dotenv_indexed_values(dotenv, LOCAL_ROOT_ENV_PREFIX)
-            )
-            local_override = (
-                args.local_root is not None
-                or bool(os.environ.get(LOCAL_ROOT_ENV))
-            )
-            connections: list[tuple[Path, str]] = []
-            for remote_index, dotenv_remote in dotenv_remotes:
-                if (
-                    not local_override
-                    and remote_index not in indexed_locals
-                    and local_value is None
-                ):
-                    raise ValueError(
-                        f"{REMOTE_ENV_PREFIX}{remote_index} has no matching "
-                        f"{LOCAL_ROOT_ENV_PREFIX}{remote_index}, and "
-                        f"{LOCAL_ROOT_ENV} is not set"
-                    )
-                connection_local_value = local_value
-                connection_local_base_dir = local_root_base_dir
-                if not local_override:
-                    connection_local_value = indexed_locals.get(
-                        remote_index,
-                        local_value,
-                    )
-                    if remote_index in indexed_locals:
-                        connection_local_base_dir = dotenv_base_dir
-                connections.append(
-                    (
-                        resolve_local_root(
-                            connection_local_value,
-                            connection_local_base_dir,
-                        ),
-                        dotenv_remote,
-                    )
-                )
-            local_root, remote_value = choose_dotenv_connection(connections)
-            remote_base_dir = dotenv_base_dir
-        else:
-            selected_connection = choose_known_connection(config_data)
-            remote_value = str(selected_connection["remote"])
-            remote_base_dir = cwd
+        selected_connection = choose_known_connection(config_data)
+        remote_value = str(selected_connection["remote"])
+        remote_base_dir = cwd
 
-            if local_value is None:
-                local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
-            else:
-                local_root = resolve_local_root(local_value, local_root_base_dir)
+        if local_value is None:
+            local_root = resolve_local_root(str(selected_connection["local_root"]), cwd)
+        else:
+            local_root = resolve_local_root(local_value, local_root_base_dir)
 
     remote, remote_is_local = resolve_remote_spec(remote_value, remote_base_dir)
     if remote_is_local:

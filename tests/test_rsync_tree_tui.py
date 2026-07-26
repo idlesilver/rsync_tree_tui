@@ -213,26 +213,68 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(values, ["zero:/data", "two:/data", "ten:/data"])
 
-    def test_dotenv_single_remote_keeps_priority_over_indexed_remotes(self) -> None:
+    def test_dotenv_indexed_local_without_matching_remote_uses_default(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
-        env_file = Path(".env")
+        project_dir = Path("project")
+        project_dir.mkdir()
+        env_file = project_dir / ".env"
         env_file.write_text(
-            "RSYNC_TREE_TUI_REMOTE=single@example:/data\n"
-            "RSYNC_TREE_TUI_REMOTE_0=project-a:/data\n"
-            "RSYNC_TREE_TUI_REMOTE_1=project-b:/data\n"
+            "RSYNC_TREE_TUI_LOCAL_ROOT_0=./local-zero\n"
+            "RSYNC_TREE_TUI_LOCAL_ROOT_1=./local-one\n"
+            "RSYNC_TREE_TUI_REMOTE=default:/remote/project\n"
+            "RSYNC_TREE_TUI_REMOTE_0=zero:/remote/project\n"
         )
         args = argparse.Namespace(
-            local_root=Path("local"),
+            local_root=None,
             remote=None,
             permission_group=None,
             env_file=env_file,
             config=config_path,
         )
 
-        with mock.patch("builtins.input", side_effect=AssertionError("no picker")):
+        with (
+            mock.patch("builtins.input", return_value="1"),
+            mock.patch("builtins.print"),
+        ):
             config = tui.resolve_app_config(args)
 
-        self.assertEqual(config.remote_spec, "single@example:/data")
+        self.assertEqual(
+            config.local_root,
+            (Path(self.tmp.name) / "project" / "local-one").resolve(),
+        )
+        self.assertEqual(config.remote_spec, "default:/remote/project")
+
+    def test_shell_remote_overrides_indexed_remotes_but_keeps_indexed_locals(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        project_dir = Path("project")
+        project_dir.mkdir()
+        env_file = project_dir / ".env"
+        env_file.write_text(
+            "RSYNC_TREE_TUI_LOCAL_ROOT_0=./local-zero\n"
+            "RSYNC_TREE_TUI_LOCAL_ROOT_1=./local-one\n"
+            "RSYNC_TREE_TUI_REMOTE_0=zero:/remote/project\n"
+            "RSYNC_TREE_TUI_REMOTE_1=one:/remote/project\n"
+        )
+        os.environ["RSYNC_TREE_TUI_REMOTE"] = "shell:/remote/project"
+        args = argparse.Namespace(
+            local_root=None,
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        with (
+            mock.patch("builtins.input", return_value="1"),
+            mock.patch("builtins.print"),
+        ):
+            config = tui.resolve_app_config(args)
+
+        self.assertEqual(
+            config.local_root,
+            (Path(self.tmp.name) / "project" / "local-one").resolve(),
+        )
+        self.assertEqual(config.remote_spec, "shell:/remote/project")
 
     def test_dotenv_single_indexed_remote_is_used_without_prompt(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
@@ -378,10 +420,7 @@ class ConfigTests(unittest.TestCase):
     def test_dotenv_indexed_remote_without_local_root_raises_error(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
         env_file = Path(".env")
-        env_file.write_text(
-            "RSYNC_TREE_TUI_LOCAL_ROOT_0=./local-zero\n"
-            "RSYNC_TREE_TUI_REMOTE_1=one:/remote/project\n"
-        )
+        env_file.write_text("RSYNC_TREE_TUI_REMOTE_1=one:/remote/project\n")
         args = argparse.Namespace(
             local_root=None,
             remote=None,
@@ -393,6 +432,24 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError,
             "RSYNC_TREE_TUI_LOCAL_ROOT_1.*RSYNC_TREE_TUI_LOCAL_ROOT",
+        ):
+            tui.resolve_app_config(args)
+
+    def test_dotenv_indexed_local_without_remote_raises_error(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        env_file = Path(".env")
+        env_file.write_text("RSYNC_TREE_TUI_LOCAL_ROOT_1=./local-one\n")
+        args = argparse.Namespace(
+            local_root=None,
+            remote=None,
+            permission_group=None,
+            env_file=env_file,
+            config=config_path,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "RSYNC_TREE_TUI_REMOTE_1.*RSYNC_TREE_TUI_REMOTE",
         ):
             tui.resolve_app_config(args)
 

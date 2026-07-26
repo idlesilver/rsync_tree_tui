@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `.env` 中不带编号的 `RSYNC_TREE_TUI_REMOTE` 现在可作为编号 local 缺少同编号 remote 时的 fallback；两侧编号配置按编号并集配对，任一侧既无同编号值也无默认值时明确报错。
+
 ## [0.2.15] - 2026-07-27
 
 ### Added
