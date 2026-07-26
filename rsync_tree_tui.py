@@ -893,10 +893,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Defaults (in priority order):\n"
-            f"  --local-root : ${LOCAL_ROOT_ENV} → .env {LOCAL_ROOT_ENV} → current pwd\n"
-            f"  --remote     : ${REMOTE_ENV} → .env {REMOTE_ENV} → .env {REMOTE_ENV}_N → known connection picker\n"
+            f"  --local-root : ${LOCAL_ROOT_ENV} → matching .env {LOCAL_ROOT_ENV}_N → .env {LOCAL_ROOT_ENV} → current pwd\n"
+            f"  --remote     : ${REMOTE_ENV} → matching .env {REMOTE_ENV}_N → .env {REMOTE_ENV} → known connection picker\n"
             f"  --permission-group : ${PERMISSION_GROUP_ENV} → .env → known connection → config\n"
             f"  --config     : {default_config_path()}\n"
+            "Project .env pairs matching _N indices; a missing side falls back "
+            "to its unnumbered value.\n"
         ),
     )
     parser.add_argument(

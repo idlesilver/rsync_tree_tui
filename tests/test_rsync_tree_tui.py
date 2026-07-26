@@ -23,6 +23,18 @@ class CliTests(unittest.TestCase):
 
         self.assertIn(tui.__version__, result.stdout)
 
+    def test_help_describes_indexed_env_pair_fallbacks(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "rsync_tree_tui.py", "--help"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertIn("RSYNC_TREE_TUI_LOCAL_ROOT_N", result.stdout)
+        self.assertIn("RSYNC_TREE_TUI_REMOTE_N", result.stdout)
+        self.assertIn("a missing side falls back to its unnumbered value", result.stdout)
+
 
 class ConfigTests(unittest.TestCase):
     def setUp(self) -> None:
