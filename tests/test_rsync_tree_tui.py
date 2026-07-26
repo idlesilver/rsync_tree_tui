@@ -600,7 +600,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.3.1"
+    FUTURE_VERSION = "0.2.16"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
