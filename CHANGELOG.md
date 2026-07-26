@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-27
+
 ### Added
 
 - `.env` 支持用 `RSYNC_TREE_TUI_LOCAL_ROOT_<number>` 与同编号 remote 配对；未配置同编号 local 时 fallback 到默认 `RSYNC_TREE_TUI_LOCAL_ROOT`，两者都缺失时明确报错。
