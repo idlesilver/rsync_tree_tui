@@ -6,15 +6,11 @@
 
 ## [Unreleased]
 
-### Added
-
-- `.env` 中不带编号的 `RSYNC_TREE_TUI_REMOTE` 现在可作为编号 local 缺少同编号 remote 时的 fallback；两侧编号配置按编号并集配对，任一侧既无同编号值也无默认值时明确报错。
-
 ## [0.2.15] - 2026-07-27
 
 ### Added
 
-- `.env` 支持用 `RSYNC_TREE_TUI_LOCAL_ROOT_<number>` 与同编号 remote 配对；未配置同编号 local 时 fallback 到默认 `RSYNC_TREE_TUI_LOCAL_ROOT`，两者都缺失时明确报错。
+- `.env` 支持用相同编号的 `RSYNC_TREE_TUI_LOCAL_ROOT_<number>` 与 `RSYNC_TREE_TUI_REMOTE_<number>` 配对；两侧编号按并集生成候选，缺少同编号值时 fallback 到该侧不带编号的默认值，同编号与默认值都缺失时明确报错。
 
 ## [0.2.14] - 2026-07-21
 
