@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- PERM badge 改为只摘要 group/other 的 read/write 层级：`pvt--`、`grp-r`、`grp-w`、`pub-r`、`pub-w`；other 权限超过 group 时优先显示 group 层级并标红，read 使用与 remote-only 相同的青色，精确权限继续通过 mode 视图查看。
+
 ## [0.2.15] - 2026-07-27
 
 ### Added

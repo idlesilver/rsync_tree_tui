@@ -114,7 +114,7 @@ recursive: enabled / disabled (roots only)
 
 如果没有配置 selected group，或需要临时覆盖，可以在 permission 弹窗中用 `g` 切到 input group，按 `G` 输入 group。输入后必须按 Enter 在 remote 侧通过 `getent group` 验证，验证通过后才允许继续执行。
 
-常规 `write=grp` 不会赋予 other write；`[any:g]` 表示 any readable + group writable。只有隐藏高级快捷键 `W` 可以进入 `write=any`，并且执行时需要按两次 `y` 确认。
+常规 `write=grp` 不会赋予 other write；例如 `read=any, write=grp` 会生成目录 `775` / 文件 `664`，PERM badge 摘要为 `[pub-r]`，按 `P` 切到 mode 可查看 group write 的精确位。只有隐藏高级快捷键 `W` 可以进入 `write=any`，并且执行时需要按两次 `y` 确认。
 
 `--permission-group` / `RSYNC_TREE_TUI_PERMISSION_GROUP` 提供一个可选 selected group；弹窗中 group 不是 `not change group` 时就会执行 `chgrp`，与 read/write 选择独立。
 

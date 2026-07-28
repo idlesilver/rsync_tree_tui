@@ -804,6 +804,29 @@ class PermissionRequest:
     recursive: bool = True
 
 
+class PermissionBadgeScope(str, Enum):
+    PRIVATE = "pvt"
+    GROUP = "grp"
+    PUBLIC = "pub"
+
+
+class PermissionBadgeAccess(str, Enum):
+    NONE = "-"
+    READ = "r"
+    WRITE = "w"
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionBadge:
+    scope: PermissionBadgeScope
+    access: PermissionBadgeAccess
+    warning: bool
+
+    @property
+    def label(self) -> str:
+        return f"[{self.scope.value}-{self.access.value}]"
+
+
 @dataclass(slots=True)
 class RemoteEditUploadRequest:
     rel_path: str
@@ -1927,42 +1950,36 @@ def _mode_label(perms: int) -> str:
     return _fixed_permission_label(text)
 
 
-def remote_permission_badge(entry: EntryMeta) -> str:
-    """Return a short access badge for remote files and directories."""
-    mode = entry.perms & 0o777
-    special = entry.perms & 0o7000
-    if entry.entry_type == EntryType.DIRECTORY and special not in (0, 0o2000):
-        return _mode_label(entry.perms)
+def remote_permission_badge_info(entry: EntryMeta) -> PermissionBadge:
+    """Summarize group/other read-write access and flag permission inversion."""
+    group_access = (entry.perms >> 3) & 0o6
+    other_access = entry.perms & 0o6
+    warning = bool(other_access & ~group_access)
+    visible_access = group_access if warning else other_access or group_access
 
-    if entry.entry_type == EntryType.DIRECTORY:
-        if mode == 0o700:
-            return "[pvt:-]"
-        if mode == 0o750:
-            return "[grp:r]"
-        if mode == 0o770:
-            return "[grp:w]"
-        if mode == 0o755:
-            return "[any:r]"
-        if mode == 0o775:
-            return "[any:g]"
-        if mode == 0o777:
-            return "[any:w]"
-    else:
-        if special:
-            return _mode_label(entry.perms)
-        if mode == 0o600:
-            return "[pvt:-]"
-        if mode == 0o640:
-            return "[grp:r]"
-        if mode == 0o660:
-            return "[grp:w]"
-        if mode == 0o644:
-            return "[any:r]"
-        if mode == 0o664:
-            return "[any:g]"
-        if mode == 0o666:
-            return "[any:w]"
-    return _mode_label(entry.perms)
+    if not visible_access:
+        return PermissionBadge(
+            PermissionBadgeScope.PRIVATE,
+            PermissionBadgeAccess.NONE,
+            warning,
+        )
+
+    scope = (
+        PermissionBadgeScope.GROUP
+        if warning or not other_access
+        else PermissionBadgeScope.PUBLIC
+    )
+    access = (
+        PermissionBadgeAccess.WRITE
+        if visible_access & 0o2
+        else PermissionBadgeAccess.READ
+    )
+    return PermissionBadge(scope, access, warning)
+
+
+def remote_permission_badge(entry: EntryMeta) -> str:
+    """Return a short group/other read-write badge for a remote entry."""
+    return remote_permission_badge_info(entry).label
 
 
 def remote_permission_label(entry: EntryMeta | None, view: str) -> str:
@@ -1982,13 +1999,15 @@ def remote_permission_label(entry: EntryMeta | None, view: str) -> str:
 def badge_color_pair(entry: EntryMeta | None) -> int:
     if entry is None:
         return 0
-    badge = remote_permission_badge(entry)
-    if badge == "[pvt:-]":
-        return 6
-    if badge.startswith("[grp:"):
+    badge = remote_permission_badge_info(entry)
+    if badge.warning:
+        return 1
+    if badge.scope == PermissionBadgeScope.PRIVATE:
+        return 7
+    if badge.scope == PermissionBadgeScope.GROUP:
         return 5
-    if badge.startswith("[any:"):
-        return 4
+    if badge.scope == PermissionBadgeScope.PUBLIC:
+        return 3
     return 9
 
 
@@ -2006,27 +2025,23 @@ def permission_view_color_pair(view: str, entry: EntryMeta | None) -> int:
     return 0
 
 
-def permission_badge_color_segments(label: str) -> list[tuple[str, int, bool]]:
-    if label == "[pvt:-]":
-        return [(label, 6, True)]
-    if label in {"[grp:r]", "[grp:w]", "[any:r]", "[any:g]", "[any:w]"}:
-        scope = label[1:4]
-        write = label[5]
-        scope_pair = 5 if scope == "grp" else 4
-        if write == "r":
-            write_pair = 8
-        elif write == "g":
-            write_pair = 5
-        else:
-            write_pair = 1
-        return [
-            ("[", 0, False),
-            (scope, scope_pair, False),
-            (":", 0, False),
-            (write, write_pair, False),
-            ("]", 0, False),
-        ]
-    return [(label, 9, False)]
+def permission_badge_color_segments(
+    badge: PermissionBadge,
+) -> list[tuple[str, int, bool]]:
+    if badge.warning:
+        return [(badge.label, 1, False)]
+    if badge.scope == PermissionBadgeScope.PRIVATE:
+        return [(badge.label, 7, True)]
+
+    scope_pair = 5 if badge.scope == PermissionBadgeScope.GROUP else 3
+    access_pair = 4 if badge.access == PermissionBadgeAccess.READ else 9
+    return [
+        ("[", 0, False),
+        (badge.scope.value, scope_pair, False),
+        ("-", 0, False),
+        (badge.access.value, access_pair, False),
+        ("]", 0, False),
+    ]
 
 
 def permission_column_width(
@@ -2891,20 +2906,20 @@ class SyncApp:
         curses.mousemask(mouse_event_mask())
         curses.mouseinterval(180)
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_RED, -1)  # both sides, different
+        curses.init_pair(1, curses.COLOR_RED, -1)  # different / permission warning
         curses.init_pair(2, curses.COLOR_BLUE, -1)  # status line
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)  # help text / local-only
-        curses.init_pair(4, curses.COLOR_CYAN, -1)  # remote-only
-        curses.init_pair(5, curses.COLOR_GREEN,  -1)   # both exist, confirmed same
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)  # local-only / public scope
+        curses.init_pair(4, curses.COLOR_CYAN, -1)  # remote-only / permission read
+        curses.init_pair(5, curses.COLOR_GREEN, -1)  # confirmed same / group scope
         dim_text_color = (
             DIM_TEXT_COLOR_256
             if getattr(curses, "COLORS", 0) > DIM_TEXT_COLOR_256
             else curses.COLOR_WHITE
         )
         curses.init_pair(6, dim_text_color, -1)  # dimmed gray
-        curses.init_pair(7, curses.COLOR_GREEN, -1)  # reserved permission green
+        curses.init_pair(7, curses.COLOR_WHITE, -1)  # private permission (dimmed)
         curses.init_pair(8, curses.COLOR_YELLOW, -1)  # readonly / warning
-        curses.init_pair(9, curses.COLOR_MAGENTA, -1)  # numeric permission
+        curses.init_pair(9, curses.COLOR_MAGENTA, -1)  # numeric mode / permission write
 
         try:
             while True:
@@ -3125,10 +3140,12 @@ class SyncApp:
             badge_attr = row_attr
             badge_segments: list[tuple[str, int, bool]] | None = None
             if node.right_entry is not None:
-                badge_text = remote_permission_label(node.right_entry, view)
                 if view == "badge":
-                    badge_segments = permission_badge_color_segments(badge_text)
+                    badge = remote_permission_badge_info(node.right_entry)
+                    badge_text = badge.label
+                    badge_segments = permission_badge_color_segments(badge)
                 else:
+                    badge_text = remote_permission_label(node.right_entry, view)
                     badge_attr = curses.color_pair(permission_view_color_pair(view, node.right_entry))
                     if is_cursor_row:
                         badge_attr |= curses.A_REVERSE
@@ -3136,7 +3153,11 @@ class SyncApp:
             if badge_segments is not None:
                 segment_x = badge_x
                 for segment_text, pair, dim in badge_segments:
-                    segment_attr = curses.color_pair(pair) if pair else row_attr
+                    segment_attr = (
+                        curses.color_pair(pair)
+                        if pair
+                        else curses.A_NORMAL
+                    )
                     if dim:
                         segment_attr |= curses.A_DIM
                     if is_cursor_row:
@@ -3732,7 +3753,10 @@ class SyncApp:
                 p for p in selected_paths if self._remote_path_writable(p)
             ]
             if not selected_paths:
-                self.message = "No writable remote paths in selection. Check [grp:w]/[any:g] dirs."
+                self.message = (
+                    "No writable remote paths in selection. "
+                    "Check PERM owner/group/mode details."
+                )
                 self.pending_action = None
                 return
 
@@ -4798,13 +4822,13 @@ class SyncApp:
             "  '... N more' can be expanded with Right/Enter or click",
             "",
             "PERM column (middle column)",
-            "  [pvt:-]          Owner only",
-            "  [grp:r]          Owner + group read",
-            "  [grp:w]          Owner + group write",
-            "  [any:r]          Owner + group + other read",
-            "  [any:g]          Owner + group write, other read",
-            "  [any:w]          Owner + group + other write",
-            "  [ 755 ]          Non-standard numeric mode",
+            "  [pvt--]          No group/other read or write",
+            "  [grp-r]          Group read, no public read/write",
+            "  [grp-w]          Group write, no public read/write",
+            "  [pub-r]          Public read",
+            "  [pub-w]          Public write",
+            "  red badge        Public r/w exceeds group r/w",
+            "  P                Show exact numeric mode",
             "",
             "Diff preview",
             "  f uses built-in popup with Left/Right horizontal pan",

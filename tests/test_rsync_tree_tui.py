@@ -1317,7 +1317,7 @@ class RenderTests(unittest.TestCase):
 
         self.assertIn("<error>", cell)
 
-    def test_remote_file_permission_badge_uses_two_dimensional_rules(self) -> None:
+    def test_remote_file_permission_badge_reports_group_write(self) -> None:
         entry = tui.EntryMeta(
             rel_path="asset.bin",
             entry_type=tui.EntryType.FILE,
@@ -1326,7 +1326,7 @@ class RenderTests(unittest.TestCase):
             perms=0o660,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[grp:w]")
+        self.assertEqual(tui.remote_permission_badge(entry), "[grp-w]")
         self.assertEqual(tui.badge_color_pair(entry), 5)
 
     def test_remote_directory_permission_badge_ignores_setgid(self) -> None:
@@ -1338,10 +1338,10 @@ class RenderTests(unittest.TestCase):
             perms=0o2755,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[any:r]")
-        self.assertEqual(tui.badge_color_pair(entry), 4)
+        self.assertEqual(tui.remote_permission_badge(entry), "[pub-r]")
+        self.assertEqual(tui.badge_color_pair(entry), 3)
 
-    def test_remote_any_group_write_permission_uses_distinct_badge(self) -> None:
+    def test_remote_public_read_badge_hides_group_write_detail(self) -> None:
         entry = tui.EntryMeta(
             rel_path="dataset",
             entry_type=tui.EntryType.DIRECTORY,
@@ -1350,10 +1350,98 @@ class RenderTests(unittest.TestCase):
             perms=0o2775,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[any:g]")
-        self.assertEqual(tui.badge_color_pair(entry), 4)
+        self.assertEqual(tui.remote_permission_badge(entry), "[pub-r]")
 
-    def test_remote_nonstandard_permission_uses_numeric_badge(self) -> None:
+    def test_remote_permission_badge_warns_when_other_exceeds_group(self) -> None:
+        entry = tui.EntryMeta(
+            rel_path="unsafe",
+            entry_type=tui.EntryType.DIRECTORY,
+            size=0,
+            mtime_s=1,
+            perms=0o746,
+        )
+
+        badge = tui.remote_permission_badge_info(entry)
+
+        self.assertEqual(badge.label, "[grp-r]")
+        self.assertTrue(badge.warning)
+
+    def test_permission_inversion_renders_as_a_red_warning(self) -> None:
+        entry = tui.EntryMeta(
+            rel_path="unsafe",
+            entry_type=tui.EntryType.DIRECTORY,
+            size=0,
+            mtime_s=1,
+            perms=0o746,
+        )
+
+        segments = tui.permission_badge_color_segments(
+            tui.remote_permission_badge_info(entry)
+        )
+
+        self.assertEqual(
+            segments,
+            [
+                (
+                    "[grp-r]",
+                    1,
+                    False,
+                )
+            ],
+        )
+
+    def test_permission_badge_segments_use_scope_and_access_colors(self) -> None:
+        examples = {
+            tui.PermissionBadge(
+                tui.PermissionBadgeScope.GROUP,
+                tui.PermissionBadgeAccess.READ,
+                False,
+            ): [
+                ("[", 0, False),
+                ("grp", 5, False),
+                ("-", 0, False),
+                ("r", 4, False),
+                ("]", 0, False),
+            ],
+            tui.PermissionBadge(
+                tui.PermissionBadgeScope.PUBLIC,
+                tui.PermissionBadgeAccess.WRITE,
+                False,
+            ): [
+                ("[", 0, False),
+                ("pub", 3, False),
+                ("-", 0, False),
+                ("w", 9, False),
+                ("]", 0, False),
+            ],
+            tui.PermissionBadge(
+                tui.PermissionBadgeScope.PRIVATE,
+                tui.PermissionBadgeAccess.NONE,
+                False,
+            ): [
+                ("[pvt--]", 7, True),
+            ],
+        }
+
+        for badge, expected in examples.items():
+            with self.subTest(badge=badge.label):
+                self.assertEqual(
+                    tui.permission_badge_color_segments(badge),
+                    expected,
+                )
+
+    def test_permission_read_badge_uses_remote_only_cyan(self) -> None:
+        badge = tui.PermissionBadge(
+            tui.PermissionBadgeScope.GROUP,
+            tui.PermissionBadgeAccess.READ,
+            False,
+        )
+
+        segments = tui.permission_badge_color_segments(badge)
+
+        self.assertEqual(segments[3], ("r", 4, False))
+
+    def test_remote_file_permission_badge_reports_group_read(self) -> None:
         entry = tui.EntryMeta(
             rel_path="asset.bin",
             entry_type=tui.EntryType.FILE,
@@ -1362,10 +1450,10 @@ class RenderTests(unittest.TestCase):
             perms=0o640,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[grp:r]")
+        self.assertEqual(tui.remote_permission_badge(entry), "[grp-r]")
         self.assertEqual(tui.badge_color_pair(entry), 5)
 
-    def test_remote_nonstandard_permission_uses_centered_numeric_badge(self) -> None:
+    def test_remote_file_badge_uses_same_read_write_summary_as_directory(self) -> None:
         entry = tui.EntryMeta(
             rel_path="run.sh",
             entry_type=tui.EntryType.FILE,
@@ -1374,8 +1462,8 @@ class RenderTests(unittest.TestCase):
             perms=0o755,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[ 755 ]")
-        self.assertEqual(tui.badge_color_pair(entry), 9)
+        self.assertEqual(tui.remote_permission_badge(entry), "[pub-r]")
+        self.assertEqual(tui.badge_color_pair(entry), 3)
 
     def test_remote_pvt_badge_uses_private_color_pair(self) -> None:
         entry = tui.EntryMeta(
@@ -1386,8 +1474,40 @@ class RenderTests(unittest.TestCase):
             perms=0o700,
         )
 
-        self.assertEqual(tui.remote_permission_badge(entry), "[pvt:-]")
-        self.assertEqual(tui.badge_color_pair(entry), 6)
+        self.assertEqual(tui.remote_permission_badge(entry), "[pvt--]")
+        self.assertEqual(tui.badge_color_pair(entry), 7)
+
+    def test_remote_permission_badge_only_considers_group_and_other_read_write(self) -> None:
+        examples = {
+            0o700: ("[pvt--]", False),
+            0o750: ("[grp-r]", False),
+            0o770: ("[grp-w]", False),
+            0o755: ("[pub-r]", False),
+            0o775: ("[pub-r]", False),
+            0o777: ("[pub-w]", False),
+            0o720: ("[grp-w]", False),
+            0o722: ("[pub-w]", False),
+            0o746: ("[grp-r]", True),
+            0o714: ("[pvt--]", True),
+            0o702: ("[pvt--]", True),
+            0o470: ("[grp-w]", False),
+            0o2745: ("[pub-r]", False),
+            0o4777: ("[pub-w]", False),
+        }
+
+        for perms, expected in examples.items():
+            with self.subTest(perms=f"{perms:o}"):
+                entry = tui.EntryMeta(
+                    rel_path="entry",
+                    entry_type=tui.EntryType.DIRECTORY,
+                    size=0,
+                    mtime_s=1,
+                    perms=perms,
+                )
+
+                badge = tui.remote_permission_badge_info(entry)
+
+                self.assertEqual((badge.label, badge.warning), expected)
 
     def test_large_loaded_directory_stays_unexplored_until_check(self) -> None:
         root = tui.TreeNode(
@@ -1457,7 +1577,7 @@ class RenderTests(unittest.TestCase):
             group="asset_team",
         )
 
-        self.assertEqual(tui.remote_permission_label(entry, "badge"), "[any:r]")
+        self.assertEqual(tui.remote_permission_label(entry, "badge"), "[pub-r]")
         self.assertEqual(tui.remote_permission_label(entry, "owner"), "[alice]")
         self.assertEqual(tui.remote_permission_label(entry, "group"), "[asset_team]")
         self.assertEqual(tui.remote_permission_label(entry, "mode"), "[2755 ]")
@@ -1496,7 +1616,7 @@ class RenderTests(unittest.TestCase):
         )
         self.assertEqual(tui.permission_column_width(visible, "badge", 100), 7)
 
-    def test_render_draws_remote_badge_in_middle_column_with_badge_color(self) -> None:
+    def test_render_draws_remote_read_badge_with_remote_only_cyan(self) -> None:
         app = tui.SyncApp.__new__(tui.SyncApp)
         root = tui.TreeNode(name="", rel_path="", is_expanded=True)
         remote_file = tui.TreeNode(
@@ -1508,7 +1628,7 @@ class RenderTests(unittest.TestCase):
                 entry_type=tui.EntryType.FILE,
                 size=1,
                 mtime_s=1,
-                perms=0o660,
+                perms=0o640,
             ),
         )
         root.children = {"asset.bin": remote_file}
@@ -1527,21 +1647,28 @@ class RenderTests(unittest.TestCase):
         app.stdscr.getmaxyx.return_value = (24, 100)
 
         with (
-            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 100),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n * 256),
             mock.patch("rsync_tree_tui.curses.A_REVERSE", 0),
+            mock.patch("rsync_tree_tui.curses.A_DIM", 4),
         ):
             app.render()
 
         calls = app.stdscr.addnstr.call_args_list
         self.assertTrue(
             any(
-                call.args[2] == "grp" and call.args[4] == 500
+                call.args[2] == "[" and call.args[4] == 0
                 for call in calls
             )
         )
         self.assertTrue(
             any(
-                call.args[2] == "w" and call.args[4] == 100
+                call.args[2] == "grp" and call.args[4] == 1280
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            any(
+                call.args[2] == "r" and call.args[4] == 1024
                 for call in calls
             )
         )

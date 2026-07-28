@@ -20,46 +20,63 @@ TUI 在 LOCAL 和 REMOTE 中间使用独立 `PERM` 列。按 `P` 在四种视图
 badge -> owner -> group -> mode -> badge
 ```
 
-所有视图都保持固定括号位置 `[_____]`：
+badge 使用固定宽度，owner/group 按当前可见内容扩宽：
 
 ```text
-[pvt:-]
-[grp:r]
-[grp:w]
-[any:r]
-[any:g]
-[any:w]
-[ 755 ]
+[pvt--]
+[grp-r]
+[grp-w]
+[pub-r]
+[pub-w]
 [2755 ]
 [alice]
 [asset]
 [     ]
 ```
 
-owner/group 超过 5 个字符时截断；缺失元信息显示空白 `[     ]`。
+缺失元信息显示空白 `[     ]`。
 
 颜色：
 
 | 视图 | 颜色 |
 | --- | --- |
-| badge `[pvt:-]` | 灰色 |
-| badge `[grp:r]` / `[grp:w]` | scope 绿色；`r` 黄色；`w` 红色 |
-| badge `[any:r]` / `[any:g]` / `[any:w]` | scope 蓝色；`r` 黄色；`g` 绿色；`w` 红色 |
+| badge `[pvt--]` | 灰色 |
+| badge `[grp-r]` / `[grp-w]` | `grp` 绿色；`r` 青色（与 remote-only 相同）；`w` 紫色 |
+| badge `[pub-r]` / `[pub-w]` | `pub` 黄色；`r` 青色（与 remote-only 相同）；`w` 紫色 |
+| public r/w 超过 group r/w | 整枚 badge 红色 |
 | owner | 青色 |
 | group | 绿色 |
-| mode / numeric fallback | 紫色 |
+| mode | 紫色 |
 | unknown / blank | 白色 |
 
 ## Badge 判定
 
-Badge 只按新模型精确匹配；不再输出旧 `[rdo]` / `[pub]`。
+Badge 只摘要 group 和 other 的 read/write 位，不考虑 owner、execute、条目类型或 setuid/setgid/sticky 等特殊位。需要精确权限时按 `P` 切到 mode 视图。
 
-| 条目类型 | `[pvt:-]` | `[grp:r]` | `[grp:w]` | `[any:r]` | `[any:g]` | `[any:w]` |
-| --- | --- | --- | --- | --- | --- | --- |
-| 目录 | `700` / `2700` | `750` / `2750` | `770` / `2770` | `755` / `2755` | `775` / `2775` | `777` / `2777` |
-| 文件 | `600` | `640` | `660` | `644` | `664` | `666` |
+正常权限按以下优先级显示：
 
-其他权限显示数字 mode。目录 setgid 只在上述目录模板中被接受；其他特殊位显示数字。
+```text
+other 有 write  -> [pub-w]
+other 有 read   -> [pub-r]
+group 有 write  -> [grp-w]
+group 有 read   -> [grp-r]
+都没有          -> [pvt--]
+```
+
+因此 `755` 和 `775` 都显示 `[pub-r]`；两者的 group write 差异在 mode 视图中查看。write 优先于 read，所以 write-only 权限仍归入 `*-w`。
+
+如果 other 拥有 group 没有的 read/write 位，则视为权限倒挂。此时 badge 改按 group 的 read/write 定级，并整枚显示红色；group 没有 read/write 时显示红色 `[pvt--]`。倒挂比较同样忽略 execute 位。
+
+| Mode 示例 | Badge | 状态 |
+| --- | --- | --- |
+| `700` / `600` | `[pvt--]` | 正常 |
+| `750` / `640` | `[grp-r]` | 正常 |
+| `770` / `660` | `[grp-w]` | 正常 |
+| `755` / `644` | `[pub-r]` | 正常 |
+| `775` / `664` | `[pub-r]` | 正常 |
+| `777` / `666` | `[pub-w]` | 正常 |
+| `746` | `[grp-r]` | 红色倒挂 |
+| `714` / `702` | `[pvt--]` | 红色倒挂 |
 
 ## 修改规则
 
