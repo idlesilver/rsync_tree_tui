@@ -36,7 +36,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.15"
+__version__ = "0.2.16"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -4614,8 +4614,8 @@ class SyncApp:
                 f"[r] read:   {read_scope}",
                 f"[w] write:  {write_scope}",
                 f"[g] group:  {group_value}",
-                f"[R] recursive: {permission_recursive_setting_label(recursive)}",
                 "    [G] edit input group; Enter verifies",
+                f"[R] recursive: {permission_recursive_setting_label(recursive)}",
             ]
             lines.extend([
                 "",

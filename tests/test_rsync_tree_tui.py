@@ -669,7 +669,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.16"
+    FUTURE_VERSION = "0.2.17"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -3064,6 +3064,32 @@ class PermissionActionTests(unittest.TestCase):
                 if len(call.args) >= 3
             )
         )
+
+    def test_permission_mode_popup_places_group_edit_before_recursive(self) -> None:
+        app = self.make_app()
+        app.stdscr = mock.Mock()
+        app.stdscr.getmaxyx.return_value = (24, 100)
+        app.stdscr.getch.return_value = ord("y")
+        win = mock.Mock()
+
+        with (
+            mock.patch("rsync_tree_tui.curses.newwin", return_value=win),
+            mock.patch("rsync_tree_tui.curses.color_pair", side_effect=lambda n: n),
+        ):
+            app._choose_permission_mode(1)
+
+        def rendered_row(prefix: str) -> int:
+            return next(
+                call.args[0]
+                for call in win.addnstr.call_args_list
+                if len(call.args) >= 3 and call.args[2].startswith(prefix)
+            )
+
+        group_row = rendered_row("[g] group:")
+        group_edit_row = rendered_row("    [G] edit input group")
+        recursive_row = rendered_row("[R] recursive:")
+        self.assertEqual(group_edit_row, group_row + 1)
+        self.assertEqual(recursive_row, group_edit_row + 1)
 
     def test_permission_mode_popup_shift_r_disables_recursive(self) -> None:
         app = self.make_app()
