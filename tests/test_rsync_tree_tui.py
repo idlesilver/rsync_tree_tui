@@ -67,6 +67,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(data["diff_viewers"], tui.DEFAULT_DIFF_VIEWERS)
         self.assertEqual(data["file_editor"], tui.DEFAULT_FILE_EDITOR)
         self.assertEqual(data["image_opener"], tui.DEFAULT_IMAGE_OPENER)
+        self.assertEqual(data["default_upload_permission"], "")
         self.assertEqual(
             data["mouse_wheel"],
             {
@@ -75,6 +76,45 @@ class ConfigTests(unittest.TestCase):
             },
         )
         self.assertTrue(config_path.exists())
+
+    def test_config_accepts_pub_read_as_default_upload_permission(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        local_root = Path(self.tmp.name) / "local"
+        remote_root = Path(self.tmp.name) / "remote"
+        config_path.write_text(
+            '{"version": 1, "default_upload_permission": "pub-r", '
+            '"known_connections": []}'
+        )
+        args = argparse.Namespace(
+            local_root=local_root,
+            remote=str(remote_root),
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.default_upload_permission, "pub-r")
+
+    def test_config_rejects_unknown_default_upload_permission(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        local_root = Path(self.tmp.name) / "local"
+        remote_root = Path(self.tmp.name) / "remote"
+        config_path.write_text(
+            '{"version": 1, "default_upload_permission": "public", '
+            '"known_connections": []}'
+        )
+        args = argparse.Namespace(
+            local_root=local_root,
+            remote=str(remote_root),
+            permission_group=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        with self.assertRaisesRegex(ValueError, "default_upload_permission"):
+            tui.resolve_app_config(args)
 
     def test_config_file_backfills_auto_update_defaults(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
@@ -1060,6 +1100,10 @@ class FileOpenTests(unittest.TestCase):
                 ),
             )
             app = self.make_app_with_current_node(node, local_root)
+            app.default_upload_permission = "pub-r"
+            app.remote_is_local = False
+            app.remote_user = "alice"
+            app.permission_group = ""
             temp_root = Path(tempfile.mkdtemp())
             try:
                 (temp_root / "notes.txt").write_text("after\n")
@@ -1097,6 +1141,10 @@ class FileOpenTests(unittest.TestCase):
                 self.assertEqual(
                     len([arg for arg in rsync_calls[0] if arg.startswith("--files-from=")]),
                     1,
+                )
+                self.assertIn(
+                    "--chmod=Du=rwx,Dg=rx,Do=rx,Dg+s,Fu=rw,Fg=r,Fo=r",
+                    rsync_calls[0],
                 )
                 self.assertIn(tui.format_local_root(temp_root), rsync_calls[0])
                 self.assertIn(tui.format_remote_root("user@example", "/remote/root"), rsync_calls[0])
@@ -1183,6 +1231,87 @@ class ManifestTests(unittest.TestCase):
         entry = entries["dir\tname/file.txt"]
         self.assertEqual(entry.size, 12)
         self.assertEqual(entry.owner, "alice")
+
+
+class TreeRefreshTests(unittest.TestCase):
+    def test_refresh_preserves_revealed_pages_in_expanded_directory(self) -> None:
+        def make_dataset(*, expanded: bool, shown: int) -> tui.TreeNode:
+            dataset = tui.TreeNode(
+                name="dataset",
+                rel_path="dataset",
+                left_entry=tui.EntryMeta(
+                    "dataset", tui.EntryType.DIRECTORY, 0, 1, 0o755
+                ),
+                children_loaded=True,
+                is_expanded=expanded,
+                children_shown_count=shown,
+                total_children_count=5,
+            )
+            for index in range(5):
+                name = f"{index}.txt"
+                rel_path = f"dataset/{name}"
+                dataset.children[name] = tui.TreeNode(
+                    name=name,
+                    rel_path=rel_path,
+                    parent=dataset,
+                    left_entry=tui.EntryMeta(
+                        rel_path, tui.EntryType.FILE, 1, 1, 0o644
+                    ),
+                    children_loaded=True,
+                )
+            return dataset
+
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        old_root = tui.TreeNode(
+            name="", rel_path="", children_loaded=True, is_expanded=True
+        )
+        old_dataset = make_dataset(expanded=True, shown=4)
+        old_dataset.parent = old_root
+        old_root.children = {"dataset": old_dataset}
+        app.root_node = old_root
+        app.node_by_rel_path = {
+            "": old_root,
+            "dataset": old_dataset,
+            **{node.rel_path: node for node in old_dataset.children.values()},
+        }
+        app.pagination_size = 2
+        app.cursor_index = 0
+        app.scroll_offset = 0
+        app.last_cursor_rel_path = "dataset"
+        app.message = ""
+
+        def initialize_tree() -> None:
+            new_root = tui.TreeNode(
+                name="", rel_path="", children_loaded=True, is_expanded=True
+            )
+            new_dataset = make_dataset(expanded=False, shown=0)
+            new_dataset.parent = new_root
+            new_root.children = {"dataset": new_dataset}
+            app.root_node = new_root
+            app.node_by_rel_path = {
+                "": new_root,
+                "dataset": new_dataset,
+                **{node.rel_path: node for node in new_dataset.children.values()},
+            }
+
+        app.initialize_tree = initialize_tree
+
+        app.refresh_manifests(initial_load=False)
+
+        refreshed_dataset = app.node_by_rel_path["dataset"]
+        self.assertTrue(refreshed_dataset.is_expanded)
+        self.assertEqual(refreshed_dataset.children_shown_count, 4)
+        self.assertEqual(
+            [node.rel_path for node in app._visible_nodes()],
+            [
+                "dataset",
+                "dataset/0.txt",
+                "dataset/1.txt",
+                "dataset/2.txt",
+                "dataset/3.txt",
+                "dataset/__more_placeholder__",
+            ],
+        )
 
 
 class ChecksumPolicyTests(unittest.TestCase):
@@ -2688,6 +2817,181 @@ class SyncActionTests(unittest.TestCase):
         print_mock.assert_any_call("Full log: /tmp/rsync-failed.log")
         self.assertIn("rsync exit code 23", app.message)
         self.assertIn("/tmp/rsync-failed.log", app.message)
+
+    def test_upload_applies_configured_default_permission_after_rsync(self) -> None:
+        app = tui.SyncApp.__new__(tui.SyncApp)
+        root = tui.TreeNode(name="", rel_path="", is_expanded=True)
+        local_file = tui.TreeNode(
+            name="asset.txt",
+            rel_path="asset.txt",
+            parent=root,
+            is_selected=True,
+            left_entry=tui.EntryMeta(
+                rel_path="asset.txt",
+                entry_type=tui.EntryType.FILE,
+                size=1,
+                mtime_s=1,
+                perms=0o600,
+            ),
+            children_loaded=True,
+        )
+        root.children = {"asset.txt": local_file}
+        app.root_node = root
+        app.node_by_rel_path = {"": root, "asset.txt": local_file}
+        app.pending_action = "upload"
+        app.local_root = Path("/local")
+        app.remote_target = "host"
+        app.remote_root = "/remote"
+        app.remote_is_local = False
+        app.remote_user = "alice"
+        app.permission_group = ""
+        app.default_upload_permission = "pub-r"
+        app.message = ""
+        app.render = mock.Mock()
+        app.suspend_tui = mock.Mock()
+        app.resume_tui = mock.Mock()
+        app.refresh_manifests = mock.Mock()
+        app._ssh_opts = mock.Mock(return_value=[])
+        app._expand_selected_paths = mock.Mock(
+            return_value=(["asset.txt"], {"asset.txt": local_file.left_entry})
+        )
+        app._split_paths_by_checksum = mock.Mock(
+            return_value=[(False, ["asset.txt"])]
+        )
+
+        with (
+            mock.patch(
+                "rsync_tree_tui.run_foreground_rsync_command",
+                return_value=tui.RSyncRunResult(0, Path("/tmp/ok.log"), []),
+            ) as run,
+            mock.patch("builtins.input"),
+            mock.patch("builtins.print"),
+        ):
+            app.execute_pending_action()
+
+        rsync_command = run.call_args.args[0]
+        self.assertIn(
+            "--chmod=Du=rwx,Dg=rx,Do=rx,Dg+s,Fu=rw,Fg=r,Fo=r",
+            rsync_command,
+        )
+        self.assertIn("default permission [pub-r]", app.message)
+
+    def test_upload_chmod_changes_only_file_list_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            local_root = root / "local"
+            remote_root = root / "remote"
+            (local_root / "dataset").mkdir(parents=True)
+            (remote_root / "dataset").mkdir(parents=True)
+            uploaded_file = local_root / "dataset" / "uploaded.sh"
+            remote_only_file = remote_root / "dataset" / "remote-only.txt"
+            uploaded_file.write_text("uploaded\n")
+            remote_only_file.write_text("remote only\n")
+            uploaded_file.chmod(0o777)
+            remote_only_file.chmod(0o700)
+
+            with tempfile.NamedTemporaryFile("wb") as file_list:
+                file_list.write(b"dataset\0dataset/uploaded.sh\0")
+                file_list.flush()
+                command = tui.build_rsync_command(
+                    Path(file_list.name),
+                    tui.format_local_root(local_root),
+                    tui.format_local_root(remote_root),
+                    "",
+                    False,
+                    chmod=tui.DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP["pub-r"],
+                )
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+
+            self.assertEqual(
+                (remote_root / "dataset").stat().st_mode & 0o7777,
+                0o2755,
+            )
+            self.assertEqual(
+                (remote_root / "dataset" / "uploaded.sh").stat().st_mode & 0o7777,
+                0o644,
+            )
+            self.assertEqual(remote_only_file.stat().st_mode & 0o7777, 0o700)
+
+    def test_upload_chmod_does_not_change_implied_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            local_root = root / "local"
+            remote_root = root / "remote"
+            (local_root / "dataset").mkdir(parents=True)
+            (remote_root / "dataset").mkdir(parents=True)
+            uploaded_file = local_root / "dataset" / "uploaded.sh"
+            uploaded_file.write_text("uploaded\n")
+            uploaded_file.chmod(0o777)
+            (remote_root / "dataset").chmod(0o700)
+
+            with tempfile.NamedTemporaryFile("wb") as file_list:
+                file_list.write(b"dataset/uploaded.sh\0")
+                file_list.flush()
+                command = tui.build_rsync_command(
+                    Path(file_list.name),
+                    tui.format_local_root(local_root),
+                    tui.format_local_root(remote_root),
+                    "",
+                    False,
+                    chmod=tui.DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP["pub-r"],
+                )
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+
+            self.assertEqual(
+                (remote_root / "dataset").stat().st_mode & 0o7777,
+                0o700,
+            )
+            self.assertEqual(
+                (remote_root / "dataset" / "uploaded.sh").stat().st_mode
+                & 0o7777,
+                0o644,
+            )
+
+    def test_upload_chmod_modes_set_documented_permissions(self) -> None:
+        expected_modes = {
+            "pvt--": (0o700, 0o600),
+            "grp-r": (0o2750, 0o640),
+            "grp-w": (0o2770, 0o660),
+            "pub-r": (0o2755, 0o644),
+            "pub-w": (0o2777, 0o666),
+        }
+
+        for permission, (expected_dir_mode, expected_file_mode) in expected_modes.items():
+            with self.subTest(permission=permission), tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir)
+                local_root = root / "local"
+                remote_root = root / "remote"
+                (local_root / "dataset").mkdir(parents=True)
+                uploaded_file = local_root / "dataset" / "uploaded.sh"
+                uploaded_file.write_text("uploaded\n")
+                uploaded_file.chmod(0o777)
+                remote_root.mkdir()
+
+                with tempfile.NamedTemporaryFile("wb") as file_list:
+                    file_list.write(b"dataset\0dataset/uploaded.sh\0")
+                    file_list.flush()
+                    command = tui.build_rsync_command(
+                        Path(file_list.name),
+                        tui.format_local_root(local_root),
+                        tui.format_local_root(remote_root),
+                        "",
+                        False,
+                        chmod=tui.DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP[
+                            permission
+                        ],
+                    )
+                    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+
+                self.assertEqual(
+                    (remote_root / "dataset").stat().st_mode & 0o7777,
+                    expected_dir_mode,
+                )
+                self.assertEqual(
+                    (remote_root / "dataset" / "uploaded.sh").stat().st_mode
+                    & 0o7777,
+                    expected_file_mode,
+                )
 
 
 class PermissionActionTests(unittest.TestCase):

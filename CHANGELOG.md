@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- 新增 `default_upload_permission` 配置；可用 `pvt--`、`grp-r`、`grp-w`、`pub-r`、`pub-w` 通过 rsync `--chmod` 自动统一本次 upload file list 的远端权限。
+
+### Fixed
+
+- rsync 或手动刷新 manifest 后会保留大目录通过 `... N more` 已展开的分页数量，不再退回默认前 20 项。
+
 ## [0.2.16] - 2026-08-05
 
 ### Changed

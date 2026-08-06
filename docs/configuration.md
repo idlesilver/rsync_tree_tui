@@ -96,7 +96,29 @@ SSH config name 原样传给 `ssh` 和 `rsync`，因此 `HostName`、`User`、`P
 ~/.config/rsync-tree-tui/config.json
 ```
 
-配置样例见 [config.example.json](../config.example.json)。该文件维护 checksum 策略、diff viewer、file editor、image opener、mouse wheel、auto update 和成功连接过的 local/remote。没有传入 `remote` 时，工具会按访问次数列出历史连接，让用户输入 index 选择。
+配置样例见 [config.example.json](../config.example.json)。该文件维护 upload 默认权限、checksum 策略、diff viewer、file editor、image opener、mouse wheel、auto update 和成功连接过的 local/remote。没有传入 `remote` 时，工具会按访问次数列出历史连接，让用户输入 index 选择。
+
+## Upload 默认权限
+
+`default_upload_permission` 会让 rsync 在 upload 时统一本次 file list 中条目的远端权限。默认空字符串表示关闭，不改变原有 upload 行为。
+
+```json
+{
+  "default_upload_permission": "pub-r"
+}
+```
+
+支持的 badge 值及精确结果：
+
+| 配置值 | 目录 mode | 文件 mode |
+| --- | --- | --- |
+| `pvt--` | `700` | `600` |
+| `grp-r` | `2750` | `640` |
+| `grp-w` | `2770` | `660` |
+| `pub-r` | `2755` | `644` |
+| `pub-w` | `2777` | `666` |
+
+目录中的前导 `2` 是 setgid，用于让新条目继承 group。权限通过 rsync `--chmod --no-implied-dirs` 应用，只作用于显式 upload file list；远端独有的目录后代不会被递归修改，单独上传嵌套文件也不会修改其隐含父目录。项目原有的 `--keep-dirlinks` 仍然生效，因此目标端指向目录的符号链接会继续被当作目标目录使用。权限无法应用时会作为 rsync 失败处理，并沿用 rsync log 和错误摘要。
 
 ## Auto Update
 

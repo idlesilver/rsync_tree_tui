@@ -25,6 +25,7 @@
     "vimdiff {local} {remote}",
     "nvim -d {local} {remote}"
   ],
+  "default_upload_permission": "pub-r",
   "file_editor": "vim {file}",
   "image_opener": "sh -c 'timg \"$1\" && printf \"\\nPress Ctrl+C to return to rsync-tree-tui...\\n\" && sleep 2147483647' timg-view {file}",
   "mouse_wheel": {

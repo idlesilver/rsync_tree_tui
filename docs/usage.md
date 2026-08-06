@@ -40,6 +40,8 @@ q                  退出
 
 `d` download：remote -> local。
 
+配置 `default_upload_permission` 后，普通 upload 和修改 remote 临时副本后的单文件 upload 都会在 rsync 成功后自动应用指定远端权限。返回主界面刷新 manifest 时，已展开目录和通过 `... N more` 显示出的分页数量都会保留。
+
 目录选择会先展开成显式 file list，再交给 rsync `--files-from`。下载会使用 rsync `--backup --whole-file`：
 
 - `--whole-file` 让远端覆盖本地时直接传完整文件，避免用本地旧文件作为 delta basis 时出现 verification failed。

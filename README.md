@@ -92,6 +92,16 @@ permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > s
 ~/.config/rsync-tree-tui/config.json
 ```
 
+如需在每次 upload 成功后自动统一远端权限，可设置：
+
+```json
+{
+  "default_upload_permission": "pub-r"
+}
+```
+
+空字符串表示关闭；可选值为 `pvt--`、`grp-r`、`grp-w`、`pub-r`、`pub-w`。
+
 详细配置见 [Configuration](docs/configuration.md)。
 
 项目 `.env` 可以配置多组 local/remote；相同编号自动配对，任一侧缺少同编号

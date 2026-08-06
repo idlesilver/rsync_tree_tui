@@ -61,6 +61,14 @@ DEFAULT_PAGINATION_SIZE = 20
 DEFAULT_ESC_DELAY_MS = 25
 DEFAULT_MOUSE_WHEEL_STEP = 1
 DEFAULT_MOUSE_WHEEL_COALESCE_MS = 0
+DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP = {
+    "pvt--": "Du=rwx,Dgo=,Fu=rw,Fgo=",
+    "grp-r": "Du=rwx,Dg=rx,Do=,Dg+s,Fu=rw,Fg=r,Fo=",
+    "grp-w": "Du=rwx,Dg=rwx,Do=,Dg+s,Fu=rw,Fg=rw,Fo=",
+    "pub-r": "Du=rwx,Dg=rx,Do=rx,Dg+s,Fu=rw,Fg=r,Fo=r",
+    "pub-w": "Dugo=rwx,Dg+s,Fugo=rw",
+}
+DEFAULT_UPLOAD_PERMISSIONS = ("", *DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP)
 MIN_MAIN_RENDER_WIDTH = 34
 MIN_MAIN_RENDER_HEIGHT = 8
 DIM_TEXT_COLOR_256 = 244
@@ -125,6 +133,7 @@ def default_config_data() -> dict[str, object]:
             "step": DEFAULT_MOUSE_WHEEL_STEP,
             "coalesce_ms": DEFAULT_MOUSE_WHEEL_COALESCE_MS,
         },
+        "default_upload_permission": "",
         "permission_group": "",
         "known_connections": [],
     }
@@ -160,6 +169,19 @@ def load_json_config(config_path: Path) -> dict[str, object]:
 def save_json_config(config_path: Path, data: dict[str, object]) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def parse_default_upload_permission(config_data: dict[str, object]) -> str:
+    value = config_data.get("default_upload_permission", "")
+    if not isinstance(value, str):
+        raise ValueError("default_upload_permission must be a string")
+    permission = value.strip().lower()
+    if permission not in DEFAULT_UPLOAD_PERMISSIONS:
+        choices = ", ".join(repr(item) for item in DEFAULT_UPLOAD_PERMISSIONS)
+        raise ValueError(
+            f"Invalid default_upload_permission: {value!r}; expected one of {choices}"
+        )
+    return permission
 
 
 def configure_escape_delay(delay_ms: int = DEFAULT_ESC_DELAY_MS) -> None:
@@ -582,6 +604,7 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         file_editor=file_editor,
         image_opener=resolve_image_opener(config_data, file_editor),
         mouse_wheel=parse_mouse_wheel_config(config_data),
+        default_upload_permission=parse_default_upload_permission(config_data),
         permission_group=permission_group,
         permission_group_source=permission_group_source,
         pagination_size=int(config_data.get("pagination_size", DEFAULT_PAGINATION_SIZE)),
@@ -791,6 +814,7 @@ class AppConfig:
     file_editor: FileEditor
     image_opener: FileEditor
     mouse_wheel: MouseWheelConfig
+    default_upload_permission: str = ""
     permission_group: str = ""
     permission_group_source: str = "none"
     pagination_size: int = DEFAULT_PAGINATION_SIZE
@@ -1845,6 +1869,19 @@ def collect_expanded_node_paths(node: TreeNode) -> set[str]:
     return expanded_node_paths
 
 
+def collect_revealed_page_counts(
+    node: TreeNode, pagination_size: int
+) -> dict[str, int]:
+    revealed_page_counts: dict[str, int] = {}
+    if node.children_shown_count > pagination_size:
+        revealed_page_counts[node.rel_path] = node.children_shown_count
+    for child_node in node.children.values():
+        revealed_page_counts.update(
+            collect_revealed_page_counts(child_node, pagination_size)
+        )
+    return revealed_page_counts
+
+
 def visible_nodes(
     root_node: TreeNode, pagination_size: int = DEFAULT_PAGINATION_SIZE
 ) -> list[TreeNode]:
@@ -2146,11 +2183,17 @@ def build_rsync_command(
     use_checksum: bool,
     backup: bool = False,
     whole_file: bool = False,
+    chmod: str = "",
 ) -> list[str]:
+    permission_options = (
+        ["--perms", "--no-implied-dirs", f"--chmod={chmod}"]
+        if chmod
+        else ["--no-perms"]
+    )
     command = [
         "rsync",
         "-av",
-        "--no-perms",
+        *permission_options,
         "--no-owner",
         "--no-group",
         "--omit-dir-times",
@@ -2352,6 +2395,7 @@ class SyncApp:
         self.file_editor = config.file_editor
         self.image_opener = config.image_opener
         self.mouse_wheel = config.mouse_wheel
+        self.default_upload_permission = config.default_upload_permission
         self.permission_group = config.permission_group
         self.permission_group_source = config.permission_group_source
         self.permission_view = "badge"
@@ -2502,6 +2546,16 @@ class SyncApp:
             return f"{self.permission_group} ({self.permission_group_source})"
         return "<none>"
 
+    def _default_upload_rsync_chmod(self) -> str:
+        permission = getattr(self, "default_upload_permission", "")
+        return DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP.get(permission, "")
+
+    def _upload_completion_message(self, operation: str) -> str:
+        permission = getattr(self, "default_upload_permission", "")
+        if not permission:
+            return f"{operation}."
+        return f"{operation} and applied default permission [{permission}]."
+
     def _permission_group_display_attr(self) -> int:
         if self.permission_group:
             return curses.color_pair(5)
@@ -2644,23 +2698,51 @@ class SyncApp:
     def refresh_manifests(self, initial_load: bool = False) -> None:
         selected_node_paths = collect_selected_node_paths(self.root_node)
         expanded_node_paths = collect_expanded_node_paths(self.root_node)
+        revealed_page_counts = collect_revealed_page_counts(
+            self.root_node, self.pagination_size
+        )
         if initial_load:
             selected_node_paths = set()
             expanded_node_paths = {""}
+            revealed_page_counts = {}
 
         self.initialize_tree()
 
+        root_shown_count = revealed_page_counts.get("")
+        if root_shown_count is not None:
+            self.root_node.children_shown_count = min(
+                root_shown_count, len(self.root_node.children)
+            )
+
         materialized_paths = sorted(
-            (selected_node_paths | expanded_node_paths) - {""},
+            (
+                selected_node_paths
+                | expanded_node_paths
+                | set(revealed_page_counts)
+            )
+            - {""},
             key=lambda rel_path: (rel_path.count("/"), rel_path),
         )
         for rel_path in materialized_paths:
             node = self.ensure_path_loaded(rel_path)
             if node is not None and rel_path in selected_node_paths:
                 node.is_selected = True
-            if node is not None and rel_path in expanded_node_paths and node_is_directory(node):
+            if (
+                node is not None
+                and node_is_directory(node)
+                and (
+                    rel_path in expanded_node_paths
+                    or rel_path in revealed_page_counts
+                )
+            ):
                 self.load_children(node)
-                node.is_expanded = True
+                shown_count = revealed_page_counts.get(rel_path)
+                if shown_count is not None:
+                    node.children_shown_count = min(
+                        shown_count, len(node.children)
+                    )
+                if rel_path in expanded_node_paths:
+                    node.is_expanded = True
 
         visible = self._visible_nodes()
         if not visible:
@@ -4104,6 +4186,11 @@ class SyncApp:
                         use_checksum,
                         backup=action == "download",
                         whole_file=action == "download",
+                        chmod=(
+                            self._default_upload_rsync_chmod()
+                            if action == "upload"
+                            else ""
+                        ),
                     ),
                 )
             )
@@ -4132,10 +4219,15 @@ class SyncApp:
 
         self.refresh_manifests(initial_load=False)
         if sync_ok:
-            self.message = (
-                f"Completed {source_side} -> "
-                f"{'local' if action == 'download' else 'remote'} sync."
-            )
+            if action == "upload":
+                self.message = self._upload_completion_message(
+                    "Completed local -> remote sync"
+                )
+            else:
+                self.message = (
+                    f"Completed {source_side} -> "
+                    f"{'local' if action == 'download' else 'remote'} sync."
+                )
         else:
             if failure is not None:
                 self.message = (
@@ -4469,7 +4561,6 @@ class SyncApp:
                 return
             if self._execute_upload_from_local_root([request.rel_path], request.temp_root):
                 self._refresh_file_manifest_side(request.rel_path, "right")
-                self.message = "Completed edited file upload."
         finally:
             shutil.rmtree(request.temp_root, ignore_errors=True)
 
@@ -4520,6 +4611,7 @@ class SyncApp:
                         ),
                         ssh_cmd,
                         use_checksum,
+                        chmod=self._default_upload_rsync_chmod(),
                     ),
                 )
             )
@@ -4558,15 +4650,16 @@ class SyncApp:
             if hasattr(self, "stdscr"):
                 self.resume_tui()
 
-        self.message = (
-            "Completed edited file upload."
-            if sync_ok
-            else (
+        if sync_ok:
+            self.message = self._upload_completion_message(
+                "Completed edited file upload"
+            )
+        else:
+            self.message = (
                 f"Upload failed (rsync exit code {failure.returncode}). Log: {failure.log_path}"
                 if failure is not None and str(failure.log_path)
                 else "Upload failed - check terminal output above for details."
             )
-        )
         return sync_ok
 
     def _choose_permission_mode(self, target_count: int) -> tuple[str, str, bool] | None:
