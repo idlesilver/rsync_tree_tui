@@ -6,22 +6,20 @@
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-08-06
+
 ### Added
 
-- 新增 `default_upload_permission` 配置；可用 `pvt--`、`grp-r`、`grp-w`、`pub-r`、`pub-w` 通过 rsync `--chmod` 自动统一本次 upload file list 的远端权限。
-
-### Fixed
-
-- rsync 或手动刷新 manifest 后会保留大目录通过 `... N more` 已展开的分页数量，不再退回默认前 20 项。
-
-## [0.2.16] - 2026-08-05
+- 新增 `default_upload_permission` 配置；可用 `pvt--`、`grp-r`、`grp-w`、`pub-r`、`pub-w` 通过 rsync `--chmod` 自动统一本次 upload file list 的远端权限，并支持 global config、`.env`、shell ENV `RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION` 和 `--default-upload-permission` 完整覆盖链。
 
 ### Changed
 
+- upload 默认权限改为 `pub-r`；可用空字符串显式关闭。
 - PERM badge 改为只摘要 group/other 的 read/write 层级：`pvt--`、`grp-r`、`grp-w`、`pub-r`、`pub-w`；other 权限超过 group 时优先显示 group 层级并标红，read 使用与 remote-only 相同的青色，精确权限继续通过 mode 视图查看。
 
 ### Fixed
 
+- rsync 或手动刷新 manifest 后会保留大目录通过 `... N more` 已展开的分页数量，不再退回默认前 20 项。
 - permission 弹窗中的大写 `G` 输入提示现在紧跟在小写 `g` group 选项之后，不再与大写 `R` recursive 选项顺序颠倒。
 
 ## [0.2.15] - 2026-07-27

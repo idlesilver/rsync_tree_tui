@@ -36,7 +36,7 @@ from pathlib import Path
 # ------------------------------------------------------------------------ #
 
 APP_NAME = "rsync-tree-tui"
-__version__ = "0.2.16"
+__version__ = "0.2.17"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/rsync_tree_tui.py"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/idlesilver/rsync_tree_tui/main/VERSION"
 AUTO_UPDATE_VERSION_TIMEOUT = 2
@@ -47,6 +47,7 @@ REMOTE_ENV = "RSYNC_TREE_TUI_REMOTE"
 REMOTE_ENV_PREFIX = f"{REMOTE_ENV}_"
 LOCAL_ROOT_ENV_PREFIX = f"{LOCAL_ROOT_ENV}_"
 PERMISSION_GROUP_ENV = "RSYNC_TREE_TUI_PERMISSION_GROUP"
+DEFAULT_UPLOAD_PERMISSION_ENV = "RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION"
 DEFAULT_CHECKSUM_THRESHOLD_MB = 512
 DEFAULT_CHECKSUM_SUFFIXES = [
     ".json",
@@ -68,6 +69,7 @@ DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP = {
     "pub-r": "Du=rwx,Dg=rx,Do=rx,Dg+s,Fu=rw,Fg=r,Fo=r",
     "pub-w": "Dugo=rwx,Dg+s,Fugo=rw",
 }
+DEFAULT_UPLOAD_PERMISSION = "pub-r"
 DEFAULT_UPLOAD_PERMISSIONS = ("", *DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP)
 MIN_MAIN_RENDER_WIDTH = 34
 MIN_MAIN_RENDER_HEIGHT = 8
@@ -133,7 +135,7 @@ def default_config_data() -> dict[str, object]:
             "step": DEFAULT_MOUSE_WHEEL_STEP,
             "coalesce_ms": DEFAULT_MOUSE_WHEEL_COALESCE_MS,
         },
-        "default_upload_permission": "",
+        "default_upload_permission": DEFAULT_UPLOAD_PERMISSION,
         "permission_group": "",
         "known_connections": [],
     }
@@ -172,7 +174,7 @@ def save_json_config(config_path: Path, data: dict[str, object]) -> None:
 
 
 def parse_default_upload_permission(config_data: dict[str, object]) -> str:
-    value = config_data.get("default_upload_permission", "")
+    value = config_data.get("default_upload_permission", DEFAULT_UPLOAD_PERMISSION)
     if not isinstance(value, str):
         raise ValueError("default_upload_permission must be a string")
     permission = value.strip().lower()
@@ -497,6 +499,12 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
     remote_value, remote_base_dir = get_remote_value(args, dotenv, dotenv_base_dir, cwd)
     cli_permission_group = getattr(args, "permission_group", None)
     env_permission_group = get_env_or_dotenv(PERMISSION_GROUP_ENV, dotenv)
+    cli_default_upload_permission = getattr(
+        args, "default_upload_permission", None
+    )
+    env_default_upload_permission = os.environ.get(DEFAULT_UPLOAD_PERMISSION_ENV)
+    if env_default_upload_permission is None:
+        env_default_upload_permission = dotenv.get(DEFAULT_UPLOAD_PERMISSION_ENV)
 
     selected_connection: dict[str, object] | None = None
     local_override = (
@@ -592,6 +600,16 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         permission_group = str(config_data["permission_group"])
         permission_group_source = "global config"
 
+    default_upload_permission_data = config_data
+    if cli_default_upload_permission is not None:
+        default_upload_permission_data = {
+            "default_upload_permission": cli_default_upload_permission
+        }
+    elif env_default_upload_permission is not None:
+        default_upload_permission_data = {
+            "default_upload_permission": env_default_upload_permission
+        }
+
     file_editor = resolve_file_editor(config_data)
     return AppConfig(
         local_root=local_root,
@@ -604,7 +622,9 @@ def resolve_app_config(args: argparse.Namespace) -> AppConfig:
         file_editor=file_editor,
         image_opener=resolve_image_opener(config_data, file_editor),
         mouse_wheel=parse_mouse_wheel_config(config_data),
-        default_upload_permission=parse_default_upload_permission(config_data),
+        default_upload_permission=parse_default_upload_permission(
+            default_upload_permission_data
+        ),
         permission_group=permission_group,
         permission_group_source=permission_group_source,
         pagination_size=int(config_data.get("pagination_size", DEFAULT_PAGINATION_SIZE)),
@@ -814,7 +834,7 @@ class AppConfig:
     file_editor: FileEditor
     image_opener: FileEditor
     mouse_wheel: MouseWheelConfig
-    default_upload_permission: str = ""
+    default_upload_permission: str = DEFAULT_UPLOAD_PERMISSION
     permission_group: str = ""
     permission_group_source: str = "none"
     pagination_size: int = DEFAULT_PAGINATION_SIZE
@@ -943,6 +963,7 @@ def parse_args() -> argparse.Namespace:
             f"  --local-root : ${LOCAL_ROOT_ENV} → matching .env {LOCAL_ROOT_ENV}_N → .env {LOCAL_ROOT_ENV} → current pwd\n"
             f"  --remote     : ${REMOTE_ENV} → matching .env {REMOTE_ENV}_N → .env {REMOTE_ENV} → known connection picker\n"
             f"  --permission-group : ${PERMISSION_GROUP_ENV} → .env → known connection → config\n"
+            f"  --default-upload-permission : ${DEFAULT_UPLOAD_PERMISSION_ENV} → .env → config → {DEFAULT_UPLOAD_PERMISSION}\n"
             f"  --config     : {default_config_path()}\n"
             "Project .env pairs matching _N indices; a missing side falls back "
             "to its unnumbered value.\n"
@@ -977,6 +998,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional selected group for grp:* permission changes "
             f"(default: ${PERMISSION_GROUP_ENV} / .env / known config / global config)."
+        ),
+    )
+    parser.add_argument(
+        "--default-upload-permission",
+        default=None,
+        help=(
+            "Permission badge applied during upload: pvt--, grp-r, grp-w, "
+            f"pub-r, or pub-w (default: ${DEFAULT_UPLOAD_PERMISSION_ENV} / "
+            f".env / global config / {DEFAULT_UPLOAD_PERMISSION})."
         ),
     )
     parser.add_argument(
@@ -2547,11 +2577,15 @@ class SyncApp:
         return "<none>"
 
     def _default_upload_rsync_chmod(self) -> str:
-        permission = getattr(self, "default_upload_permission", "")
+        permission = getattr(
+            self, "default_upload_permission", DEFAULT_UPLOAD_PERMISSION
+        )
         return DEFAULT_UPLOAD_PERMISSION_RSYNC_CHMOD_MAP.get(permission, "")
 
     def _upload_completion_message(self, operation: str) -> str:
-        permission = getattr(self, "default_upload_permission", "")
+        permission = getattr(
+            self, "default_upload_permission", DEFAULT_UPLOAD_PERMISSION
+        )
         if not permission:
             return f"{operation}."
         return f"{operation} and applied default permission [{permission}]."

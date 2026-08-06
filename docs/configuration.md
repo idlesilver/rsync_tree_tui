@@ -22,6 +22,12 @@
 --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > selected known connection > global config > 空
 ```
 
+`default_upload_permission` 的来源优先级：
+
+```text
+--default-upload-permission > shell RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION > .env > global config > pub-r
+```
+
 `.env` 默认从启动目录读取，也可以通过 `--env-file` 指定。`.env` 中的相对 `RSYNC_TREE_TUI_LOCAL_ROOT=./storage` 和本地 `RSYNC_TREE_TUI_REMOTE=./nas` 会相对 `.env` 所在目录解析；CLI 参数和 shell 环境变量中的相对路径仍相对启动目录解析。
 
 ## Project Remotes
@@ -100,13 +106,25 @@ SSH config name 原样传给 `ssh` 和 `rsync`，因此 `HostName`、`User`、`P
 
 ## Upload 默认权限
 
-`default_upload_permission` 会让 rsync 在 upload 时统一本次 file list 中条目的远端权限。默认空字符串表示关闭，不改变原有 upload 行为。
+`default_upload_permission` 会让 rsync 在 upload 时统一本次 file list 中条目的远端权限，默认值为 `pub-r`。
 
 ```json
 {
   "default_upload_permission": "pub-r"
 }
 ```
+
+四层配置示例：
+
+```bash
+# .env 或 shell ENV
+RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION=grp-w
+
+# CLI（最高优先级）
+rsynctui --default-upload-permission pvt--
+```
+
+global config 使用上面的 JSON 写法。空字符串可以显式关闭自动权限，例如 shell 中使用 `RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION=''`，或 CLI 中使用 `--default-upload-permission ''`。
 
 支持的 badge 值及精确结果：
 

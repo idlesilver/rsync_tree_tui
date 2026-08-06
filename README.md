@@ -2,7 +2,7 @@
 
 `rsync-tree-tui` 是一个单文件 TUI 工具，用于对比 local 和 remote 两棵目录树，交互式选择文件或目录执行 upload、download、diff preview、checksum check 和权限调整。
 
-当前版本：`v0.2.16`
+当前版本：`v0.2.17`
 
 ## 快速开始
 
@@ -76,6 +76,7 @@ upload/download 失败时会保留一份 rsync log，并在前台显示相关错
 RSYNC_TREE_TUI_LOCAL_ROOT=/path/to/local
 RSYNC_TREE_TUI_REMOTE=user@host:/path/to/remote
 RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
+RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION=pub-r
 ```
 
 配置来源优先级：
@@ -84,6 +85,7 @@ RSYNC_TREE_TUI_PERMISSION_GROUP=asset_team
 local_root       --local-root > shell RSYNC_TREE_TUI_LOCAL_ROOT > .env indexed match > .env default > 当前工作目录
 remote           --remote > shell RSYNC_TREE_TUI_REMOTE > .env indexed match > .env default > known connection picker
 permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > selected known connection > global config > 空
+upload_permission --default-upload-permission > shell RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION > .env > global config > pub-r
 ```
 
 首次运行会创建全局配置：
@@ -92,7 +94,7 @@ permission_group --permission-group > RSYNC_TREE_TUI_PERMISSION_GROUP > .env > s
 ~/.config/rsync-tree-tui/config.json
 ```
 
-如需在每次 upload 成功后自动统一远端权限，可设置：
+每次 upload 默认会把远端权限统一为 `pub-r`。可以通过参数、shell ENV、`.env` 或 global config 覆盖：
 
 ```json
 {

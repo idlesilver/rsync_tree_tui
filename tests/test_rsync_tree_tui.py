@@ -67,7 +67,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(data["diff_viewers"], tui.DEFAULT_DIFF_VIEWERS)
         self.assertEqual(data["file_editor"], tui.DEFAULT_FILE_EDITOR)
         self.assertEqual(data["image_opener"], tui.DEFAULT_IMAGE_OPENER)
-        self.assertEqual(data["default_upload_permission"], "")
+        self.assertEqual(data["default_upload_permission"], "pub-r")
         self.assertEqual(
             data["mouse_wheel"],
             {
@@ -77,12 +77,12 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertTrue(config_path.exists())
 
-    def test_config_accepts_pub_read_as_default_upload_permission(self) -> None:
+    def test_global_config_sets_default_upload_permission(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
         local_root = Path(self.tmp.name) / "local"
         remote_root = Path(self.tmp.name) / "remote"
         config_path.write_text(
-            '{"version": 1, "default_upload_permission": "pub-r", '
+            '{"version": 1, "default_upload_permission": "pvt--", '
             '"known_connections": []}'
         )
         args = argparse.Namespace(
@@ -95,7 +95,86 @@ class ConfigTests(unittest.TestCase):
 
         config = tui.resolve_app_config(args)
 
-        self.assertEqual(config.default_upload_permission, "pub-r")
+        self.assertEqual(config.default_upload_permission, "pvt--")
+
+    def test_dotenv_default_upload_permission_overrides_global_config(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        config_path.write_text(
+            '{"version": 1, "default_upload_permission": "pvt--", '
+            '"known_connections": []}'
+        )
+        Path(".env").write_text(
+            "RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION=grp-r\n"
+        )
+        args = argparse.Namespace(
+            local_root=Path(self.tmp.name) / "local",
+            remote=str(Path(self.tmp.name) / "remote"),
+            permission_group=None,
+            default_upload_permission=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.default_upload_permission, "grp-r")
+
+    def test_shell_default_upload_permission_overrides_dotenv(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        config_path.write_text(
+            '{"version": 1, "default_upload_permission": "pvt--", '
+            '"known_connections": []}'
+        )
+        Path(".env").write_text(
+            "RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION=grp-r\n"
+        )
+        os.environ["RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION"] = "grp-w"
+        args = argparse.Namespace(
+            local_root=Path(self.tmp.name) / "local",
+            remote=str(Path(self.tmp.name) / "remote"),
+            permission_group=None,
+            default_upload_permission=None,
+            env_file=None,
+            config=config_path,
+        )
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.default_upload_permission, "grp-w")
+
+    def test_cli_default_upload_permission_overrides_shell_env(self) -> None:
+        config_path = Path(self.tmp.name) / "config.json"
+        local_root = Path(self.tmp.name) / "local"
+        remote_root = Path(self.tmp.name) / "remote"
+        config_path.write_text(
+            '{"version": 1, "default_upload_permission": "pvt--", '
+            '"known_connections": []}'
+        )
+        Path(".env").write_text(
+            "RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION=grp-r\n"
+        )
+        os.environ["RSYNC_TREE_TUI_DEFAULT_UPLOAD_PERMISSION"] = "grp-w"
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "rsync_tree_tui.py",
+                "--local-root",
+                str(local_root),
+                "--remote",
+                str(remote_root),
+                "--config",
+                str(config_path),
+                "--default-upload-permission",
+                "pub-w",
+            ],
+        ):
+            args = tui.parse_args()
+
+        config = tui.resolve_app_config(args)
+
+        self.assertEqual(config.default_upload_permission, "pub-w")
 
     def test_config_rejects_unknown_default_upload_permission(self) -> None:
         config_path = Path(self.tmp.name) / "config.json"
@@ -709,7 +788,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class AutoUpdateTests(unittest.TestCase):
-    FUTURE_VERSION = "0.2.17"
+    FUTURE_VERSION = "0.2.18"
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
